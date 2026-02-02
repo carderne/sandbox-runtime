@@ -11,6 +11,7 @@ import {
   generateProxyEnvVars,
   normalizePathForSandbox,
   normalizeCaseForComparison,
+  isSymlinkOutsideBoundary,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -563,6 +564,28 @@ async function generateFilesystemArgs(
       if (!fs.existsSync(normalizedPath)) {
         logForDebugging(
           `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+        )
+        continue
+      }
+
+      // Check if path is a symlink pointing outside expected boundaries
+      // bwrap follows symlinks, so --bind on a symlink makes the target writable
+      // This could unexpectedly expose paths the user didn't intend to allow
+      try {
+        const resolvedPath = fs.realpathSync(normalizedPath)
+        if (
+          resolvedPath !== normalizedPath &&
+          isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
+        ) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping symlink write path pointing outside expected location: ${pathPattern} -> ${resolvedPath}`,
+          )
+          continue
+        }
+      } catch {
+        // realpathSync failed - path might not exist or be accessible, skip it
+        logForDebugging(
+          `[Sandbox Linux] Skipping write path that could not be resolved: ${normalizedPath}`,
         )
         continue
       }
