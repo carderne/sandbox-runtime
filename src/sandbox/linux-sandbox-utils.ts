@@ -678,8 +678,12 @@ async function generateFilesystemArgs(
       // This could unexpectedly expose paths the user didn't intend to allow
       try {
         const resolvedPath = fs.realpathSync(normalizedPath)
+        // Trim trailing slashes before comparing: realpathSync never returns
+        // a trailing slash, but normalizedPath may have one, which would cause
+        // a false mismatch and incorrectly treat the path as a symlink.
+        const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
         if (
-          resolvedPath !== normalizedPath &&
+          resolvedPath !== normalizedForComparison &&
           isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
         ) {
           logForDebugging(

@@ -152,6 +152,29 @@ describe('Symlink write path detection (unit)', () => {
     // Symlink within same area should be allowed (resolves to deeper path)
     expect(result).toContain('bwrap')
   })
+
+  it('should include write paths with trailing slashes (not treat them as symlinks)', async () => {
+    if (skipIfNotLinux()) return
+
+    // When normalizedPath has a trailing slash, realpathSync returns it without one.
+    // The comparison `resolvedPath !== normalizedPath` would incorrectly be true,
+    // potentially causing the path to be skipped as if it were a symlink.
+    const pathWithTrailingSlash = USER_AREA + '/'
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [] },
+      writeConfig: {
+        allowOnly: [pathWithTrailingSlash],
+        denyWithinAllow: [],
+      },
+    })
+
+    // The path should be included as --bind, not skipped
+    expect(result).toContain('--bind')
+    expect(result).toContain(USER_AREA)
+  })
 })
 
 /**
