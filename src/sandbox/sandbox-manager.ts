@@ -358,7 +358,7 @@ function checkDependencies(ripgrepConfig?: {
 
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
-    return { denyOnly: [] }
+    return { denyOnly: [], allowWithinDeny: [] }
   }
 
   const denyPaths: string[] = []
@@ -376,8 +376,24 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  // Process allowRead paths (re-allow within denied regions)
+  const allowPaths: string[] = []
+  for (const p of config.filesystem.allowRead ?? []) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      const expanded = expandGlobPattern(p)
+      logForDebugging(
+        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      allowPaths.push(...expanded)
+    } else {
+      allowPaths.push(stripped)
+    }
+  }
+
   return {
     denyOnly: denyPaths,
+    allowWithinDeny: allowPaths,
   }
 }
 
@@ -555,8 +571,20 @@ async function wrapWithSandbox(
       expandedDenyRead.push(stripped)
     }
   }
+  const rawAllowRead =
+    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
+  const expandedAllowRead: string[] = []
+  for (const p of rawAllowRead) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      expandedAllowRead.push(...expandGlobPattern(p))
+    } else {
+      expandedAllowRead.push(stripped)
+    }
+  }
   const readConfig = {
     denyOnly: expandedDenyRead,
+    allowWithinDeny: expandedAllowRead,
   }
 
   // Check if network config is specified - this determines if we need network restrictions

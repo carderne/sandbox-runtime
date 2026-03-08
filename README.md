@@ -115,7 +115,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read** (deny-only pattern): By default, read access is allowed everywhere. You can deny specific paths (e.g., `~/.ssh`). An empty deny list means full read access.
+- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
@@ -262,6 +262,7 @@ srt --settings /path/to/srt-settings.json <command>
   },
   "filesystem": {
     "denyRead": ["~/.ssh"],
+    "allowRead": [],
     "allowWrite": [".", "src/", "test/", "/tmp"],
     "denyWrite": [".env", "config/production.json"]
   },
@@ -301,9 +302,10 @@ Unix sockets are **blocked by default** on both platforms.
 
 Uses two different patterns:
 
-**Read restrictions** (deny-only pattern) - all reads allowed by default:
+**Read restrictions** (deny-then-allow pattern) - all reads allowed by default:
 
 - `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
+- `filesystem.allowRead` - Array of paths to re-allow read access within denied regions (takes precedence over denyRead). **Note:** this is the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 
 **Write restrictions** (allow-only pattern) - all writes denied by default:
 
@@ -324,6 +326,7 @@ Examples:
 - `"allowWrite": ["src/"]` - Allow write to entire `src/` directory
 - `"allowWrite": ["src/**/*.ts"]` - Allow write to all `.ts` files in `src/` and subdirectories
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["/Users"], "allowRead": ["."]` - Deny read to all of `/Users`, but re-allow the current directory
 - `"denyWrite": [".env"]` - Deny write to `.env` file (even if current directory is allowed)
 
 **Path Syntax (Linux):**
@@ -332,6 +335,7 @@ Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**
 
@@ -382,6 +386,25 @@ Examples:
   }
 }
 ```
+
+**Workspace-only filesystem access** (deny reads outside the workspace):
+
+```json
+{
+  "network": {
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["/Users"],
+    "allowRead": ["."],
+    "allowWrite": ["."],
+    "denyWrite": []
+  }
+}
+```
+
+This denies reading anything under `/Users` (or `/home` on Linux), then re-allows the current working directory. System paths (`/usr`, `/lib`, etc.) remain readable.
 
 ### Common Issues and Tips
 
@@ -500,17 +523,18 @@ Filesystem restrictions are enforced at the OS level:
 
 **Default filesystem permissions:**
 
-- **Read** (deny-only): Allowed everywhere by default. You can deny specific paths.
+- **Read** (deny-then-allow): Allowed everywhere by default. You can deny broad regions, then re-allow specific paths within them. `allowRead` takes precedence over `denyRead`.
 
   - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
+  - Example: `denyRead: ["/Users"], allowRead: ["."]` to block all of `/Users` except the workspace
   - Empty `denyRead: []` = full read access (nothing denied)
 
 - **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
   - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
   - Empty `allowWrite: []` = no write access (nothing allowed)
-  - `denyWrite` creates exceptions within allowed paths
+  - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
 
-This model lets you start with broad read access but maximally restricted write access, then explicitly open the holes you need.
+**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 

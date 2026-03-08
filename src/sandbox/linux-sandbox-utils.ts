@@ -825,6 +825,9 @@ async function generateFilesystemArgs(
 
   // Handle read restrictions by mounting tmpfs over denied paths
   const readDenyPaths = [...(readConfig?.denyOnly || [])]
+  const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
+    normalizePathForSandbox(p),
+  )
 
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
@@ -845,7 +848,41 @@ async function generateFilesystemArgs(
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
+
+      // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
+      // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
+      // so they are readable again.
+      for (const allowPath of readAllowPaths) {
+        if (
+          allowPath.startsWith(normalizedPath + '/') ||
+          allowPath === normalizedPath
+        ) {
+          if (!fs.existsSync(allowPath)) {
+            logForDebugging(
+              `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
+            )
+            continue
+          }
+          // Bind the allowed path back over the tmpfs so it's readable
+          args.push('--ro-bind', allowPath, allowPath)
+          logForDebugging(
+            `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+          )
+        }
+      }
     } else {
+      // For files, check if this specific file is re-allowed
+      const isReAllowed = readAllowPaths.some(
+        allowPath =>
+          normalizedPath === allowPath ||
+          normalizedPath.startsWith(allowPath + '/'),
+      )
+      if (isReAllowed) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
+        )
+        continue
+      }
       // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
     }

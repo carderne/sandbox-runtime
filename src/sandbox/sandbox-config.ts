@@ -123,6 +123,13 @@ export const NetworkConfigSchema = z.object({
  */
 export const FilesystemConfigSchema = z.object({
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  allowRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
+        'Use with denyRead to deny a broad region then allow back specific subdirectories.',
+    ),
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
