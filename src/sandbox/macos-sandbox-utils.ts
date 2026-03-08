@@ -28,7 +28,6 @@ export interface MacOSSandboxParams {
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
-  allowMachLookup?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
@@ -116,11 +115,8 @@ function getAncestorDirectories(pathStr: string): string[] {
 }
 
 /**
- * Generate deny rules for file movement (file-write-unlink) and creation
- * (file-write-create) to protect paths. This prevents bypassing read or write
- * restrictions by moving files/directories, and prevents replacing a
- * not-yet-existing protected path (or one of its ancestors) with an
- * attacker-controlled symlink.
+ * Generate deny rules for file movement (file-write-unlink) to protect paths
+ * This prevents bypassing read or write restrictions by moving files/directories
  *
  * @param pathPatterns - Array of path patterns to protect (can include globs)
  * @param logTag - Log tag for sandbox violations
@@ -131,7 +127,6 @@ function generateMoveBlockingRules(
   logTag: string,
 ): string[] {
   const rules: string[] = []
-  const ops = ['file-write-unlink', 'file-write-create'] as const
 
   for (const pathPattern of pathPatterns) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
@@ -141,13 +136,11 @@ function generateMoveBlockingRules(
       const regexPattern = globToRegex(normalizedPath)
 
       // Block moving/renaming files matching this pattern
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (regex ${escapePath(regexPattern)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
+      rules.push(
+        `(deny file-write-unlink`,
+        `  (regex ${escapePath(regexPattern)})`,
+        `  (with message "${logTag}"))`,
+      )
 
       // For glob patterns, extract the static prefix and block ancestor moves
       // Remove glob characters to get the directory prefix
@@ -159,46 +152,38 @@ function generateMoveBlockingRules(
           : path.dirname(staticPrefix)
 
         // Block moves of the base directory itself
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(baseDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
+        rules.push(
+          `(deny file-write-unlink`,
+          `  (literal ${escapePath(baseDir)})`,
+          `  (with message "${logTag}"))`,
+        )
 
         // Block moves of ancestor directories
         for (const ancestorDir of getAncestorDirectories(baseDir)) {
-          for (const op of ops) {
-            rules.push(
-              `(deny ${op}`,
-              `  (literal ${escapePath(ancestorDir)})`,
-              `  (with message "${logTag}"))`,
-            )
-          }
+          rules.push(
+            `(deny file-write-unlink`,
+            `  (literal ${escapePath(ancestorDir)})`,
+            `  (with message "${logTag}"))`,
+          )
         }
       }
     } else {
       // Use subpath matching for literal paths
 
       // Block moving/renaming the denied path itself
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (subpath ${escapePath(normalizedPath)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
+      rules.push(
+        `(deny file-write-unlink`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
 
       // Block moves of ancestor directories
       for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(ancestorDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
+        rules.push(
+          `(deny file-write-unlink`,
+          `  (literal ${escapePath(ancestorDir)})`,
+          `  (with message "${logTag}"))`,
+        )
       }
     }
   }
@@ -222,14 +207,12 @@ function generateMoveBlockingRules(
 function generateReadRules(
   config: FsReadRestrictionConfig | undefined,
   logTag: string,
-  writeAllowPaths?: string[],
 ): string[] {
   if (!config) {
     return [`(allow file-read*)`]
   }
 
   const rules: string[] = []
-  let deniesRoot = false
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
@@ -237,8 +220,6 @@ function generateReadRules(
   // Then deny specific paths
   for (const pathPattern of config.denyOnly || []) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
-
-    if (normalizedPath === '/') deniesRoot = true
 
     if (containsGlobChars(normalizedPath)) {
       // Use regex matching for glob patterns
@@ -256,13 +237,6 @@ function generateReadRules(
         `  (with message "${logTag}"))`,
       )
     }
-  }
-
-  // (subpath "/") denies the root inode itself; allowWithinDeny subpaths don't
-  // cover "/", so dyld aborts before exec. Re-allow the literal root so path
-  // traversal works. This exposes `ls /` dirent names but no subtree contents.
-  if (deniesRoot) {
-    rules.push(`(allow file-read* (literal "/"))`)
   }
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
@@ -285,55 +259,8 @@ function generateReadRules(
     }
   }
 
-  // Allow stat/lstat on all directories so that realpath() can traverse
-  // path components within denied regions. Without this, C realpath() fails
-  // when resolving symlinks because it needs to lstat every intermediate
-  // directory (e.g. /Users, /Users/chris) even if only a subdirectory like
-  // ~/.local is in allowWithinDeny. This only allows metadata reads on
-  // directories — not listing contents (readdir) or reading files.
-  if (config.denyOnly.length > 0) {
-    rules.push(`(allow file-read-metadata`, `  (vnode-type DIRECTORY))`)
-  }
-
   // Block file movement to prevent bypass via mv/rename
   rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
-
-  // Re-allow file-write-unlink / file-write-create for paths that are explicitly
-  // write-allowed. The move-blocking rules above emit broad
-  // (deny file-write-unlink (subpath "/Users")) to prevent bypassing read
-  // restrictions by moving files out of denied regions.
-  // However, in macOS Seatbelt, a specific (deny file-write-unlink) is not overridden
-  // by a later (allow file-write*) wildcard — the specific operation deny wins.
-  // This means file deletions are blocked even in write-allowed directories like
-  // the project directory. We fix this by explicitly re-allowing file-write-unlink
-  // and file-write-create for write-allowed paths after the move-blocking deny rules.
-  //
-  // Note: denyWithinAllow paths are not excluded here because the write section's
-  // generateMoveBlockingRules() runs later in the profile and re-denies
-  // file-write-unlink for those paths (Seatbelt uses last-match-wins). This
-  // depends on read rules being emitted before write rules in generateSandboxProfile().
-  if (writeAllowPaths && writeAllowPaths.length > 0) {
-    for (const pathPattern of writeAllowPaths) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
-
-      for (const op of ['file-write-unlink', 'file-write-create'] as const) {
-        if (containsGlobChars(normalizedPath)) {
-          const regexPattern = globToRegex(normalizedPath)
-          rules.push(
-            `(allow ${op}`,
-            `  (regex ${escapePath(regexPattern)})`,
-            `  (with message "${logTag}"))`,
-          )
-        } else {
-          rules.push(
-            `(allow ${op}`,
-            `  (subpath ${escapePath(normalizedPath)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-      }
-    }
-  }
 
   return rules
 }
@@ -351,6 +278,17 @@ function generateWriteRules(
   }
 
   const rules: string[] = []
+
+  // Automatically allow TMPDIR parent on macOS when write restrictions are enabled
+  const tmpdirParents = getTmpdirParentIfMacOSPattern()
+  for (const tmpdirParent of tmpdirParents) {
+    const normalizedPath = normalizePathForSandbox(tmpdirParent)
+    rules.push(
+      `(allow file-write*`,
+      `  (subpath ${escapePath(normalizedPath)})`,
+      `  (with message "${logTag}"))`,
+    )
+  }
 
   // Generate allow rules
   for (const pathPattern of config.allowOnly || []) {
@@ -419,7 +357,6 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
-  allowMachLookup,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -433,7 +370,6 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
-  allowMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -478,16 +414,6 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
-        ]
-      : []),
-    ...(allowMachLookup && allowMachLookup.length > 0
-      ? [
-          '; User-specified XPC/Mach services',
-          ...allowMachLookup.map(name =>
-            name.endsWith('*')
-              ? `(allow mach-lookup (global-name-prefix ${escapePath(name.slice(0, -1))}))`
-              : `(allow mach-lookup (global-name ${escapePath(name)}))`,
-          ),
         ]
       : []),
     '',
@@ -679,11 +605,8 @@ function generateSandboxProfile({
   profile.push('')
 
   // Read rules
-  // Pass write-allowed paths so that move-blocking deny rules in the read section
-  // can be overridden for paths where file deletion should be permitted.
-  const writeAllowPaths = writeConfig?.allowOnly
   profile.push('; File read')
-  profile.push(...generateReadRules(readConfig, logTag, writeAllowPaths))
+  profile.push(...generateReadRules(readConfig, logTag))
   profile.push('')
 
   // Write rules
@@ -716,6 +639,31 @@ function escapePath(pathStr: string): string {
 }
 
 /**
+ * Get TMPDIR parent directory if it matches macOS pattern /var/folders/XX/YYY/T/
+ * Returns both /var/ and /private/var/ versions since /var is a symlink
+ */
+function getTmpdirParentIfMacOSPattern(): string[] {
+  const tmpdir = process.env.TMPDIR
+  if (!tmpdir) return []
+
+  const match = tmpdir.match(
+    /^\/(private\/)?var\/folders\/[^/]{2}\/[^/]+\/T\/?$/,
+  )
+  if (!match) return []
+
+  const parent = tmpdir.replace(/\/T\/?$/, '')
+
+  // Return both /var/ and /private/var/ versions since /var is a symlink
+  if (parent.startsWith('/private/var/')) {
+    return [parent, parent.replace('/private', '')]
+  } else if (parent.startsWith('/var/')) {
+    return [parent, '/private' + parent]
+  }
+
+  return [parent]
+}
+
+/**
  * Wrap command with macOS sandbox
  */
 export function wrapCommandWithSandboxMacOS(
@@ -729,7 +677,6 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
-    allowMachLookup,
     readConfig,
     writeConfig,
     allowPty,
@@ -764,7 +711,6 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
-    allowMachLookup,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
