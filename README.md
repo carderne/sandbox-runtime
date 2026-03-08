@@ -1,5 +1,15 @@
 # Anthropic Sandbox Runtime (srt)
 
+## Forked from [anthropic-experimental/sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) with two changes:
+
+Fork released here for install: [@carderne/sandbox-runtime](https://www.npmjs.com/package/@carderne/sandbox-runtime).
+
+- **`allowRead` config option**: A new optional `allowRead` field re-allows read access within regions blocked by `denyRead`. `allowRead` takes precedence over `denyRead` (intentionally the opposite of write, where `denyWrite` takes precedence over `allowWrite`). This enables workspace-only access patterns like `denyRead: ["/Users"], allowRead: ["."]` without breaking system paths. The field is optional — existing configs work identically.
+
+- **`enableWeakerNetworkIsolation` now allows `configd` access**: When `enableWeakerNetworkIsolation` is enabled, the macOS sandbox now also permits mach-lookup to `com.apple.SystemConfiguration.configd`. This is needed for Rust/Go programs (e.g. `uv`, `cargo`) that query system proxy/network configuration via `SCDynamicStoreCreate` on startup. The service is read-only (exposes proxy settings, DNS servers, interface info) but cannot modify system settings. **Security note:** this exposes host network configuration to the sandboxed process.
+
+## Introduction
+
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
 `srt` uses native OS sandboxing primitives (`sandbox-exec` on macOS, `bubblewrap` on Linux) and proxy-based network filtering. It can be used to sandbox the behaviour of agents, local MCP servers, bash commands and arbitrary processes.
@@ -11,7 +21,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/sandbox-runtime
+npm install -g @carderne/sandbox-runtime
 ```
 
 ## Basic Usage
@@ -176,7 +186,7 @@ srt --settings /path/to/srt-settings.json npm install
 import {
   SandboxManager,
   type SandboxRuntimeConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@carderne/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
@@ -215,10 +225,10 @@ child.on('exit', async code => {
 
 ```typescript
 // Main sandbox manager
-export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
+export { SandboxManager } from '@carderne/sandbox-runtime'
 
 // Violation tracking
-export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+export { SandboxViolationStore } from '@carderne/sandbox-runtime'
 
 // TypeScript types
 export type {
@@ -230,7 +240,7 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@carderne/sandbox-runtime'
 ```
 
 ## Configuration
