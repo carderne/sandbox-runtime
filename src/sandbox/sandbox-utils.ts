@@ -309,6 +309,20 @@ export function generateProxyEnvVars(
     return envVars
   }
 
+  // Make Node's built-in fetch() (undici) honour HTTP_PROXY / HTTPS_PROXY.
+  // By default, undici uses a plain Agent that makes direct TCP connections and
+  // ignores proxy env vars — unlike curl and other CLI tools. The --use-env-proxy
+  // flag (Node 22+) tells the internal undici instance to read these variables.
+  // We prepend to any existing NODE_OPTIONS so we don't clobber user flags.
+  const nodeMajor = parseInt(process.versions.node.split('.')[0], 10)
+  if (nodeMajor >= 22) {
+    const existingNodeOptions = process.env.NODE_OPTIONS ?? ''
+    const nodeOptions = existingNodeOptions
+      ? `${existingNodeOptions} --use-env-proxy`
+      : '--use-env-proxy'
+    envVars.push(`NODE_OPTIONS=${nodeOptions}`)
+  }
+
   // Always set NO_PROXY to exclude localhost and private networks from proxying
   const noProxyAddresses = [
     'localhost',
