@@ -181,6 +181,12 @@ async function curlViaProxy(
   let stderr = ''
   child.stdout.setEncoding('utf8').on('data', c => (out += c))
   child.stderr.setEncoding('utf8').on('data', c => (stderr += c))
+  // Drain both streams to 'end' before reading the exit code — Bun's
+  // ChildProcess 'close' can fire before all 'data' events are delivered.
+  await Promise.all([
+    new Promise<void>(r => child.stdout.once('end', r)),
+    new Promise<void>(r => child.stderr.once('end', r)),
+  ])
   const exit = await new Promise<number>(resolve =>
     child.on('close', code => resolve(code ?? 1)),
   )
