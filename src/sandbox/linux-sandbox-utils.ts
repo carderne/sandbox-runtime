@@ -99,60 +99,6 @@ function findSymlinkInPath(
 }
 
 /**
- * Check if any existing component in the path is a file (not a directory).
- * If so, the target path can never be created because you can't mkdir under a file.
- *
- * This handles the git worktree case: .git is a file, so .git/hooks can never
- * exist and there's nothing to deny.
- */
-function hasFileAncestor(targetPath: string): boolean {
-  const parts = targetPath.split(path.sep)
-  let currentPath = ''
-
-  for (const part of parts) {
-    if (!part) continue // Skip empty parts (leading /)
-    const nextPath = currentPath + path.sep + part
-    try {
-      const stat = fs.statSync(nextPath)
-      if (stat.isFile() || stat.isSymbolicLink()) {
-        // This component exists as a file — nothing below it can be created
-        return true
-      }
-    } catch {
-      // Path doesn't exist — stop checking
-      break
-    }
-    currentPath = nextPath
-  }
-
-  return false
-}
-
-/**
- * Find the first non-existent path component.
- * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
- * returns "/existing/parent/nonexistent"
- *
- * This is used to block creation of non-existent deny paths by mounting /dev/null
- * at the first missing component, preventing mkdir from creating the parent directories.
- */
-function findFirstNonExistentComponent(targetPath: string): string {
-  const parts = targetPath.split(path.sep)
-  let currentPath = ''
-
-  for (const part of parts) {
-    if (!part) continue // Skip empty parts (leading /)
-    const nextPath = currentPath + path.sep + part
-    if (!fs.existsSync(nextPath)) {
-      return nextPath
-    }
-    currentPath = nextPath
-  }
-
-  return targetPath // Shouldn't reach here if called correctly
-}
-
-/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
@@ -289,23 +235,6 @@ const bwrapMountPoints: Set<string> = new Set()
 // bwrap instance is still running detaches that instance's bind mount and
 // the deny rule stops applying inside it.
 let activeSandboxCount = 0
-
-let exitHandlerRegistered = false
-
-/**
- * Register cleanup handler for bwrap mount points
- */
-function registerExitCleanupHandler(): void {
-  if (exitHandlerRegistered) {
-    return
-  }
-
-  process.on('exit', () => {
-    cleanupBwrapMountPoints({ force: true })
-  })
-
-  exitHandlerRegistered = true
-}
 
 /**
  * Clean up mount point files created by bwrap for non-existent deny paths.
@@ -757,70 +686,21 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Handle non-existent paths by mounting /dev/null to block creation.
-      // Without this, a sandboxed process could mkdir+write a denied path that
-      // doesn't exist yet, bypassing the deny rule entirely.
+      // Skip non-existent deny paths. Previously, bwrap would create
+      // empty files/directories on the host filesystem as mount points for
+      // --ro-bind /dev/null binds. These "ghost dotfiles" (e.g. .bashrc,
+      // .gitconfig, .zshrc) persist after bwrap exits if cleanup doesn't
+      // run (crash, race condition, etc.), polluting the project directory.
       //
-      // bwrap creates empty files on the host as mount points for these binds.
-      // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
-      // remove them after the command exits.
+      // The security tradeoff is that a sandboxed process could create the
+      // denied file, but project-local dotfiles like .bashrc are never
+      // sourced by shells (which use ~/.bashrc), and the sandbox still
+      // prevents network exfiltration. Explicit denyWrite rules in the
+      // config continue to protect paths that already exist.
       if (!fs.existsSync(normalizedPath)) {
-        // Fix 1 (worktree): If any existing component in the deny path is a
-        // file (not a directory), skip the deny entirely. You can't mkdir
-        // under a file, so the deny path can never be created. This handles
-        // git worktrees where .git is a file.
-        if (hasFileAncestor(normalizedPath)) {
-          logForDebugging(
-            `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
-          )
-          continue
-        }
-
-        // Find the deepest existing ancestor directory
-        let ancestorPath = path.dirname(normalizedPath)
-        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
-          ancestorPath = path.dirname(ancestorPath)
-        }
-
-        // Only protect if the existing ancestor is within an allowed write path.
-        // If not, the path is already read-only from --ro-bind / /.
-        const ancestorIsWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            ancestorPath.startsWith(allowedPath + '/') ||
-            ancestorPath === allowedPath ||
-            normalizedPath.startsWith(allowedPath + '/'),
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent deny path (not creating mount point): ${normalizedPath}`,
         )
-
-        if (ancestorIsWithinAllowedPath) {
-          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
-
-          // Fix 2: If firstNonExistent is an intermediate component (not the
-          // leaf deny path itself), mount a read-only empty directory instead
-          // of /dev/null. This prevents the component from appearing as a file
-          // which breaks tools that expect to traverse it as a directory.
-          if (firstNonExistent !== normalizedPath) {
-            const emptyDir = fs.mkdtempSync(
-              path.join(tmpdir(), 'claude-empty-'),
-            )
-            denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
-            logForDebugging(
-              `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
-          } else {
-            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
-            logForDebugging(
-              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
-          }
-        } else {
-          logForDebugging(
-            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
-          )
-        }
         continue
       }
 
