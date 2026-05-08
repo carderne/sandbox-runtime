@@ -192,6 +192,16 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.',
     ),
+  disableMandatoryDenyPaths: z
+    .boolean()
+    .optional()
+    .describe(
+      'Disable the hardcoded mandatory deny list for dangerous files and directories (default: false). ' +
+        'When true, the sandbox will not auto-deny writes to .bashrc, .zshrc, .gitconfig, .vscode, .idea, etc. ' +
+        'Only the user-specified denyWrite rules will apply. Useful when the default deny list causes unwanted ' +
+        'side effects such as ghost dotfiles from bwrap mount points, or when the user trusts the sandboxed process ' +
+        'to not modify these files.',
+    ),
 })
 
 /**

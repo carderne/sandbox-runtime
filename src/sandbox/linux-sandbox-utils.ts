@@ -53,6 +53,8 @@ export interface LinuxSandboxParams {
   seccompConfig?: SeccompConfig
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  /** Disable the hardcoded mandatory deny list for dangerous files (default: false) */
+  disableMandatoryDenyPaths?: boolean
 }
 
 /** Default max depth for searching dangerous files */
@@ -108,7 +110,11 @@ async function linuxGetMandatoryDenyPaths(
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  disableMandatoryDenyPaths = false,
 ): Promise<string[]> {
+  if (disableMandatoryDenyPaths) {
+    return []
+  }
   const cwd = process.cwd()
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
@@ -580,6 +586,7 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  disableMandatoryDenyPaths = false,
 ): Promise<string[]> {
   const args: string[] = []
   // fs already imported
@@ -655,6 +662,7 @@ async function generateFilesystemArgs(
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
+        disableMandatoryDenyPaths,
       )),
     ]
 
@@ -918,6 +926,7 @@ export async function wrapCommandWithSandboxLinux(
     allowGitConfig = false,
     seccompConfig,
     abortSignal,
+    disableMandatoryDenyPaths = false,
   } = params
 
   // Determine if we have restrictions to apply
@@ -1045,6 +1054,7 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      disableMandatoryDenyPaths,
     )
     bwrapArgs.push(...fsArgs)
 

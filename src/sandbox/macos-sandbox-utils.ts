@@ -37,13 +37,21 @@ export interface MacOSSandboxParams {
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   binShell?: string
+  /** Disable the hardcoded mandatory deny list for dangerous files (default: false) */
+  disableMandatoryDenyPaths?: boolean
 }
 
 /**
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
+export function macGetMandatoryDenyPatterns(
+  allowGitConfig = false,
+  disableMandatoryDenyPaths = false,
+): string[] {
+  if (disableMandatoryDenyPaths) {
+    return []
+  }
   const cwd = process.cwd()
   const denyPaths: string[] = []
 
@@ -346,6 +354,7 @@ function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
   allowGitConfig = false,
+  disableMandatoryDenyPaths = false,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -378,7 +387,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(allowGitConfig),
+    ...macGetMandatoryDenyPatterns(allowGitConfig, disableMandatoryDenyPaths),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -425,6 +434,7 @@ function generateSandboxProfile({
   allowBrowserProcess = false,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
+  disableMandatoryDenyPaths = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -440,6 +450,7 @@ function generateSandboxProfile({
   allowBrowserProcess?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  disableMandatoryDenyPaths?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -693,7 +704,14 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+  profile.push(
+    ...generateWriteRules(
+      writeConfig,
+      logTag,
+      allowGitConfig,
+      disableMandatoryDenyPaths,
+    ),
+  )
 
   // Pseudo-terminal (pty) support
   if (allowPty) {
@@ -797,6 +815,7 @@ export function wrapCommandWithSandboxMacOS(
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
     binShell,
+    disableMandatoryDenyPaths = false,
   } = params
 
   // Determine if we have restrictions to apply
@@ -830,6 +849,7 @@ export function wrapCommandWithSandboxMacOS(
     allowBrowserProcess,
     allowGitConfig,
     enableWeakerNetworkIsolation,
+    disableMandatoryDenyPaths,
     logTag,
   })
 

@@ -531,6 +531,10 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+function getDisableMandatoryDenyPaths(): boolean {
+  return config?.filesystem?.disableMandatoryDenyPaths ?? false
+}
+
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -685,6 +689,7 @@ async function wrapWithSandbox(
         allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         binShell,
+        disableMandatoryDenyPaths: getDisableMandatoryDenyPaths(),
       })
 
     case 'linux':
@@ -714,6 +719,7 @@ async function wrapWithSandbox(
         allowGitConfig: getAllowGitConfig(),
         seccompConfig: getSeccompConfig(),
         abortSignal,
+        disableMandatoryDenyPaths: getDisableMandatoryDenyPaths(),
       })
 
     default:
