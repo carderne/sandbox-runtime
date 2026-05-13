@@ -33,8 +33,8 @@ export interface MacOSSandboxParams {
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
-  allowBrowserProcess?: boolean
   allowGitConfig?: boolean
+  allowGitHooks?: boolean
   enableWeakerNetworkIsolation?: boolean
   binShell?: string
 }
@@ -43,7 +43,10 @@ export interface MacOSSandboxParams {
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
+export function macGetMandatoryDenyPatterns(
+  allowGitConfig = false,
+  allowGitHooks = false,
+): string[] {
   const cwd = process.cwd()
   const denyPaths: string[] = []
 
@@ -59,9 +62,11 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks are always blocked for security
-  denyPaths.push(path.resolve(cwd, '.git/hooks'))
-  denyPaths.push('**/.git/hooks/**')
+  // Git hooks - conditionally blocked based on allowGitHooks setting
+  if (!allowGitHooks) {
+    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    denyPaths.push('**/.git/hooks/**')
+  }
 
   // Git config - conditionally blocked based on allowGitConfig setting
   if (!allowGitConfig) {
@@ -346,6 +351,7 @@ function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
   allowGitConfig = false,
+  allowGitHooks = false,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -378,7 +384,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(allowGitConfig),
+    ...macGetMandatoryDenyPatterns(allowGitConfig, allowGitHooks),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -422,8 +428,8 @@ function generateSandboxProfile({
   allowLocalBinding,
   allowMachLookup,
   allowPty,
-  allowBrowserProcess = false,
   allowGitConfig = false,
+  allowGitHooks = false,
   enableWeakerNetworkIsolation = false,
   logTag,
 }: {
@@ -437,8 +443,8 @@ function generateSandboxProfile({
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
   allowPty?: boolean
-  allowBrowserProcess?: boolean
   allowGitConfig?: boolean
+  allowGitHooks?: boolean
   enableWeakerNetworkIsolation?: boolean
   logTag: string
 }): string {
@@ -481,8 +487,6 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
-          '; configd - needed for Rust/Go programs that query system proxy/network config (uv, cargo)',
-          '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
         ]
       : []),
     ...(allowMachLookup && allowMachLookup.length > 0
@@ -693,7 +697,9 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+  profile.push(
+    ...generateWriteRules(writeConfig, logTag, allowGitConfig, allowGitHooks),
+  )
 
   // Pseudo-terminal (pty) support
   if (allowPty) {
@@ -708,61 +714,6 @@ function generateSandboxProfile({
     profile.push('  (literal "/dev/ptmx")')
     profile.push('  (regex #"^/dev/ttys")')
     profile.push(')')
-  }
-
-  // Browser process support (Chrome/Chromium)
-  //
-  // Chromium-based browsers need significantly broader OS permissions than
-  // typical CLI tools. The default Seatbelt profile is designed for commands
-  // like git, node, and npm — Chrome's multi-process architecture requires
-  // Mach IPC for inter-process communication, window server access, GPU
-  // drivers, crash reporting (Crashpad), and more. These services vary by
-  // macOS version and hardware, making an exhaustive allowlist impractical.
-  //
-  // This option grants:
-  //   - All Mach operations (mach*): IPC, bootstrap registration, service
-  //     lookups, task ports, cross-domain lookups. Needed for Crashpad,
-  //     window server (CoreGraphics/SkyLight), CoreDisplay, GPU process, etc.
-  //   - Unrestricted process-info: Chrome manages renderer, GPU, utility,
-  //     and crashpad child processes outside the same sandbox boundary.
-  //   - Broad IOKit access: GPU process and display management.
-  //   - Unrestricted IPC shared memory: renderer ↔ GPU communication.
-  //
-  // Security note: this significantly widens the Mach IPC and process
-  // inspection surface. Filesystem and network restrictions remain fully
-  // enforced. Only enable when browser automation (e.g. agent-browser) is
-  // needed.
-  if (allowBrowserProcess) {
-    profile.push('')
-    profile.push('; Browser process support (Chrome/Chromium)')
-    profile.push(
-      '; All Mach operations — Chrome requires bootstrap registration',
-    )
-    profile.push(
-      '; (Crashpad), service lookups (window server, CoreDisplay, GPU),',
-    )
-    profile.push(
-      '; task ports, and cross-domain lookups that vary by OS version',
-    )
-    profile.push('(allow mach*)')
-    profile.push('')
-    profile.push(
-      '; Process info for all processes — Chrome manages renderer, GPU,',
-    )
-    profile.push(
-      '; utility, and crashpad child processes outside the same sandbox',
-    )
-    profile.push('(allow process-info*)')
-    profile.push('')
-    profile.push(
-      '; Broader IOKit access — needed for GPU process and display management',
-    )
-    profile.push('(allow iokit-open)')
-    profile.push('')
-    profile.push(
-      '; Shared memory with non-sandboxed processes (e.g. renderer ↔ GPU)',
-    )
-    profile.push('(allow ipc-posix-shm*)')
   }
 
   return profile.join('\n')
@@ -793,8 +744,8 @@ export function wrapCommandWithSandboxMacOS(
     readConfig,
     writeConfig,
     allowPty,
-    allowBrowserProcess = false,
     allowGitConfig = false,
+    allowGitHooks = false,
     enableWeakerNetworkIsolation = false,
     binShell,
   } = params
@@ -827,8 +778,8 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowMachLookup,
     allowPty,
-    allowBrowserProcess,
     allowGitConfig,
+    allowGitHooks,
     enableWeakerNetworkIsolation,
     logTag,
   })

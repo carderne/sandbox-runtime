@@ -531,6 +531,10 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+function getAllowGitHooks(): boolean {
+  return config?.filesystem?.allowGitHooks ?? false
+}
+
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -660,9 +664,10 @@ async function wrapWithSandbox(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
-  // Check custom config to allow browser process operations (Chrome/Chromium)
-  const allowBrowserProcess =
-    customConfig?.allowBrowserProcess ?? config?.allowBrowserProcess
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+  const allowGitHooks =
+    customConfig?.filesystem?.allowGitHooks ?? getAllowGitHooks()
 
   switch (platform) {
     case 'macos':
@@ -681,8 +686,8 @@ async function wrapWithSandbox(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowBrowserProcess,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitHooks,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         binShell,
       })
@@ -711,7 +716,8 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitHooks,
         seccompConfig: getSeccompConfig(),
         abortSignal,
       })

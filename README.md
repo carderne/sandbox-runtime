@@ -264,7 +264,9 @@ srt --settings /path/to/srt-settings.json <command>
     "denyRead": ["~/.ssh"],
     "allowRead": [],
     "allowWrite": [".", "src/", "test/", "/tmp"],
-    "denyWrite": [".env", "config/production.json"]
+    "denyWrite": [".env", "config/production.json"],
+    "allowGitConfig": false,
+    "allowGitHooks": false
   },
   "ignoreViolations": {
     "*": ["/usr/bin", "/System"],
@@ -311,6 +313,8 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.allowGitConfig` - Allow writes to `.git/config` files (default: false)
+- `filesystem.allowGitHooks` - Allow writes to `.git/hooks/` directories (default: false). This enables operations like `git init` to install sample hooks, but also allows creating executable hooks.
 
 **Path Syntax (macOS):**
 
@@ -346,8 +350,7 @@ Examples:
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
-- `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` and `com.apple.SystemConfiguration.configd` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA, and for Rust/Go programs (`uv`, `cargo`) that query system proxy/network configuration via `SCDynamicStoreCreate`. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service and exposes host network configuration (proxy settings, DNS servers) through configd.
-- `allowBrowserProcess` - Allow browser process operations in the macOS sandbox (boolean, default: false). Grants the additional Mach IPC, Mach bootstrap registration, process-info, IOKit, and shared-memory permissions that Chromium-based browsers need to launch and run. Required for tools like `agent-browser` that spawn a Chrome/Chromium subprocess. **Security warning:** this significantly widens the Mach IPC and process inspection surface — sandboxed code can look up arbitrary Mach services, inspect other processes, and open IOKit drivers. Filesystem and network restrictions remain enforced, but the broader IPC surface increases the risk of sandbox escape via vulnerable system services. Only enable when browser automation is needed.
+- `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
 
 ### Common Configuration Recipes
 
@@ -542,7 +545,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`
+- Git hooks and config: `.git/hooks/`, `.git/config` (unless `allowGitHooks` or `allowGitConfig` is enabled, respectively)
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
@@ -658,8 +661,7 @@ Users should be aware of potential risks that come from allowing broad domains l
 - Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox.
 - Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
 - Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used incases where additional isolation is otherwise enforced.
-- Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent` and `com.apple.SystemConfiguration.configd`. The former is needed for Go programs to verify TLS certificates via the macOS Security framework; the latter is needed for Rust/Go programs (e.g. `uv`, `cargo`) that query system proxy/network configuration on startup. This opens a potential data exfiltration vector through the trustd service and exposes read-only host network configuration (proxy settings, DNS servers) through configd. Only enable when needed.
-- Browser Process Permissions (macOS): The `allowBrowserProcess` option grants unrestricted Mach IPC (`mach*`), process inspection (`process-info*`), IOKit device access (`iokit-open`), and POSIX shared memory (`ipc-posix-shm*`). These are required by Chromium's multi-process architecture (renderer, GPU, crashpad). While filesystem and network restrictions remain enforced, the broad Mach and process-info surface means sandboxed code could interact with system services or inspect other processes, increasing the risk of privilege escalation via a vulnerable service. Only enable when browser automation is needed.
+- Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent`, which is needed for Go programs to verify TLS certificates via the macOS Security framework. This opens a potential data exfiltration vector through the trustd service and should only be enabled when Go TLS verification is required (e.g., when using `httpProxyPort` with a MITM proxy and custom CA).
 
 ### Known Limitations and Future Work
 

@@ -192,6 +192,12 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.',
     ),
+  allowGitHooks: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow writes to .git/hooks directories (default: false). Enables git init to install sample hooks, but also allows creating executable hooks.',
+    ),
 })
 
 /**
@@ -280,16 +286,6 @@ export const SandboxRuntimeConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
-  allowBrowserProcess: z
-    .boolean()
-    .optional()
-    .describe(
-      'Allow browser process operations (macOS only). Grants the additional Mach IPC, ' +
-        'Mach bootstrap registration, and IOKit permissions that Chromium-based browsers ' +
-        'need to launch and run inside the sandbox. Required for tools like agent-browser ' +
-        'that spawn a Chrome/Chromium subprocess. Without this, Chrome will crash on startup ' +
-        'due to denied Mach service lookups and bootstrap registrations.',
-    ),
   seccomp: SeccompConfigSchema.optional().describe(
     'Custom seccomp binary paths (Linux only).',
   ),
