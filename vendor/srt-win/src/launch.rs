@@ -397,7 +397,9 @@ fn build_env_block(
 // ─── Command-line quoting ───────────────────────────────────────────
 
 /// MSVCRT / `CommandLineToArgvW` quoting for one argument.
-fn quote_arg(a: &str) -> String {
+/// Public so `main.rs`'s self-elevate path can rebuild
+/// `lpParameters` from `std::env::args()`.
+pub fn quote_arg(a: &str) -> String {
     if !a.is_empty()
         && !a
             .chars()

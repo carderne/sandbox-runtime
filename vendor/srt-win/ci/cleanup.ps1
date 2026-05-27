@@ -15,6 +15,8 @@ param(
   [string]$GroupName = 'srt-ci-test',
   # Must match smoke.ps1's default.
   [string]$TestSublayer = 'a91b6f12-4c0e-4e30-b1f7-3d52890ce117',
+  # Must match smoke.ps1's single-install section.
+  [string]$InstallSublayer = 'b2e8a6c4-1f73-4d09-9e25-c7b0d3a48f61',
   # Must match smoke-exec.ps1's default.
   [string]$ExecSublayer = '5b0e64f4-09f1-4c2e-8c97-4d2c0f4e9b7d'
 )
@@ -30,6 +32,8 @@ if ($env:SRT_ALT_GUID) {
   & $Exe wfp uninstall --sublayer-guid $env:SRT_ALT_GUID
 }
 & $Exe wfp uninstall --sublayer-guid $TestSublayer
+& $Exe wfp uninstall --sublayer-guid $InstallSublayer
 & $Exe wfp uninstall --sublayer-guid $ExecSublayer
 & $Exe group delete --name $GroupName
+& $Exe group delete --name "$GroupName-inst"
 exit 0

@@ -26,7 +26,10 @@ param(
   [string]$GroupName = 'srt-ci-test',
   # Distinct from wfp::DEFAULT_SUBLAYER_GUID so local runs never
   # touch a production install.
-  [string]$TestSublayer = 'a91b6f12-4c0e-4e30-b1f7-3d52890ce117'
+  [string]$TestSublayer = 'a91b6f12-4c0e-4e30-b1f7-3d52890ce117',
+  # Second sublayer for the single-install convenience-subcommand
+  # row, so it doesn't perturb the lifecycle section's $TestSublayer.
+  [string]$InstallSublayer = 'b2e8a6c4-1f73-4d09-9e25-c7b0d3a48f61'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +61,11 @@ function MustFail([string[]]$argv, [string]$why) {
   }
 }
 
+# The admin mutators below (group create|delete, wfp install|uninstall)
+# self-elevate via maybe_self_elevate (batch 02b). The CI runner is
+# already elevated, so the helper returns None and they run in-process,
+# same as before; the UAC self-elevate relaunch path is interactive-only
+# (see 02b) and is not exercised here.
 # ── group create (idempotent) ────────────────────────────────────────
 Run @('group', 'create', '--name', $GroupName)
 Run @('group', 'create', '--name', $GroupName)   # second call must succeed
@@ -211,5 +219,89 @@ if ($gd.state -ne 'absent') {
 }
 # Idempotent no-op: second delete must also exit 0.
 Run @('group', 'delete', '--name', $GroupName)
+
+# ═════════════════════════════════════════════════════════════════════
+# Single-step `install` / `uninstall` convenience subcommands.
+#
+# Distinct group name + sublayer so this section is isolated from the
+# lifecycle assertions above. Verifies that one `install` call leaves
+# both the group present AND the WFP filters installed, and that one
+# `uninstall` call removes both.
+# ═════════════════════════════════════════════════════════════════════
+
+$instGrp = "$GroupName-inst"
+$isl = @('--sublayer-guid', $InstallSublayer)
+
+Run (@('install', '--name', $instGrp) + $isl + $pr)
+$ig = J @('group', 'status', '--name', $instGrp)
+if ($ig.state -notin 'created-not-on-token', 'ready') {
+  throw "install: group expected created-not-on-token/ready, got $($ig.state)"
+}
+$iw = J (@('wfp', 'status') + $isl)
+if ($iw.state -ne 'installed' -or $iw.filters -lt 8) {
+  throw "install: wfp expected installed/>=8, got $($iw.state)/$($iw.filters)"
+}
+
+# Idempotency, same range: second install with identical flags is
+# a no-op (exit 0, "already installed").
+$out = & $Exe @(@('install', '--name', $instGrp) + $isl + $pr) 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+  throw "install idempotency: same-range expected exit 0, got $LASTEXITCODE"
+}
+if ($out -notmatch 'already installed') {
+  throw "install idempotency: expected 'already installed' in output, got '$out'"
+}
+$iw2 = J (@('wfp', 'status') + $isl)
+if ($iw2.filters -ne $iw.filters) {
+  throw "install idempotency: filters $($iw.filters) -> $($iw2.filters)"
+}
+
+# Conflict, different range without --force: exits 13.
+& $Exe @(@('install', '--name', $instGrp, '--proxy-port-range', '50000-50001') + $isl) 2>$null
+if ($LASTEXITCODE -ne 13) {
+  throw "install conflict: different-range without --force expected exit 13, got $LASTEXITCODE"
+}
+# Original range still in place.
+$iw3 = J (@('wfp', 'status') + $isl)
+if ($iw3.port_range[0] -ne 60080) {
+  throw "install conflict: range was overwritten without --force"
+}
+
+# --force replaces.
+Run (@('install', '--name', $instGrp, '--proxy-port-range', '50000-50001', '--force') + $isl)
+$iwF = J (@('wfp', 'status') + $isl)
+if ($iwF.port_range[0] -ne 50000 -or $iwF.port_range[1] -ne 50001) {
+  throw "install --force: expected port_range [50000,50001], got [$($iwF.port_range -join ',')]"
+}
+
+# --group-sid path (group externally managed; here it already
+# exists from the --name install above). With matching range
+# this is the same-range no-op.
+Run (@('install', '--group-sid', $ig.sid, '--proxy-port-range', '50000-50001') + $isl)
+
+# Distinct exit code 11: group step fails on a malformed
+# --group-sid (canonicalize_sid rejects). --force so the
+# pre-check (which would otherwise fire on the existing
+# install above) is skipped and we reach the group step.
+& $Exe @(@('install', '--group-sid', 'not-a-sid', '--force') + $isl) 2>$null
+if ($LASTEXITCODE -ne 11) {
+  throw "install: invalid --group-sid expected exit 11, got $LASTEXITCODE"
+}
+
+# Uninstall removes filters only — group remains.
+Run (@('uninstall') + $isl)
+$uw = J (@('wfp', 'status') + $isl)
+if ($uw.state -ne 'absent') {
+  throw "uninstall: wfp expected absent, got $($uw.state)"
+}
+$ug = J @('group', 'status', '--name', $instGrp)
+if ($ug.state -notin 'created-not-on-token', 'ready') {
+  throw "uninstall: group should be left intact, got $($ug.state)"
+}
+# Idempotent no-op: second uninstall must also exit 0.
+Run (@('uninstall') + $isl)
+
+# Explicit group teardown.
+Run @('group', 'delete', '--name', $instGrp)
 
 Write-Host 'srt-win smoke: OK'
