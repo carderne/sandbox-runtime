@@ -747,10 +747,19 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     'E3: msys2 wget to an allowed host → 200',
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
+      // No -q: wget's connection log (which proxy address it dialed,
+      // and any "failed: Connection refused") goes to stderr so a
+      // failure self-explains in the message below.
       const r = await runSandboxed(
-        `"${MSYS2_WGET}" -q -O NUL --server-response --timeout=15 https://example.com`,
+        `"${MSYS2_WGET}" -O NUL --server-response --timeout=15 https://example.com`,
       )
-      expect(r.stderr + r.stdout).toMatch(/HTTP\/[\d.]+ 200/)
+      if (!/HTTP\/[\d.]+ 200/.test(r.stderr + r.stdout)) {
+        throw new Error(
+          `E3 wget via proxy: no HTTP 200 seen · status=${r.status} · ` +
+            `stdout=${JSON.stringify(r.stdout.slice(0, 400))} · ` +
+            `stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
+        )
+      }
     },
     30_000,
   )
@@ -810,9 +819,19 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       SandboxManager.updateConfig(
         createTestConfig(['crates.io', 'static.crates.io']),
       )
+      // CARGO_HTTP_CHECK_REVOKE=false: schannel's certificate
+      // revocation lookup goes through CryptoAPI/WinHTTP, which never
+      // reads proxy env vars, so under the egress sandbox it can't
+      // reach the CRL endpoint unless the runner's CRL cache happens
+      // to be warm. Standard practice behind corporate proxies; this
+      // row proves cargo's own traffic routes via the proxy, not
+      // revocation policy.
       const r = await runSandboxedUntil(
         'cargo search serde --limit 1',
         x => x.status === 0 && /serde/.test(x.stdout),
+        2,
+        30_000,
+        { CARGO_HTTP_CHECK_REVOKE: 'false' },
       )
       expectStatus('tool/cargo', r, [0])
       expect(r.stdout).toMatch(/serde/)
