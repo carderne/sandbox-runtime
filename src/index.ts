@@ -7,6 +7,10 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  CredentialsConfig,
+  CredentialFileConfig,
+  CredentialEnvVarConfig,
+  CredentialMode,
   IgnoreViolationsConfig,
 } from './sandbox/sandbox-config.js'
 
@@ -14,6 +18,7 @@ export {
   SandboxRuntimeConfigSchema,
   NetworkConfigSchema,
   FilesystemConfigSchema,
+  CredentialsConfigSchema,
   IgnoreViolationsConfigSchema,
   RipgrepConfigSchema,
 } from './sandbox/sandbox-config.js'
@@ -23,6 +28,7 @@ export type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
+  CredentialRestrictionConfig,
   NetworkRestrictionConfig,
   NetworkHostPattern,
 } from './sandbox/sandbox-schemas.js'

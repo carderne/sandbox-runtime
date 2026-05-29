@@ -112,6 +112,84 @@ const ParentProxyConfigSchema = z.object({
 })
 
 /**
+ * Schema for the access mode of a declared credential source.
+ *
+ * - `deny` — the sandboxed process cannot read the file / does not see the
+ *   environment variable.
+ * - `allow` — SRT adds no restriction for that source, and the entry exempts
+ *   the matching path from the default credential deny list
+ *   (DANGEROUS_CREDENTIAL_PATHS in sandbox-utils.ts).
+ * - `mask` — reserved for credential masking; rejected until masking ships.
+ */
+const credentialModeSchema = z
+  .enum(['deny', 'allow', 'mask'])
+  .refine(mode => mode !== 'mask', {
+    message:
+      'Credential mode "mask" is not supported yet. Use "deny" to block the ' +
+      'credential inside the sandbox or "allow" to pass it through unchanged; ' +
+      'masking will be added in a future release.',
+  })
+
+/**
+ * Schema for an environment variable name. Restricted to names that can be
+ * passed safely to `env -u` (macOS) and bwrap `--unsetenv` (Linux).
+ */
+const envVarNameSchema = z
+  .string()
+  .min(1, 'Environment variable name cannot be empty')
+  .refine(val => !/[=\s\0]/.test(val), {
+    message:
+      'Environment variable name must not contain "=", whitespace, or NUL characters',
+  })
+
+/**
+ * Schema for a single credential file/directory entry.
+ */
+export const CredentialFileConfigSchema = z.object({
+  path: filesystemPathSchema.describe(
+    'Path to a credential file or directory. Supports the same path forms as ' +
+      'filesystem.denyRead (absolute paths and ~ expansion).',
+  ),
+  mode: credentialModeSchema.describe('Access mode for this path'),
+})
+
+/**
+ * Schema for a single credential environment variable entry.
+ */
+export const CredentialEnvVarConfigSchema = z.object({
+  name: envVarNameSchema.describe('Environment variable name'),
+  mode: credentialModeSchema.describe(
+    'Access mode for this environment variable',
+  ),
+})
+
+/**
+ * Credentials configuration schema for validation.
+ *
+ * Declares credential sources (files and environment variables) with a
+ * per-source mode:
+ * - `deny` blocks the source inside the sandbox (file reads are denied via the
+ *   filesystem read-deny mechanism, env vars are unset in the child).
+ * - `allow` adds no restriction for that source AND exempts the matching path
+ *   from the default credential deny list (DANGEROUS_CREDENTIAL_PATHS). It
+ *   never overrides an explicit filesystem.denyRead or `mode: "deny"` entry.
+ *
+ * When this section is present, the DANGEROUS_CREDENTIAL_PATHS defaults are
+ * also denied for reads. Configs without a `credentials` section behave
+ * exactly as before this section existed.
+ */
+export const CredentialsConfigSchema = z.object({
+  files: z
+    .array(CredentialFileConfigSchema)
+    .optional()
+    .describe('Credential files or directories to protect'),
+  envVars: z
+    .array(CredentialEnvVarConfigSchema)
+    .optional()
+    .describe('Environment variables to protect'),
+})
+
+/**
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
@@ -303,6 +381,10 @@ export const SandboxRuntimeConfigSchema = z.object({
   filesystem: FilesystemConfigSchema.describe(
     'Filesystem restrictions configuration',
   ),
+  credentials: CredentialsConfigSchema.optional().describe(
+    'Credential handling configuration. When present, the default credential ' +
+      'store paths (DANGEROUS_CREDENTIAL_PATHS) are also denied for reads.',
+  ),
   ignoreViolations: IgnoreViolationsConfigSchema.optional().describe(
     'Optional configuration for ignoring specific violations',
   ),
@@ -358,6 +440,12 @@ export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
+export type CredentialMode = z.infer<typeof credentialModeSchema>
+export type CredentialFileConfig = z.infer<typeof CredentialFileConfigSchema>
+export type CredentialEnvVarConfig = z.infer<
+  typeof CredentialEnvVarConfigSchema
+>
+export type CredentialsConfig = z.infer<typeof CredentialsConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >

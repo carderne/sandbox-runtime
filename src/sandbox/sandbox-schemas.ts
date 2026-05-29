@@ -36,6 +36,19 @@ export interface FsWriteRestrictionConfig {
 }
 
 /**
+ * Credential restriction config (internal structure built from the
+ * `credentials` config section).
+ *
+ * - `denyReadPaths`: paths to merge into the read-deny set
+ *   (FsReadRestrictionConfig.denyOnly), unioned with caller-supplied denyRead.
+ * - `unsetEnvVars`: environment variable names to unset inside the sandbox.
+ */
+export interface CredentialRestrictionConfig {
+  denyReadPaths: string[]
+  unsetEnvVars: string[]
+}
+
+/**
  * Network restriction config (internal structure built from permission rules).
  *
  * This uses an "allow-only" pattern (like write restrictions):
