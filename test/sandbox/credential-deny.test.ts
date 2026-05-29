@@ -480,18 +480,18 @@ describe.if(isLinux)('credential deny on Linux (bwrap)', () => {
   })
 
   describe('bwrap argv generation', () => {
-    it('emits a /dev/null mask for a denied credential file', async () => {
+    it('emits a /dev/null bind for a denied credential file', async () => {
       const wrapped = await SandboxManager.wrapWithSandbox('true')
 
       expect(wrapped).toContain(`--ro-bind /dev/null ${SECRET_FILE}`)
       expect(wrapped).toContain(`--tmpfs ${SECRET_DIR}`)
     })
 
-    it('masks the resolved target when a denied credential file is a symlink', async () => {
+    it('denies the resolved target when a denied credential file is a symlink', async () => {
       const wrapped = await SandboxManager.wrapWithSandbox('true')
 
-      // bwrap rejects symlink bind destinations, so the mask lands on the
-      // symlink's target instead of the symlink path itself.
+      // bwrap rejects symlink bind destinations, so the deny bind lands on
+      // the symlink's target instead of the symlink path itself.
       expect(wrapped).toContain(`--ro-bind /dev/null ${SECRET_LINK_TARGET}`)
       expect(wrapped).not.toContain(`--ro-bind /dev/null ${SECRET_LINK} `)
     })
@@ -526,7 +526,7 @@ describe.if(isLinux)('credential deny on Linux (bwrap)', () => {
       const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
       const result = runInSandbox(wrapped)
 
-      // The /dev/null mask makes the file readable but empty
+      // The /dev/null bind makes the file readable but empty
       expect(result.stdout).not.toContain('hunter2')
       expect(result.stdout.trim()).toBe('')
     })
@@ -535,7 +535,7 @@ describe.if(isLinux)('credential deny on Linux (bwrap)', () => {
       const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_LINK}`)
       const result = runInSandbox(wrapped)
 
-      // The symlink resolves to the masked target inside the mount namespace
+      // The symlink resolves to the denied target inside the mount namespace
       expect(result.stdout).not.toContain('hunter2')
       expect(result.stdout.trim()).toBe('')
     })

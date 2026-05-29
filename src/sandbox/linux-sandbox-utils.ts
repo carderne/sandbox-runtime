@@ -692,7 +692,7 @@ function buildSandboxCommand(
  * bwrap cannot create a file bind mount point over a destination that is
  * itself a symlink — `--ro-bind /dev/null <symlink>` fails with "Can't create
  * file at <path>" and the whole command refuses to start. File read-deny
- * masks therefore target the symlink's resolved target instead: reads
+ * binds therefore target the symlink's resolved target instead: reads
  * through the symlink resolve to that target inside the mount namespace, so
  * the denied content stays covered. This matters for credential dotfiles
  * (~/.netrc, ~/.npmrc, …) that are commonly symlinks into a dotfile
@@ -701,7 +701,7 @@ function buildSandboxCommand(
  * carve-outs expressed against the symlink path (e.g. /bin on usr-merged
  * systems).
  */
-function resolveSymlinkFileMaskDest(normalizedPath: string): string {
+function resolveSymlinkDenyDest(normalizedPath: string): string {
   try {
     if (fs.lstatSync(normalizedPath).isSymbolicLink()) {
       return fs.realpathSync(normalizedPath)
@@ -1021,11 +1021,11 @@ async function generateFilesystemArgs(
         )
         continue
       }
-      // For files, bind /dev/null instead of tmpfs. Mask the resolved target
-      // when the path is a symlink — bwrap rejects symlink bind destinations.
-      const maskDest = resolveSymlinkFileMaskDest(normalizedPath)
-      args.push('--ro-bind', '/dev/null', maskDest)
-      maskedFiles.add(maskDest)
+      // For files, bind /dev/null instead of tmpfs. bwrap rejects symlink
+      // bind destinations, so the deny bind lands on the resolved target.
+      const denyDest = resolveSymlinkDenyDest(normalizedPath)
+      args.push('--ro-bind', '/dev/null', denyDest)
+      maskedFiles.add(denyDest)
       maskedFiles.add(normalizedPath)
     }
   }
