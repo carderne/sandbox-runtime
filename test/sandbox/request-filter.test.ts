@@ -98,6 +98,59 @@ describe('network.filterRequest', () => {
     expect(seen!.signal).toBeInstanceOf(AbortSignal)
   })
 
+  // Regression: previously, the URL passed to filterRequest was built
+  // from `req.headers.host ?? target.hostname`. The Host header is
+  // attacker-controlled (the sandboxed client picks any value once TLS
+  // is terminated), so a sandboxed process could CONNECT to allowlisted
+  // host A and send a decrypted request with `Host: B` (some other
+  // allowlisted host). filterRequest would see "the request is going
+  // to B" while the request is actually delivered to A. A consumer
+  // using filterRequest for per-host method gating (e.g. "POST allowed
+  // only to inference endpoints") was bypassable: spoof
+  // `Host: api.inference.example` on a CONNECT to a non-inference
+  // host, get the POST allowed, and have it delivered to the original
+  // CONNECT target.
+  //
+  // Fix: derive the URL from the verified CONNECT target only.
+  test('URL passed to filterRequest is the CONNECT target, NOT a spoofed Host header', async () => {
+    let seen: Request | undefined
+    let upstreamSawRequest = false
+    upstream.on('request', () => {
+      upstreamSawRequest = true
+    })
+    await withProxy(
+      async req => {
+        seen = req
+        // Deny anything that isn't 127.0.0.1 — i.e. emulate a per-host
+        // policy. If the URL came from the spoofed Host header, this
+        // would erroneously allow the request through.
+        const host = new URL(req.url).hostname
+        if (host !== '127.0.0.1') {
+          return { action: 'deny', reason: `unexpected host ${host}` }
+        }
+        return { action: 'deny', reason: 'denied for the test' }
+      },
+      async port => {
+        const r = await curl(port, `https://127.0.0.1:${upstreamPort}/x`, {
+          method: 'POST',
+          body: 'exfil',
+          headers: ['Host: spoofed.example.com'],
+        })
+        // We expect the deny to fire, but with the CORRECT host
+        // (127.0.0.1), not 'spoofed.example.com'.
+        expect(r.status).toBe(403)
+        expect(r.body).toContain('denied for the test')
+      },
+    )
+    expect(seen).toBeDefined()
+    const u = new URL(seen!.url)
+    expect(u.hostname).toBe('127.0.0.1')
+    expect(u.port).toBe(String(upstreamPort))
+    // Upstream must NOT have seen the request — even though the Host
+    // header named an allowlisted-looking host.
+    expect(upstreamSawRequest).toBe(false)
+  })
+
   test('deny returns 403 with reason; upstream not reached', async () => {
     let upstreamHit = false
     const decision: RequestDecision = {

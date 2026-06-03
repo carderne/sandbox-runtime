@@ -203,11 +203,25 @@ async function forwardUpstream(
   if (filterRequest) {
     const ac = new AbortController()
     res.once('close', () => ac.abort())
+    // Build the URL passed to filterRequest from the CONNECT target,
+    // NOT from `req.headers.host`. The Host header is supplied by the
+    // sandboxed client and can be spoofed: a sandboxed process can
+    // CONNECT to allowlisted host A and then send a decrypted request
+    // with `Host: B` (where B is some other allowlisted host). If we
+    // built the filterRequest URL from req.headers.host the callback
+    // would see "host=B" while the request is actually delivered to A.
+    // A consumer using filterRequest for per-host method gating (e.g.
+    // "POST allowed only to inference endpoints") would be bypassed —
+    // the agent could spoof Host: api.example.com on a CONNECT to a
+    // different allowlisted host, get the POST allowed, and have it
+    // delivered to the CONNECT target instead.
+    //
+    // Always derive the URL from the verified CONNECT target so
+    // filterRequest sees the actual upstream destination.
     const host =
-      req.headers.host ??
-      (target.port === 443
+      target.port === 443
         ? target.hostname
-        : `${target.hostname}:${target.port}`)
+        : `${target.hostname}:${target.port}`
     const out = await decideAndRespond(
       filterRequest,
       req,
