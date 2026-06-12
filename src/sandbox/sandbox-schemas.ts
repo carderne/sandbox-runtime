@@ -43,11 +43,17 @@ export interface FsWriteRestrictionConfig {
  * - `deniedHosts` = hosts that are explicitly denied (checked first, before allowedHosts)
  *
  * Semantics:
- * - `undefined` = maximally restrictive (deny all network)
- * - `{allowedHosts: [], deniedHosts: []}` = maximally restrictive (nothing allowed)
+ * - `undefined` allowedHosts = no allowlist configured
+ * - `{allowedHosts: [], deniedHosts: []}` = allowlist configured with zero entries
  * - `{allowedHosts: [...], deniedHosts: [...]}` = apply allow/deny rules
  *
- * Note: Empty `allowedHosts` means NO hosts are allowed (unlike read's empty denyOnly).
+ * Note: Empty `allowedHosts` means no host matches an allow rule (unlike
+ * read's empty denyOnly). Whether an unmatched host is denied outright
+ * depends on the ask callback: deniedHosts are checked first and deny
+ * unconditionally; a host matching neither list falls through to the
+ * registered SandboxAskCallback when one exists, and is denied only when
+ * no callback is registered. Hosts needing a hard block-all regardless of
+ * callback behavior should use a `deniedHosts` wildcard.
  */
 export interface NetworkRestrictionConfig {
   allowedHosts?: string[]

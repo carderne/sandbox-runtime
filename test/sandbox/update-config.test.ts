@@ -87,10 +87,12 @@ describe('SandboxManager.updateConfig', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    // Initial state: no allowed hosts (empty array becomes undefined in getter)
-    expect(
-      SandboxManager.getNetworkRestrictionConfig().allowedHosts,
-    ).toBeUndefined()
+    // Initial state: allowlist configured with zero entries. The getter must
+    // preserve the empty array — consumers distinguish "no allowlist
+    // configured" (undefined) from "allowlist configured, nothing allowed".
+    expect(SandboxManager.getNetworkRestrictionConfig().allowedHosts).toEqual(
+      [],
+    )
 
     // Update config to allow example.com
     SandboxManager.updateConfig({
@@ -121,7 +123,7 @@ describe('SandboxManager.updateConfig', () => {
     })
 
     config = SandboxManager.getNetworkRestrictionConfig()
-    expect(config.allowedHosts).toBeUndefined()
+    expect(config.allowedHosts).toEqual([])
     expect(config.deniedHosts).toContain('example.com')
 
     // Move back to allowlist
@@ -152,10 +154,11 @@ describe('SandboxManager.updateConfig', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    // Empty array becomes undefined in getter
-    expect(
-      SandboxManager.getNetworkRestrictionConfig().allowedHosts,
-    ).toBeUndefined()
+    // The getter preserves the explicitly-empty allowlist so consumers can
+    // tell a configured block-all apart from no restriction at all
+    expect(SandboxManager.getNetworkRestrictionConfig().allowedHosts).toEqual(
+      [],
+    )
 
     // Verify the actual config still exists
     const fullConfig = SandboxManager.getConfig()

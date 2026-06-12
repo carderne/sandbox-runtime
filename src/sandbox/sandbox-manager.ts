@@ -615,11 +615,17 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
     return {}
   }
 
+  // Preserve an explicitly-empty allowlist: consumers need to distinguish
+  // "no network restriction configured" (absent) from "allowlist configured
+  // with zero entries" (block-all / ask-only). Stripping the empty array
+  // made a host app's restriction-status UI report an airgapped config as
+  // unrestricted. deniedHosts keeps the strip — an empty denylist and an
+  // absent one are semantically identical.
   const allowedHosts = config.network.allowedDomains
   const deniedHosts = config.network.deniedDomains
 
   return {
-    ...(allowedHosts.length > 0 && { allowedHosts }),
+    allowedHosts,
     ...(deniedHosts.length > 0 && { deniedHosts }),
   }
 }
