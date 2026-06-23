@@ -190,10 +190,8 @@ function listenOn(port: number): Promise<BoundListener> {
 
 /**
  * Bind the first free port from `candidates`, retrying on
- * EADDRINUSE. Used for the out-of-range loopback row: we need a
- * FIXED port outside the proxy range (Windows ephemeral ports are
- * 49152–65535, which overlaps the proxy range and is unstable for
- * a "definitely out of range" assertion).
+ * EADDRINUSE. Used by the IN-range loopback row (C6) where the
+ * candidate list is the proxy range minus the live proxy ports.
  */
 async function bindFirstFree(candidates: number[]): Promise<BoundListener> {
   let lastErr: unknown
@@ -207,6 +205,29 @@ async function bindFirstFree(candidates: number[]): Promise<BoundListener> {
   }
   throw new Error(
     `no free port among ${candidates.join(',')}: ${(lastErr as Error)?.message}`,
+  )
+}
+
+/**
+ * Bind an ephemeral loopback port (the OS picks) and return it
+ * provided it falls OUTSIDE the WFP-allowed proxy port range. If
+ * the assigned port lands in the range (the Windows ephemeral pool
+ * 49152–65535 overlaps it), close and retry — capped at 5; the
+ * chance of all 5 landing in a 10-port window of ~16k is
+ * effectively zero. Avoids the fixed-port collisions a candidate
+ * list can hit on a busy runner.
+ */
+async function bindOutOfRange(): Promise<BoundListener> {
+  for (let i = 0; i < 5; i++) {
+    const l = await listenOn(0)
+    if (l.port < PORT_RANGE[0] || l.port > PORT_RANGE[1]) {
+      return l
+    }
+    await l.close()
+  }
+  throw new Error(
+    `bindOutOfRange: 5 ephemeral binds all landed in ` +
+      `[${PORT_RANGE[0]}, ${PORT_RANGE[1]}]`,
   )
 }
 
@@ -651,12 +672,11 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   }, 20_000)
 
   it('C7: child BLOCKED from an OUT-of-range loopback port (filter-3)', async () => {
-    // FIXED out-of-range port (50000, matching smoke.ps1) with
-    // retry on EADDRINUSE. Binding ephemeral port 0 would land in
-    // 49152–65535, which OVERLAPS the proxy range — sometimes
-    // in-range (filter-2 PERMITs → wrong) and the `< lo` sanity
-    // check flaked ~1/3 of runs.
-    const l = await bindFirstFree([50000, 50001, 50002, 49500, 51000])
+    // Ephemeral bind, retried until the OS-assigned port falls
+    // outside the WFP-allowed proxy range — robust to both
+    // fixed-port collisions on a busy runner AND the ephemeral pool
+    // overlapping the proxy range.
+    const l = await bindOutOfRange()
     try {
       // Sanity: genuinely outside the proxy port range.
       expect(l.port < PORT_RANGE[0] || l.port > PORT_RANGE[1]).toBe(true)

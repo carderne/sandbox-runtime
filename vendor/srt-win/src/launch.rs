@@ -40,19 +40,7 @@ use crate::winsta::WinStaDesk;
 
 // ─── RAII handle wrappers ───────────────────────────────────────────
 
-/// Owns a kernel `HANDLE`; `CloseHandle` on drop. For tokens and
-/// the like — anything where the only cleanup is `CloseHandle`.
-struct OwnedHandle(HANDLE);
-impl OwnedHandle {
-    fn raw(&self) -> HANDLE { self.0 }
-}
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe { let _ = CloseHandle(self.0); }
-        }
-    }
-}
+use crate::util::OwnedHandle;
 
 /// Owns a freshly-spawned (suspended) child. If dropped before
 /// [`defuse`] is called, terminates the child — so an error
@@ -349,20 +337,48 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
 /// it by walking the parent-process chain rather than via an
 /// environment variable.
 fn build_env_block() -> Vec<u16> {
-    let mut entries: Vec<(String, String)> = std::env::vars().collect();
+    use std::os::windows::ffi::OsStrExt;
 
-    add_proxy_case_twins(&mut entries);
+    // Lossless base set — `env::vars()` PANICS on any entry whose
+    // key or value is not valid UTF-8 (e.g. a PATH segment with an
+    // unpaired surrogate from a profile path). Build from
+    // `vars_os()` and encode each via `encode_wide` so nothing is
+    // dropped and nothing panics.
+    let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        std::env::vars_os().collect();
 
-    // Order the block case-insensitively by name; values pass through
-    // verbatim. No dedup — case-variant duplicates are preserved.
-    entries.sort_by_cached_key(|(k, _)| k.to_ascii_uppercase());
+    // Proxy case-twin repair operates on the UTF-8-decodable
+    // subset: proxy variable NAMES are ASCII by convention so
+    // filtering to entries whose key round-trips as UTF-8 misses
+    // nothing relevant; values are passed through lossily (the
+    // helper only inspects names, never values). Built from
+    // `vars_os()` for the same panic-avoidance reason — `vars()`
+    // panics on ANY non-UTF-8 entry, not just the one being read.
+    let mut twin_view: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            Some((k.into_string().ok()?, v.to_string_lossy().into_owned()))
+        })
+        .collect();
+    let before = twin_view.len();
+    add_proxy_case_twins(&mut twin_view);
+    for (k, v) in twin_view.into_iter().skip(before) {
+        entries.push((k.into(), v.into()));
+    }
+
+    // Order the block case-insensitively by name; values pass
+    // through verbatim. No dedup — case-variant duplicates are
+    // preserved. The sort key uses `to_string_lossy` only for
+    // ordering; the encoded bytes use `encode_wide` losslessly.
+    entries.sort_by_cached_key(|(k, _)| {
+        k.to_string_lossy().to_ascii_uppercase()
+    });
 
     // Encode: `KEY=VALUE\0`… `\0`.
     let mut out: Vec<u16> = Vec::new();
     for (k, v) in entries {
-        out.extend(k.encode_utf16());
+        out.extend(k.encode_wide());
         out.push(b'=' as u16);
-        out.extend(v.encode_utf16());
+        out.extend(v.encode_wide());
         out.push(0);
     }
     out.push(0);
@@ -445,6 +461,10 @@ fn target_is_cmd(exe: &Path) -> bool {
     exe.file_name()
         .and_then(|n| n.to_str())
         .map(|s| {
+            // Win32 strips trailing dots/spaces from the final
+            // path component, so `cmd.exe.` launches real cmd —
+            // match it here so it gets cmd quoting, not MSVCRT.
+            let s = s.trim_end_matches(['.', ' ']);
             s.eq_ignore_ascii_case("cmd.exe") || s.eq_ignore_ascii_case("cmd")
         })
         .unwrap_or(false)

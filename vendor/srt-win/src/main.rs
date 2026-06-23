@@ -7,6 +7,8 @@
 //!   wfp    install | status | uninstall — manage the persistent WFP filters
 //!   exec   -- <target> [args...]       — spawn under the deny-only-group
 //!                                         token + job + hardening stack
+//!   acl    stamp | restore | recover   — file-level denyRead/denyWrite via
+//!                                         broker-only DACL stamp + state DB
 //!
 //! `status` subcommands write one line of JSON to stdout and exit 0.
 //! Mutating subcommands require elevation and write human-readable
@@ -93,6 +95,15 @@ enum Cmd {
         #[command(subcommand)]
         sub: WfpCmd,
     },
+    /// Stamp/restore broker-only DACLs on file paths so the
+    /// sandboxed child cannot read (or write) them. State is
+    /// persisted in `%LOCALAPPDATA%\sandbox-runtime\state.db` so
+    /// concurrent brokers refcount and a crash mid-session is
+    /// recoverable by the next `acl` op.
+    Acl {
+        #[command(subcommand)]
+        sub: AclCmd,
+    },
     /// Spawn a process under the deny-only-group sandbox.
     ///
     /// Builds a restricted token (group + Admins flipped deny-only,
@@ -121,6 +132,16 @@ enum Cmd {
         /// and cannot logout/login mid-run.
         #[arg(long)]
         skip_group_check: bool,
+        /// PID of the long-lived host whose `acl stamp` holds this
+        /// child should be fenced under. When set, exec opens a
+        /// no-`FILE_SHARE_DELETE` handle on every file that holder
+        /// has stamped and keeps it open until the child exits — the
+        /// OS then refuses delete/rename of those files, which the
+        /// file's DACL alone cannot prevent (delete is authorized by
+        /// the parent directory). When omitted, exec runs with no
+        /// state-DB dependency (current standalone behaviour).
+        #[arg(long)]
+        holder_pid: Option<u32>,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -172,6 +193,199 @@ enum GroupCmd {
         #[command(flatten)]
         group: GroupRef,
     },
+}
+
+#[derive(Subcommand)]
+enum AclCmd {
+    /// Read `{denyRead:[…], denyWrite:[…]}` from stdin, stamp each
+    /// path's DACL broker-only, and record this process as a
+    /// holder. Idempotent across calls and brokers (refcounted).
+    /// Directories and globs are rejected.
+    Stamp {
+        #[command(flatten)]
+        group: GroupRef,
+        /// PID of the LONG-LIVED process that owns these stamps —
+        /// normally the Node host (sandbox-runtime), which calls
+        /// `acl stamp` at initialize() and `acl restore` at reset()
+        /// from a SEPARATE short-lived `srt-win` process. The stamp
+        /// persists until this PID exits or restores. Required:
+        /// the `srt-win acl` process exits immediately, so keying
+        /// on its own PID would orphan the stamp instantly.
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// Drop the holder's claim on every path it stamped; restore the
+    /// original DACL on any path whose refcount falls to zero.
+    Restore {
+        #[command(flatten)]
+        group: GroupRef,
+        /// Holder PID whose stamps to release (see `acl stamp`).
+        /// Must match the value passed at stamp time.
+        #[arg(long)]
+        holder_pid: u32,
+        /// Emit a single JSON array of per-path
+        /// `{path, status, expectedFileId?, movedTo?, leftStamped?}`
+        /// objects on stdout (exit 0 always); the host raises any
+        /// error AFTER reading the array. Without this flag, the
+        /// existing human-readable summary goes to stderr.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run crash-recovery only: prune dead holders, restore any
+    /// orphaned stamps. `--force` restores even when the file's
+    /// current DACL no longer matches what we stamped (overwrites
+    /// third-party edits — use with care).
+    Recover {
+        #[command(flatten)]
+        group: GroupRef,
+        #[arg(long)]
+        force: bool,
+        /// Emit a single JSON array of per-path outcomes on stdout
+        /// (see `acl restore --json`).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// One per-path entry of the structured `acl restore --json` /
+/// `acl recover --json` result. The host reads the full array,
+/// then raises if any entry is not `restored` — restore
+/// processes ALL paths first; errors are surfaced afterward,
+/// never mid-batch.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct RestoreEntry {
+    path: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_stamped: Option<bool>,
+}
+
+/// A parent directory's restore outcome in the structured
+/// `--json` result. `status: "leftStamped"` means the directory's
+/// allow-list could NOT be removed (`restore_sd` failed) and the
+/// `parent_stamps` row was kept for the next pass to retry.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct ParentEntry {
+    path: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Top-level shape of `acl restore --json` / `acl recover --json`.
+#[derive(serde::Serialize)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct RestoreResult {
+    paths: Vec<RestoreEntry>,
+    parents: Vec<ParentEntry>,
+}
+
+#[cfg(windows)]
+fn parent_entries_from(
+    entries: &[(String, srt_win::state_db::ParentRestoreOutcome)],
+) -> Vec<ParentEntry> {
+    use srt_win::state_db::ParentRestoreOutcome;
+    entries
+        .iter()
+        .map(|(p, out)| ParentEntry {
+            path: p.clone(),
+            status: out.as_str(),
+            error: if let ParentRestoreOutcome::Failed(e) = out {
+                Some(e.clone())
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn restore_entry(
+    snap: &srt_win::state_db::Snapshot,
+    out: &srt_win::state_db::RestoreOutcome,
+) -> RestoreEntry {
+    use srt_win::state_db::RestoreOutcome;
+    let (status, moved_to, left_stamped) = match out {
+        RestoreOutcome::Restored | RestoreOutcome::AlreadyOriginal => {
+            ("restored", None, None)
+        }
+        RestoreOutcome::Relocated { moved_to } => {
+            ("relocated", Some(moved_to.clone()), Some(true))
+        }
+        RestoreOutcome::Missing => ("missing", None, Some(true)),
+        RestoreOutcome::LeftChanged => ("leftChanged", None, Some(true)),
+        RestoreOutcome::LeftUnreadable => {
+            ("leftUnreadable", None, Some(true))
+        }
+        RestoreOutcome::Tampered => {
+            ("originalSdTampered", None, Some(true))
+        }
+        RestoreOutcome::OriginalLost => {
+            ("originalSdLost", None, Some(true))
+        }
+        RestoreOutcome::StampedUnrecognized => {
+            ("stampedUnrecognized", None, Some(true))
+        }
+    };
+    RestoreEntry {
+        path: snap.canonical_path.clone(),
+        status,
+        expected_file_id: if status == "restored" {
+            None
+        } else {
+            Some(snap.file_id.to_hex())
+        },
+        moved_to,
+        left_stamped,
+    }
+}
+
+/// Per-batch accounting derived from `StampWitness`es.
+#[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct StampTally {
+    fresh: u32,
+    restamped: u32,
+    already: u32,
+    fence: u32,
+    lost: u32,
+    failed: u32,
+}
+
+#[cfg(windows)]
+impl StampTally {
+    fn record(&mut self, w: &srt_win::state_db::StampWitness) {
+        use srt_win::state_db::StampAction;
+        match w.action {
+            StampAction::Fresh => self.fresh += 1,
+            StampAction::ReStamped => self.restamped += 1,
+            StampAction::AlreadyStamped => self.already += 1,
+        }
+        if w.needs_handle_fence {
+            self.fence += 1;
+        }
+        if w.original_lost {
+            self.lost += 1;
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct AclStampInput {
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_write: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -493,17 +707,348 @@ fn run() -> anyhow::Result<()> {
             eprintln!("srt-win: removed {n} WFP filter(s)");
         }
 
+        // ─── acl ───────────────────────────────────────────────────
+        Cmd::Acl {
+            sub: AclCmd::Stamp { group, holder_pid },
+        } => {
+            use srt_win::{acl, sid, state_db};
+            let gsid = resolve_group_sid(&group)?;
+            let user_sid = sid::current_user_sid()?;
+            let holder = state_db::HolderPid(holder_pid);
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("read stdin")?;
+            let input: AclStampInput = serde_json::from_str(&buf)
+                .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
+            // Canonicalize and reject dirs/globs BEFORE taking the
+            // mutex so a bad input doesn't hold the lock. Globs and
+            // directories are HARD errors (config bug — abort the
+            // whole batch). Any other canonicalize failure
+            // (nonexistent path, transient open error,
+            // unpaired-surrogate canonical) is collected per-path
+            // and the batch continues — but exit is non-zero so the
+            // host never treats a partial stamp as success.
+            let mut targets: Vec<(String, acl::AclMask)> = Vec::new();
+            let mut bad_inputs: Vec<(String, String)> = Vec::new();
+            for (list, mask) in [
+                (&input.deny_read, acl::AclMask::ReadDeny),
+                (&input.deny_write, acl::AclMask::WriteDeny),
+            ] {
+                for p in list {
+                    match acl::canonicalize_path(p) {
+                        Ok((canon, false)) => targets.push((canon, mask)),
+                        Ok((canon, true)) => {
+                            return Err(anyhow!(
+                                "Windows fs deny requires explicit file \
+                                 paths; got directory '{p}' (canonical \
+                                 '{canon}')."
+                            ));
+                        }
+                        Err(acl::CanonError::Glob) => {
+                            return Err(anyhow!(
+                                "Windows fs deny requires explicit file \
+                                 paths; got glob '{p}'."
+                            ));
+                        }
+                        Err(acl::CanonError::Other(e)) => {
+                            bad_inputs.push((p.clone(), format!("{e:#}")));
+                        }
+                    }
+                }
+            }
+            for (p, e) in &bad_inputs {
+                eprintln!("srt-win: skipped: '{p}': {e}");
+            }
+            let dacls = acl::PrebuiltDacls::build(&gsid, &user_sid)?;
+            let (tally, report) = state_db::with_init_lock(
+                &gsid, holder, Some(&dacls), false,
+                |db| {
+                    db.register_broker()?;
+                    let mut t = StampTally::default();
+                    for (canon, mask) in &targets {
+                        // No per-arm policy: every path goes through
+                        // the same disk-first chokepoint. The sealed
+                        // StampWitness makes a "trust the row, skip
+                        // the disk check" branch unspellable here.
+                        match db.ensure_stamped(canon, *mask, &dacls) {
+                            Ok(w) => t.record(&w),
+                            Err(e) => {
+                                eprintln!(
+                                    "srt-win: '{canon}': {e:#}"
+                                );
+                                t.failed += 1;
+                            }
+                        }
+                    }
+                    Ok(t)
+                },
+            )?;
+            eprintln!(
+                "srt-win: acl stamp — {} path(s) ({} newly stamped, \
+                 {} escalated, {} already held, {} parent-stamp \
+                 fallback{}{}{}); recovery pruned {} dead broker(s), \
+                 restored {} orphan(s)",
+                targets.len(),
+                tally.fresh,
+                tally.restamped,
+                tally.already,
+                tally.fence,
+                if tally.lost > 0 {
+                    format!(", {} original_sd_lost", tally.lost)
+                } else { String::new() },
+                if tally.failed > 0 {
+                    format!(", {} FAILED", tally.failed)
+                } else { String::new() },
+                if !bad_inputs.is_empty() {
+                    format!(", {} skipped", bad_inputs.len())
+                } else { String::new() },
+                report.dead_brokers,
+                report.restored,
+            );
+            if tally.failed > 0 {
+                return Err(anyhow!(
+                    "{} path(s) could not be stamped (see above); \
+                     refusing to report success",
+                    tally.failed
+                ));
+            }
+            if !bad_inputs.is_empty() {
+                // Exit 2 = partial: the resolvable inputs WERE
+                // stamped (so the sandbox is safe to run for
+                // those), but at least one input was skipped. The
+                // host must surface this rather than treat it as
+                // success.
+                eprintln!(
+                    "srt-win: {} input path(s) skipped (see above); \
+                     exiting 2 (partial)",
+                    bad_inputs.len()
+                );
+                std::process::exit(2);
+            }
+        }
+        Cmd::Acl {
+            sub: AclCmd::Restore { group, holder_pid, json },
+        } => {
+            use srt_win::{acl, sid, state_db};
+            let gsid = resolve_group_sid(&group)?;
+            let user_sid = sid::current_user_sid()?;
+            let holder = state_db::HolderPid(holder_pid);
+            let dacls = acl::PrebuiltDacls::build(&gsid, &user_sid)?;
+            let (entries, report) = state_db::with_init_lock(
+                &gsid, holder, Some(&dacls), false,
+                |db| {
+                    let holds = db.my_holds()?;
+                    let mut entries: Vec<RestoreEntry> = Vec::new();
+                    let mut parent_outs: Vec<(
+                        String,
+                        state_db::ParentRestoreOutcome,
+                    )> = Vec::new();
+                    for canon in &holds {
+                        let now_zero = db.remove_holder(canon)?;
+                        if !now_zero {
+                            // Another holder still has it — released
+                            // our claim, file stays stamped. Not
+                            // reported (the LAST holder to release
+                            // does).
+                            continue;
+                        }
+                        let Some(snap) = db.get_snapshot(canon)?
+                        else {
+                            eprintln!(
+                                "srt-win: WARNING: '{canon}' had a holder \
+                                 row but no snapshot — skipping"
+                            );
+                            continue;
+                        };
+                        // Same case analysis as crash-recovery so
+                        // the two cannot diverge. A mismatch on one
+                        // path does NOT abort the batch — every
+                        // other path is still processed.
+                        let out = db.try_restore(
+                            &snap, &dacls, false, &mut parent_outs,
+                        )?;
+                        entries.push(restore_entry(&snap, &out));
+                    }
+                    db.unregister_broker()?;
+                    Ok((entries, parent_outs))
+                },
+            )?;
+            let (entries, parent_outs) = entries;
+            let restored =
+                entries.iter().filter(|e| e.status == "restored").count();
+            let left = entries.len() - restored;
+            // Parent left-stamped count is the union of
+            // crash-recovery's pass and THIS restore's parent
+            // outcomes (previously only the former was reported,
+            // so a non-JSON caller saw `0 parent dir(s) left
+            // stamped` while a parent was still on disk).
+            let parents_left = report.parents_left as usize
+                + parent_outs
+                    .iter()
+                    .filter(|(_, o)| {
+                        !matches!(
+                            o,
+                            state_db::ParentRestoreOutcome::Restored
+                                | state_db::ParentRestoreOutcome::AlreadyOriginal
+                                | state_db::ParentRestoreOutcome::StillHeld
+                        )
+                    })
+                    .count();
+            eprintln!(
+                "srt-win: acl restore — {} restored, {} left \
+                 (relocated/missing/changed/tampered){}",
+                restored,
+                left,
+                if parents_left > 0 {
+                    format!("; {} parent dir(s) left stamped", parents_left)
+                } else {
+                    String::new()
+                },
+            );
+            if json {
+                // Parents reported by crash-recovery + by this
+                // restore arm, merged.
+                let mut all_parents = report.parent_entries.clone();
+                all_parents.extend(parent_outs);
+                let result = RestoreResult {
+                    paths: entries,
+                    parents: parent_entries_from(&all_parents),
+                };
+                serde_json::to_writer(std::io::stdout(), &result)
+                    .context("write --json restore result")?;
+                println!();
+            }
+        }
+        Cmd::Acl { sub: AclCmd::Recover { group, force, json } } => {
+            use srt_win::{acl, sid, state_db};
+            let gsid = resolve_group_sid(&group)?;
+            let user_sid = sid::current_user_sid()?;
+            let dacls = acl::PrebuiltDacls::build(&gsid, &user_sid)?;
+            // recover only runs crash-recovery (holder-agnostic); the
+            // holder PID is irrelevant, pass our own.
+            let ((), report) = state_db::with_init_lock(
+                &gsid,
+                state_db::HolderPid(std::process::id()),
+                Some(&dacls),
+                force,
+                |_db| Ok(()),
+            )?;
+            eprintln!(
+                "srt-win: acl recover — pruned {} dead broker(s), \
+                 restored {} orphan(s), {} relocated, {} missing, \
+                 left {} (changed since stamp{})",
+                report.dead_brokers,
+                report.restored,
+                report.relocated,
+                report.missing,
+                report.left_changed,
+                if force { "; --force applied" } else { "" },
+            );
+            if json {
+                let result = RestoreResult {
+                    paths: report
+                        .entries
+                        .iter()
+                        .map(|(s, o)| restore_entry(s, o))
+                        .collect(),
+                    parents: parent_entries_from(&report.parent_entries),
+                };
+                serde_json::to_writer(std::io::stdout(), &result)
+                    .context("write --json recover result")?;
+                println!();
+            }
+        }
+
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             group,
             skip_group_check,
+            holder_pid,
             target,
         } => {
-            use srt_win::launch;
+            use srt_win::{fence, launch, state_db};
             let gsid = resolve_group_sid(&group)?;
             // `target` is `required, num_args=1..` so non-empty.
             let exe = std::path::PathBuf::from(&target[0]);
             let args = &target[1..];
+
+            // Delete/rename fence — FALLBACK only. The primary
+            // delete/rename protection is the parent-directory
+            // allow-list stamp (`acl stamp` strips the user's
+            // FILE_DELETE_CHILD on each protected file's parent).
+            // The fence is held only on files whose parent could
+            // NOT be stamped (`parent_stamp_failed = 1` — no
+            // WRITE_DAC on the parent, or no parent). For that
+            // subset the fence is LOAD-BEARING: if any such path
+            // can't be opened (after a short retry) the deny
+            // guarantee would be incomplete and exec must not run —
+            // `?` propagates. With --holder-pid omitted, exec has
+            // no state-DB dependency. Logged on the no-flag and
+            // success paths; on failure the error names the cause
+            // directly.
+            let delete_fence = match holder_pid {
+                None => {
+                    eprintln!(
+                        "srt-win: handle fence: skipped (no --holder-pid)"
+                    );
+                    None
+                }
+                Some(pid) => {
+                    let holder = state_db::HolderPid(pid);
+                    // One RO open + one read transaction → a
+                    // single WAL snapshot for both the file-fence
+                    // and parent-fence queries. Two independent
+                    // opens could see different
+                    // `parent_stamp_failed` bits (a concurrent
+                    // re-stamp's step-4 upsert forces it to 1
+                    // until step 7) and drop a stamped parent from
+                    // BOTH lists.
+                    let plan = state_db::fence_plan_for_holder(holder)
+                        .with_context(|| {
+                            format!(
+                                "fence plan: state-DB lookup for \
+                                 holder {pid}"
+                            )
+                        })?
+                        .unwrap_or_default();
+                    let f =
+                        fence::open_delete_fence(&plan.fallback_files)?;
+                    if plan.fallback_files.is_empty() {
+                        eprintln!(
+                            "srt-win: handle fence: holder_pid={pid} → \
+                             0 path(s) (parent stamps cover all)"
+                        );
+                    } else {
+                        eprintln!(
+                            "srt-win: handle fence (fallback): \
+                             holder_pid={pid} → {} parent-stamp-failed \
+                             path(s) fenced",
+                            plan.fallback_files.len()
+                        );
+                    }
+                    // Best-effort dir fence on the holder's
+                    // stamped parent directories + the state-DB
+                    // directory: a no-FILE_SHARE_DELETE handle
+                    // blocks the child renaming the parent dir
+                    // ITSELF (rename is authorized by the
+                    // grandparent's FILE_DELETE_CHILD, which we
+                    // don't stamp) — preventing path
+                    // substitution of the directory while the
+                    // child runs. The state-DB dir is fenced for
+                    // the same reason (a child renaming it
+                    // could plant a poisoned DB at the path).
+                    // Open-fail → log + continue: file DACLs
+                    // still hold; only directory-rename is
+                    // unguarded (the documented residual).
+                    let mut dirs = plan.parents;
+                    if let Ok(sd) = state_db::state_dir() {
+                        dirs.push(sd.display().to_string());
+                    }
+                    let df = fence::open_best_effort(&dirs, "dir");
+                    Some((f, df))
+                }
+            };
+
             let spec = launch::ExecSpec {
                 group_sid: &gsid,
                 skip_group_check,
@@ -511,7 +1056,11 @@ fn run() -> anyhow::Result<()> {
                 target_args: args,
             };
             let code = launch::run(&spec)?;
-            // Propagate the child's exit code verbatim.
+            // `delete_fence` drops here → handles closed → fence
+            // lifted. process::exit skips destructors, so explicitly
+            // drop anything that needs cleanup BEFORE it. Propagate
+            // the child's exit code verbatim.
+            drop(delete_fence);
             std::process::exit(code as i32);
         }
     }
@@ -550,10 +1099,10 @@ fn is_elevated() -> anyhow::Result<bool> {
 }
 
 /// Hard elevation gate: returns an error (no UAC relaunch) when not
-/// admin. The granular admin mutators now self-elevate via
+/// admin. The granular admin mutators self-elevate via
 /// [`maybe_self_elevate`], so this currently has no caller — it's
-/// retained as the non-interactive counterpart for `acl recover`
-/// (a later batch), hence `allow(dead_code)`.
+/// retained as the non-interactive counterpart for code paths that
+/// must NOT pop a UAC prompt, hence `allow(dead_code)`.
 #[cfg(windows)]
 #[allow(dead_code)]
 fn require_elevated() -> anyhow::Result<()> {
@@ -607,7 +1156,14 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
     }
 
     let exe = std::env::current_exe().context("current_exe")?;
-    let exe_w = wstr(&exe.to_string_lossy());
+    let exe_str = exe.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "current_exe path '{}' is not representable as UTF-8 \
+             (contains unpaired surrogates); cannot self-elevate",
+            exe.display()
+        )
+    })?;
+    let exe_w = wstr(exe_str);
     // Rebuild the original argv (minus argv[0]) using
     // CommandLineToArgvW-compatible quoting so the elevated
     // child parses identically.
@@ -649,13 +1205,23 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
             "ShellExecuteExW returned no process handle"
         ));
     }
-    unsafe { WaitForSingleObject(h, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(h, INFINITE) };
+    if wait == windows::Win32::Foundation::WAIT_FAILED {
+        let err = std::io::Error::last_os_error();
+        unsafe { let _ = CloseHandle(h); }
+        return Err(anyhow::anyhow!(
+            "WaitForSingleObject(elevated child): {err}"
+        ));
+    }
     let mut code: u32 = 1;
     unsafe {
         GetExitCodeProcess(h, &mut code)
             .context("GetExitCodeProcess(elevated child)")?;
         let _ = CloseHandle(h);
     }
+    // 259 (STILL_ACTIVE) after a successful wait is a real exit
+    // code (the wait already proved the process exited), not the
+    // still-running sentinel.
     Ok(Some(code as i32))
 }
 

@@ -62,9 +62,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use windows::core::{GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    LocalFree, ERROR_MEMBER_IN_ALIAS, HANDLE, HLOCAL,
-};
+use windows::Win32::Foundation::{ERROR_MEMBER_IN_ALIAS, HANDLE};
 use windows::Win32::NetworkManagement::NetManagement::{
     NetLocalGroupAdd, NetLocalGroupAddMembers, NetLocalGroupDel,
     NERR_GroupExists, NERR_GroupNotFound, LOCALGROUP_INFO_1,
@@ -89,11 +87,6 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16, FWP_UINT64,
     FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
-use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows::Win32::Security::{
-    GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
-};
-
 use crate::sid;
 use crate::util::{pcwstr, wstr};
 
@@ -125,55 +118,14 @@ const FWP_E_FILTER_NOT_FOUND: u32 = 0x80320003;
 const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x80320007;
 const FWP_E_IN_USE: u32 = 0x8032000A;
 
-const SDDL_REVISION_1: u32 = 1;
+use crate::util::OwnedSd;
 
 // ────────────────────── small RAII helpers ──────────────────────
 
-/// Heap SD owned by us; freed via `LocalFree`.
-struct OwnedSd {
-    ptr: PSECURITY_DESCRIPTOR,
-    len: u32,
-}
-
-impl OwnedSd {
-    fn from_sddl(sddl: &str) -> Result<Self> {
-        let w = wstr(sddl);
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        let mut sz: u32 = 0;
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                pcwstr(&w),
-                SDDL_REVISION_1,
-                &mut psd,
-                Some(&mut sz),
-            )
-            .map_err(|e| {
-                anyhow!(
-                    "ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"
-                )
-            })?;
-            if sz == 0 {
-                sz = GetSecurityDescriptorLength(psd);
-            }
-        }
-        Ok(Self { ptr: psd, len: sz })
-    }
-    fn byte_blob(&self) -> FWP_BYTE_BLOB {
-        FWP_BYTE_BLOB {
-            size: self.len,
-            data: self.ptr.0 as *mut u8,
-        }
-    }
-}
-
-impl Drop for OwnedSd {
-    fn drop(&mut self) {
-        if !self.ptr.0.is_null() {
-            unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.ptr.0)));
-            }
-        }
-    }
+/// Borrow an `OwnedSd` as the `FWP_BYTE_BLOB` shape WFP wants for
+/// provider data. The caller must keep `sd` alive for the duration.
+fn sd_byte_blob(sd: &OwnedSd) -> FWP_BYTE_BLOB {
+    FWP_BYTE_BLOB { size: sd.len, data: sd.ptr.0 as *mut u8 }
 }
 
 /// WFP engine handle; closed on drop.
@@ -658,9 +610,9 @@ pub fn install_filters(
         const W_LOOPBACK: u64 = 0x0D00_0000_0000_0000;
         const W_BLOCK: u64 = 0x0100_0000_0000_0000;
 
-        let mut sd_nonmember_blob = sd_nonmember.byte_blob();
-        let mut sd_group_blob = sd_group.byte_blob();
-        let mut sd_everyone_blob = sd_everyone.byte_blob();
+        let mut sd_nonmember_blob = sd_byte_blob(&sd_nonmember);
+        let mut sd_group_blob = sd_byte_blob(&sd_group);
+        let mut sd_everyone_blob = sd_byte_blob(&sd_everyone);
 
         // 127.0.0.0/8
         let mut v4_loop = FWP_V4_ADDR_AND_MASK {

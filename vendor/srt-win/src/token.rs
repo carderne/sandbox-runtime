@@ -108,23 +108,11 @@ pub fn make_sandbox_token(base: HANDLE, group_sid: &str) -> Result<HANDLE> {
     // `admins` / `group` LocalPsid drop here → LocalFree.
 
     // RAII-own `out` so a `?` from set_il/set_default_dacl below
-    // closes it. Local — token.rs is the only module that holds
-    // raw HANDLEs across fallible calls outside launch.rs.
-    struct Guard(HANDLE);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
-            }
-        }
-    }
-    let guard = Guard(out);
-    set_il(guard.0, IL_MEDIUM)?;
-    set_default_dacl(guard.0, base)?;
-    // Disarm and return the raw handle to the caller.
-    let h = guard.0;
-    std::mem::forget(guard);
-    Ok(h)
+    // closes it.
+    let guard = crate::util::OwnedHandle(out);
+    set_il(guard.raw(), IL_MEDIUM)?;
+    set_default_dacl(guard.raw(), base)?;
+    Ok(guard.into_raw())
 }
 
 /// Duplicate to a primary token (`CreateProcessAsUserW` requires a

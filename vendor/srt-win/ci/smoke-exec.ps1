@@ -375,6 +375,20 @@ if ($r.out.Trim() -notlike 'MARKER*') {
 }
 Write-Host 'E7b ok: & chains commands inside sandboxed cmd (passthrough)'
 
+# ── E7c: target_is_cmd recognises trailing-dot cmd.exe. ──────────
+# Win32 strips trailing dots/spaces from the final path component
+# but Path::file_name() does not; without target_is_cmd's trim,
+# `cmd.exe.` would take the MSVCRT-quoting branch and the post-/c
+# `&` chain would be wrapped as one literal argv element instead
+# of passed through for cmd to interpret. Same payload as E7b.
+$r = Exec @('--', "$cmd.", '/d', '/s', '/c', 'echo MARKER & exit 5')
+if ($r.exit -ne 5 -or $r.out.Trim() -notlike 'MARKER*') {
+  throw "E7c: trailing-dot cmd.exe. did NOT take the cmd-quoting " +
+        "branch (target_is_cmd trim missing). exit=$($r.exit) " +
+        "out: $($r.out)"
+}
+Write-Host 'E7c ok: target_is_cmd recognises trailing-dot cmd.exe.'
+
 # ── E8: --name resolution path through exec ─────────────────────
 # Every row above used --group-sid. Run one row via --name to cover
 # `resolve_group_sid`'s LookupAccountNameW branch in the exec path.
