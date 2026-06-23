@@ -498,6 +498,110 @@ describe('Config Validation', () => {
       }
     })
 
+    test('accepts a masked file with an extract regex', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/hosts.yml',
+              mode: 'mask',
+              extract: 'oauth_token:\\s*(\\S+)',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects an extract value that is not a valid regex', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            { path: '~/.config/gh/hosts.yml', mode: 'mask', extract: '(' },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.extract',
+        )
+        expect(issue?.message).toContain('not a valid regular expression')
+      }
+    })
+
+    test('rejects an extract regex with no capturing group', () => {
+      // Group 1 is the contract for "what to mask"; a pattern without
+      // one would mask nothing and is almost certainly a mistake.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/hosts.yml',
+              mode: 'mask',
+              extract: 'oauth_token:\\s*\\S+',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.extract',
+        )
+        expect(issue?.message).toContain('capturing group')
+      }
+    })
+
+    test('a non-capturing group does not satisfy the extract group requirement', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            { path: '~/.netrc', mode: 'mask', extract: 'password (?:\\S+)' },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('extract on a deny-mode entry is accepted (ignored)', () => {
+      // Mirrors the injectHosts-on-deny precedent: harmless, so no error.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          files: [
+            { path: '~/.netrc', mode: 'deny', extract: 'password (\\S+)' },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
     test('rejects mode "mask" on a directory path (trailing slash)', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
