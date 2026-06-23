@@ -509,6 +509,39 @@ describe('file masking on macOS degrades to read-deny', () => {
     expect(wrapped).not.toBe('echo hi')
     expect(wrapped).toContain('deny file-read*')
   })
+
+  test('an extract-mode masked file still degrades to (deny file-read*)', () => {
+    // extract changes only the fake-file CONTENT; the macOS path keys
+    // off the bind list, not the content, so structured masking is
+    // exactly as unsupported as whole-file masking — the file is denied.
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds } = buildMaskedFileBinds(
+      [
+        {
+          path: HOSTS_YML,
+          mode: 'mask',
+          extract: 'oauth_token:\\s*(\\S+)',
+        },
+      ],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    const wrapped = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      maskedFileBinds: binds,
+    })
+    expect(wrapped).toContain('deny file-read*')
+    expect(wrapped).toContain(HOSTS_YML)
+    expect(wrapped).not.toContain(binds[0]!.fakePath)
+    // The real credential never reaches the profile.
+    expect(wrapped).not.toContain(HOSTS_TOKEN)
+    store.dispose()
+  })
 })
 
 /**
