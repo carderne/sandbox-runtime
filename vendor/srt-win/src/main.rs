@@ -122,6 +122,14 @@ enum Cmd {
     Exec {
         #[command(flatten)]
         group: GroupRef,
+        /// Sublayer GUID under which the WFP filters were
+        /// installed. Default is the compile-time constant (same
+        /// as `srt-win install`). exec refuses to launch when no
+        /// srt-win filter set is installed under this sublayer —
+        /// the network fence is the load-bearing isolation
+        /// boundary; without it the child has full egress.
+        #[arg(long)]
+        sublayer_guid: Option<String>,
         /// Skip the "is the group enabled in the broker's token"
         /// pre-flight. **Fail-open** — the WFP fence depends on
         /// that membership; with this set the child may run with
@@ -132,6 +140,14 @@ enum Cmd {
         /// and cannot logout/login mid-run.
         #[arg(long)]
         skip_group_check: bool,
+        /// Skip the WFP filter-presence pre-flight. **Fail-open**
+        /// — without filters the child has unrestricted network
+        /// egress. Same intentional-bypass semantics as
+        /// `--skip-group-check`. Use ONLY when the network fence
+        /// is provided by another mechanism (or is not required
+        /// for the test).
+        #[arg(long)]
+        skip_wfp_check: bool,
         /// PID of the long-lived host whose `acl stamp` holds this
         /// child should be fenced under. When set, exec opens a
         /// no-`FILE_SHARE_DELETE` handle on every file that holder
@@ -962,12 +978,57 @@ fn run() -> anyhow::Result<()> {
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             group,
+            sublayer_guid,
             skip_group_check,
+            skip_wfp_check,
             holder_pid,
             target,
         } => {
             use srt_win::{fence, launch, state_db};
             let gsid = resolve_group_sid(&group)?;
+            // WFP pre-flight (mirrors the group-state pre-flight in
+            // launch::run). The TS host already gates on
+            // `getWindowsWfpStatus().state == 'installed'`, but
+            // `srt-win exec` invoked directly would otherwise
+            // fail-open with no network fence at all. Done here
+            // (not in launch.rs) so resolve_sublayer's GUID-parse
+            // error reporting is shared with `wfp status|install`.
+            let sl = resolve_sublayer(&sublayer_guid)?;
+            match wfp::filter_status(&sl) {
+                Ok(s) if s.state == "installed" => {}
+                Ok(s) if skip_wfp_check => {
+                    eprintln!(
+                        "srt-win: WARNING: --skip-wfp-check is set and \
+                         WFP filters under sublayer {sl:?} are \
+                         {} ({} filter(s)). The network fence is NOT \
+                         in effect for this process tree.",
+                        s.state, s.filters,
+                    );
+                }
+                Ok(s) => {
+                    return Err(anyhow!(
+                        "WFP filters under sublayer {sl:?} are {} \
+                         ({} filter(s)) — the network fence is not \
+                         installed. Run `srt-win install` (or `srt-win \
+                         wfp install --sublayer-guid {sl:?}`). Pass \
+                         --skip-wfp-check to bypass.",
+                        s.state, s.filters,
+                    ));
+                }
+                Err(e) if skip_wfp_check => {
+                    eprintln!(
+                        "srt-win: WARNING: --skip-wfp-check is set and \
+                         WFP filter status could not be read ({e:#}); \
+                         proceeding without verifying the network fence"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "cannot verify WFP filter state under sublayer \
+                         {sl:?}: {e:#}. Pass --skip-wfp-check to bypass."
+                    ));
+                }
+            }
             // `target` is `required, num_args=1..` so non-empty.
             let exe = std::path::PathBuf::from(&target[0]);
             let args = &target[1..];

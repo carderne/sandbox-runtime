@@ -1036,6 +1036,7 @@ async function wrapWithSandboxArgv(
     return wrapCommandWithSandboxWindows({
       command,
       group: getWindowsGroupRef(),
+      sublayerGuid: config?.windows?.wfpSublayerGuid,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,

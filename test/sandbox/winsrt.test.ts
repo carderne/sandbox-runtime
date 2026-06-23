@@ -297,6 +297,27 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
   })
 
+  it('wrapCommandWithSandboxWindows: sublayerGuid lands on the exec argv', () => {
+    const sl = '11111111-2222-3333-4444-555555555555'
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      group: { groupSid: ADMINS_SID },
+      sublayerGuid: sl,
+    })
+    // `srt-win exec` refuses to launch when no WFP filter set is
+    // installed under this sublayer (fail-closed network fence).
+    const i = argv.indexOf('--sublayer-guid')
+    expect(i).toBeGreaterThan(0)
+    expect(argv[i + 1]).toBe(sl)
+    expect(i).toBeLessThan(argv.indexOf('--'))
+    // Omitted → no flag (srt-win checks its compile-time default).
+    const { argv: noSl } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      group: { groupSid: ADMINS_SID },
+    })
+    expect(noSl).not.toContain('--sublayer-guid')
+  })
+
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
     const ws = getWindowsWfpStatus({
       sublayerGuid: '11111111-2222-3333-4444-555555555555',

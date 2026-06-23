@@ -85,7 +85,8 @@ function J { param([string[]] $argv) Run $argv | ConvertFrom-Json }
 #           sandboxed child wrote: E2/E4/E5/E7
 function Exec {
   param([string[]] $tail)
-  $argv = @('exec', '--group-sid', $GroupSid) + $tail
+  $argv = @('exec', '--group-sid', $GroupSid,
+            '--sublayer-guid', $Sublayer) + $tail
   $raw = & $Exe @argv 2>&1 | Out-String
   $exit = $LASTEXITCODE
   $lines = $raw -split "`r?`n"
@@ -393,7 +394,8 @@ Write-Host 'E7c ok: target_is_cmd recognises trailing-dot cmd.exe.'
 # Every row above used --group-sid. Run one row via --name to cover
 # `resolve_group_sid`'s LookupAccountNameW branch in the exec path.
 # `BUILTIN\Administrators` resolves on every Windows install.
-$r = & $Exe exec --name 'BUILTIN\Administrators' -- $cmd /c 'exit 7' 2>&1
+$r = & $Exe exec --name 'BUILTIN\Administrators' `
+        --sublayer-guid $Sublayer -- $cmd /c 'exit 7' 2>&1
 if ($LASTEXITCODE -ne 7) {
   throw "E8: --name exec expected exit 7, got $LASTEXITCODE. out: $r"
 }
@@ -402,8 +404,12 @@ Write-Host 'E8 ok: --name resolution path through exec works'
 # ── E9: refuse to nest — exec from inside exec fails fast ───────
 # Inside the sandbox child, the discriminator SID is deny-only;
 # the inner `srt-win exec` pre-flight (no --skip-group-check) must
-# refuse with the deny-only message.
-$inner = "`"$Exe`" exec --group-sid $GroupSid -- $cmd /c exit 0"
+# refuse with the deny-only message. --skip-wfp-check on the
+# inner exec: opening the WFP engine from inside the restricted
+# token is blocked (and irrelevant — we want the GROUP pre-flight
+# to be the one that fires).
+$inner = "`"$Exe`" exec --group-sid $GroupSid --skip-wfp-check " +
+         "-- $cmd /c exit 0"
 $r = Exec @('--', $cmd, '/c', $inner)
 if ($r.exit -eq 0) {
   throw "E9: nested exec succeeded; expected refusal. raw: $($r.raw)"
@@ -421,8 +427,8 @@ Write-Host 'E9 ok: nested exec refused (deny-only guard)'
 # ── E10: --skip-group-check is silent when group is ready ───────
 # The flag must not break the run and must NOT warn when the
 # group is in fact enabled (warning fires only on Absent).
-$r = & $Exe exec --group-sid $GroupSid --skip-group-check `
-        -- $cmd /c 'exit 0' 2>&1 | Out-String
+$r = & $Exe exec --group-sid $GroupSid --sublayer-guid $Sublayer `
+        --skip-group-check -- $cmd /c 'exit 0' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
   throw "E10: --skip-group-check run exited ${LASTEXITCODE}: $r"
 }
@@ -437,8 +443,8 @@ Write-Host 'E10 ok: --skip-group-check silent when group is ready'
 # and proceed (exit = child's). Without the flag it would refuse
 # — that path is covered by E9's deny-only refusal; the Absent
 # refusal differs only in the message.
-$r = & $Exe exec --group-sid S-1-5-32-9999 --skip-group-check `
-        -- $cmd /c 'exit 0' 2>&1 | Out-String
+$r = & $Exe exec --group-sid S-1-5-32-9999 --sublayer-guid $Sublayer `
+        --skip-group-check -- $cmd /c 'exit 0' 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
   throw "E10b: --skip-group-check + absent group exited ${LASTEXITCODE}: $r"
 }
@@ -447,7 +453,46 @@ if ($r -notmatch '(?i)WARNING:.*skip-group-check') {
 }
 Write-Host 'E10b ok: --skip-group-check warns when group is absent'
 
-# TODO E11: verify mitigation policies actually applied (child-side
+# ── E11: WFP pre-flight refuses when filters absent ────────────
+# A never-installed sublayer GUID → exec must refuse before
+# launching the child (the network fence is the load-bearing
+# isolation boundary). Use a random GUID rather than uninstalling
+# $Sublayer mid-test.
+$noSl = '00000000-1111-2222-3333-444444444444'
+$r = & $Exe exec --group-sid $GroupSid --sublayer-guid $noSl `
+        -- $cmd /c 'echo SHOULDNOTRUN' 2>&1 | Out-String
+if ($LASTEXITCODE -eq 0 -or $r -match 'SHOULDNOTRUN') {
+  throw "E11: exec ran with WFP filters ABSENT — network fence " +
+        "fail-open. exit=$LASTEXITCODE out: $r"
+}
+if ($r -notmatch '(?i)WFP filters.*absent.*srt-win install') {
+  throw "E11: expected WFP-absent refusal with install hint; got: $r"
+}
+Write-Host 'E11 ok: exec refuses when WFP filters absent under sublayer'
+
+# ── E11b: --skip-wfp-check bypasses with a loud warning ─────────
+$r = & $Exe exec --group-sid $GroupSid --sublayer-guid $noSl `
+        --skip-wfp-check -- $cmd /c 'exit 0' 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+  throw "E11b: --skip-wfp-check did not bypass. " +
+        "exit=$LASTEXITCODE out: $r"
+}
+if ($r -notmatch '(?i)WARNING:.*skip-wfp-check.*absent') {
+  throw "E11b: expected --skip-wfp-check warning; got: $r"
+}
+Write-Host 'E11b ok: --skip-wfp-check bypasses with warning'
+
+# ── E11c: --skip-wfp-check is silent when filters ARE installed ─
+$r = Exec @('--skip-wfp-check', '--', $cmd, '/c', 'exit 0')
+if ($r.exit -ne 0) {
+  throw "E11c: --skip-wfp-check + installed exited $($r.exit): $($r.raw)"
+}
+if ($r.raw -match '(?i)WARNING:.*skip-wfp-check') {
+  throw "E11c: warning fired despite filters being installed. raw: $($r.raw)"
+}
+Write-Host 'E11c ok: --skip-wfp-check silent when filters are installed'
+
+# TODO E12: verify mitigation policies actually applied (child-side
 #   GetProcessMitigationPolicy probe). Deferred — would need a
 #   helper binary or P/Invoke from inside the sandboxed PowerShell.
 
@@ -457,4 +502,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (E1-E10b incl. E4b/E7b)'
+Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c)'
