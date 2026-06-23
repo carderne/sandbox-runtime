@@ -135,6 +135,14 @@ export function parseWindowsBinShell(raw?: string): WindowsBinShell {
 export interface WindowsSandboxParams {
   command: string
   group: WindowsGroupRef
+  /**
+   * Sublayer GUID under which the WFP filters were installed.
+   * `srt-win exec` checks `wfp status` against it and refuses to
+   * launch when no filter set is present (fail-closed network
+   * fence). When omitted, srt-win uses its compile-time default
+   * GUID — same as `srt-win install` with no `--sublayer-guid`.
+   */
+  sublayerGuid?: string
   /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the returned env. */
   httpProxyPort?: number
   /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the returned env. */
@@ -531,6 +539,12 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 } {
   const exe = getSrtWinPath()
   const argv: string[] = [exe, 'exec', ...groupRefArgs(p.group)]
+  // Format-validated at the config boundary
+  // (`WindowsConfigSchema.wfpSublayerGuid: z.string().uuid()`),
+  // and again by clap's GUID parser at the binary boundary; the
+  // outer spawn is `shell:false`, so the value is an argv element,
+  // never shell-interpolated.
+  if (p.sublayerGuid) argv.push('--sublayer-guid', p.sublayerGuid)
   argv.push('--')
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'

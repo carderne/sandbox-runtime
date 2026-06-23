@@ -99,7 +99,11 @@ function RunJson {
 # Exec helper.
 function ChildExec {
   param([string[]] $tail)
-  $argv = @('exec', '--group-sid', $GroupSid) + $tail
+  # --skip-wfp-check: this script does NOT install WFP filters
+  # (the network fence is orthogonal to the FS-deny tests; exec
+  # is used here only to obtain a deny-only-group token). The
+  # WFP pre-flight would otherwise refuse every ChildExec.
+  $argv = @('exec', '--group-sid', $GroupSid, '--skip-wfp-check') + $tail
   $raw = & $Exe @argv 2>&1 | Out-String
   $exit = $LASTEXITCODE
   $lines = $raw -split "`r?`n"
