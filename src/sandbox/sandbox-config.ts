@@ -137,19 +137,62 @@ const envVarNameSchema = z
   )
 
 /**
+ * Schema for the optional structured-extraction regex on a masked file.
+ *
+ * Validates that the string compiles as a JavaScript RegExp and declares at
+ * least one capturing group — capture group 1 is the contract for "the
+ * credential value to mask". A pattern with zero groups would silently mask
+ * nothing useful, so it is rejected at config time rather than at runtime.
+ *
+ * Group count is determined by appending `|` (alternation with empty) and
+ * matching the empty string: the result array length is `1 + groupCount`,
+ * which counts capturing groups (including named ones) and ignores
+ * non-capturing `(?:…)`.
+ */
+const extractPatternSchema = z.string().superRefine((val, ctx) => {
+  let re: RegExp
+  try {
+    re = new RegExp(val)
+  } catch (err) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `extract is not a valid regular expression: ${(err as Error).message}`,
+    })
+    return
+  }
+  const groupCount = new RegExp(re.source + '|').exec('')!.length - 1
+  if (groupCount < 1) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'extract must contain at least one capturing group — group 1 is ' +
+        'the credential value to mask (e.g. "token:\\s*(\\S+)").',
+    })
+  }
+})
+
+/**
  * Schema for a single credential file/directory entry.
  *
- * `mode: "mask"` is **whole-file** masking: the entire file content is
- * replaced inside the sandbox with one sentinel string, and the proxy
- * substitutes that sentinel back to the real bytes on egress. This works
- * for files whose content *is* the credential (a token file, a single-line
- * secret). It does **not** work for structured files a tool parses
- * (`.netrc`, JSON/YAML configs) — the tool will fail to parse the sentinel.
- * For those, prefer env-var masking where the tool supports it, or
- * `mode: "deny"`. Format-aware extraction is a possible future extension.
+ * `mode: "mask"` without `extract` is **whole-file** masking: the entire
+ * file content is replaced inside the sandbox with one sentinel string,
+ * and the proxy substitutes that sentinel back to the real bytes on egress.
+ * This works for files whose content *is* the credential (a token file, a
+ * single-line secret).
  *
- * On macOS, SBPL cannot redirect reads, so `mode: "mask"` currently
- * degrades to `mode: "deny"` (the file is unreadable inside the sandbox).
+ * `mode: "mask"` with `extract` is **structured** masking: the regex is
+ * applied globally to the real file, capture group 1 of each match is a
+ * credential value, and only those captured spans are replaced with
+ * sentinels — the rest of the file is preserved byte-for-byte. This lets a
+ * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
+ * inside the sandbox while the credential values are protected. If the
+ * regex matches nothing the entry **degrades to `mode: "deny"`** at
+ * runtime: a wrong pattern fails closed rather than leaving the real
+ * credential readable.
+ *
+ * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
+ * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
+ * inside the sandbox).
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
@@ -157,6 +200,14 @@ export const CredentialFileConfigSchema = z.object({
       'filesystem.denyRead (absolute paths and ~ expansion).',
   ),
   mode: credentialModeSchema.describe('Access mode for this path'),
+  extract: extractPatternSchema
+    .optional()
+    .describe(
+      'Optional regex for structured masking. Applied globally; capture ' +
+        'group 1 of each match is masked, the rest of the file is preserved. ' +
+        'If the regex matches nothing the entry degrades to mode "deny". ' +
+        'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+    ),
   injectHosts: z
     .array(domainPatternSchema)
     .optional()
