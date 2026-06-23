@@ -63,6 +63,14 @@ jobs:
         with:
           components: clippy
 
+      - name: Install sqlite3 CLI (Windows, for smoke-acl DB-poison tests)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        # Pinned: an unpinned `choco install` would pull whatever
+        # the community feed serves on the day, which is a
+        # supply-chain vector for the DB-poison security tests.
+        run: choco install sqlite --version=3.50.4 --no-progress -y
+
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -85,6 +93,11 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: pwsh vendor/srt-win/ci/smoke-exec.ps1 vendor\srt-win\target\release\srt-win.exe
+
+      - name: Smoke-test srt-win acl (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win/ci/smoke-acl.ps1 vendor\srt-win\target\release\srt-win.exe
 
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
