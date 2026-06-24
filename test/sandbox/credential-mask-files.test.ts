@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
@@ -352,8 +352,7 @@ describe('buildMaskedFileBinds', () => {
     store.dispose()
   })
 
-  test('extract with no match leaves the file unprotected and warns', () => {
-    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+  test('extract with no match degrades the entry to deny', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
     const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
@@ -362,19 +361,12 @@ describe('buildMaskedFileBinds', () => {
       reg,
       store,
     )
-    // Fail-open: no bind, no deny — the entry is skipped entirely so the
-    // real file stays readable via the root mount.
+    // Fail-closed: no bind is emitted (the real file is NOT exposed),
+    // and the path is reported for the read-deny set.
     expect(binds).toHaveLength(0)
-    expect(degradeToDenyPaths).toHaveLength(0)
+    expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
     expect(reg.size).toBe(0)
     expect(store.dirPath).toBeUndefined()
-    // A loud stderr warning surfaces the config error to the operator.
-    expect(warnSpy).toHaveBeenCalledTimes(1)
-    const msg = warnSpy.mock.calls[0]![0] as string
-    expect(msg).toContain('UNPROTECTED')
-    expect(msg).toContain(HOSTS_YML)
-    expect(msg).toContain('no_such_key: (\\S+)')
-    warnSpy.mockRestore()
     store.dispose()
   })
 })
@@ -462,67 +454,60 @@ describe.if(isLinux)('structured file masking on Linux (extract)', () => {
 })
 
 /**
- * Linux: an `extract` pattern that matches nothing fails open — the
- * entry is skipped (no bind, no deny), the file stays readable via the
- * root mount, and a loud warning is emitted to stderr so the operator
- * fixes the regex.
+ * Linux: an `extract` pattern that matches nothing degrades to deny —
+ * the file is unreadable inside the sandbox so the credential the entry
+ * was meant to protect is never exposed.
  */
-describe.if(isLinux)(
-  'extract no-match leaves file readable and warns on Linux',
-  () => {
-    const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
-    const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
-    const SECRET = 'gho_nomatch_real_0123456789'
+describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
+  const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
+  const SECRET = 'gho_nomatch_real_0123456789'
 
-    beforeAll(async () => {
-      mkdirSync(TEST_DIR, { recursive: true })
-      writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
-      await SandboxManager.reset()
-      await SandboxManager.initialize({
-        network: { allowedDomains: ['localhost'], deniedDomains: [] },
-        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
-        credentials: {
-          files: [
-            {
-              path: SECRET_FILE,
-              mode: 'mask',
-              extract: 'will_not_match_(\\S+)',
-            },
-          ],
-          allowPlaintextInject: true,
-        },
-      })
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: SECRET_FILE,
+            mode: 'mask',
+            extract: 'will_not_match_(\\S+)',
+          },
+        ],
+        allowPlaintextInject: true,
+      },
     })
+  })
 
-    afterAll(async () => {
-      await SandboxManager.reset()
-      rmSync(TEST_DIR, { recursive: true, force: true })
-    })
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
 
-    test('the file is readable as-is inside the sandbox (fail-open)', async () => {
-      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
-      const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
-      // A loud stderr warning surfaces the config error at wrap time.
-      expect(warnSpy).toHaveBeenCalled()
-      expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
-      warnSpy.mockRestore()
-      // No fake-file bind and no /dev/null deny bind are emitted for the
-      // path — the entry is skipped entirely.
-      expect(wrapped).not.toMatch(
-        new RegExp(`--ro-bind \\S+ ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
-      )
-      const result = spawnSync(wrapped, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 10000,
-      })
-      // cat succeeds and returns the real bytes: fail-open means the
-      // file is left readable via the root mount.
-      expect(result.status).toBe(0)
-      expect(result.stdout).toBe(`oauth_token: ${SECRET}\n`)
+  test('reading the file inside the sandbox is denied (fail-closed)', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    // The real credential never appears in the wrapped command.
+    expect(wrapped).not.toContain(SECRET)
+    // No --ro-bind <fake> <real> — degraded entries go via denyRead, not
+    // the masked-file bind path.
+    expect(wrapped).not.toMatch(
+      new RegExp(`--ro-bind \\S+\\.fake ${SECRET_FILE.replace(/\//g, '\\/')}`),
+    )
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
     })
-  },
-)
+    // cat fails: the file is unreadable inside the sandbox, and the
+    // real bytes are never exposed on stdout.
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain(SECRET)
+  })
+})
 
 /**
  * macOS: SBPL cannot redirect a read, so a masked file degrades to a
