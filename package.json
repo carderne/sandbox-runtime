@@ -21,7 +21,7 @@
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
-    "prepublishOnly": "npm run clean && npm run build && mkdir -p dist/vendor && cp -r vendor/seccomp vendor/srt-win dist/vendor/",
+    "prepublishOnly": "npm run clean && npm run build",
     "prepare": "husky"
   },
   "dependencies": {

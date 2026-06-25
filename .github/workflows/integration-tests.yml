@@ -63,6 +63,15 @@ jobs:
         with:
           components: clippy
 
+      - name: Rust build cache (Windows)
+        if: matrix.os == 'windows'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/srt-win-src
+          # Shared with release.yml so tag-ref release builds restore
+          # the cache main pushes warm here.
+          shared-key: srt-win
+
       - name: Install sqlite3 CLI (Windows, for smoke-acl DB-poison tests)
         if: matrix.os == 'windows'
         shell: pwsh
