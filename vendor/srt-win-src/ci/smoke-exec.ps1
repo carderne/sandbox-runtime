@@ -697,6 +697,202 @@ Write-Host 'R6 ok: child cannot read state.db (cred file gate holds)'
 
 # (CA trust is install-time, not per-exec — covered in smoke.ps1.)
 
+# ── G-rows: per-session FS access for the sandbox user ──────────
+# Under separate-user the sandbox child has NO inherent rights on
+# real-user-owned files. `acl grant` adds an inheritable
+# MODIFY_NO_FDC ACE on the working-tree root; `acl stamp
+# --trustee-sid <real-user>` PROTECTEDs paths inside it. The G-rows
+# are the design probe: with grant on the root + PROTECTED stamp on
+# a file inside, the child reads siblings but not the stamped file
+# AND cannot del/ren the stamped file (the grant lacks FDC) — so
+# the per-target parent allow-list is redundant.
+$gRoot = Join-Path $env:TEMP "srt-gscratch-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $gRoot -Force | Out-Null
+# Expand to the long-form path: $env:TEMP on the GHA runner is
+# `C:\Users\RUNNER~1\...` (8.3 short name). The grant lands on the
+# canonical (long-form) file object regardless, but the CHILD opens
+# by the path we pass it — and resolving an 8.3 component requires
+# enumerating the parent dir, which srt-sandbox cannot do for the
+# real user's profile. Passing the long form lets bypass-traverse
+# (SeChangeNotifyPrivilege) reach the file directly without an
+# enumerate step.
+$k32 = Add-Type -PassThru -Namespace W -Name K -MemberDefinition `
+  '[DllImport("kernel32.dll",CharSet=CharSet.Unicode)] public static extern uint GetLongPathName(string s,System.Text.StringBuilder l,uint n);'
+$lp  = [System.Text.StringBuilder]::new(1024)
+if ($k32::GetLongPathName($gRoot, $lp, 1024) -gt 0) { $gRoot = $lp.ToString() }
+$gSub  = Join-Path $gRoot  'sub'
+New-Item -ItemType Directory -Path $gSub -Force | Out-Null
+$secret  = Join-Path $gSub 'secret.txt'
+$sibling = Join-Path $gSub 'sibling.txt'
+$subDeny = Join-Path $gRoot 'sub-deny'
+New-Item -ItemType Directory -Path $subDeny | Out-Null
+$inDeny  = Join-Path $subDeny 'inner.txt'
+$inAllow = Join-Path $subDeny 'reallow.txt'
+# NOT -NoNewline: RExec concatenates child stdout + broker stderr
+# before line-splitting, so a no-newline file body would fuse with
+# the first `srt-win:` diag line and survive the `^srt-win:` filter.
+'SECRET'  | Set-Content -Encoding ASCII $secret
+'SIBLING' | Set-Content -Encoding ASCII $sibling
+'INNER'   | Set-Content -Encoding ASCII $inDeny
+'REALLOW' | Set-Content -Encoding ASCII $inAllow
+Write-Host "G: scratch=$gRoot  sbSid=$sbSid"
+function Stdin { param([string[]] $argv, [string] $json)
+  $raw = $json | & $Exe @argv 2>&1 | Out-String
+  Write-Host -NoNewline $raw
+  if ($LASTEXITCODE -ne 0) {
+    throw "srt-win $($argv -join ' ') exited ${LASTEXITCODE}: $raw"
+  }
+}
+
+try {
+  # ── G1: working-tree grant — child can list/read/write inside ────
+  Stdin @('acl','grant','--group-sid',$GroupSid,'--holder-pid',$PID,
+          '--sandbox-user-sid',$sbSid) `
+        "{`"write`":[`"$($gRoot -replace '\\','\\')`"]}"
+  $r = RExec @('--', $cmd, '/c', "type `"$sibling`"")
+  if ($r.exit -ne 0 -or $r.out -notmatch 'SIBLING') {
+    throw "G1: child read sibling failed. exit=$($r.exit) raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "echo G1-NEW> `"$gSub\new.txt`"")
+  if ($r.exit -ne 0 -or -not (Test-Path "$gSub\new.txt")) {
+    throw "G1: child write under granted tree failed. raw: $($r.raw)"
+  }
+  Write-Host 'G1 ok: working-tree MODIFY_NO_FDC grant — child reads + creates inside'
+
+  # ── G2: DENY ACE inside the grant — read denied ──────────────────
+  Stdin @('acl','stamp','--group-sid',$GroupSid,'--holder-pid',$PID,
+          '--sandbox-user-sid',$sbSid) `
+        "{`"denyRead`":[`"$($secret -replace '\\','\\')`"]}"
+  $r = RExec @('--', $cmd, '/c', "type `"$secret`"")
+  if ($r.exit -eq 0 -or $r.out -match 'SECRET') {
+    throw "G2: child READ the stamped file. raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$sibling`"")
+  if ($r.out -notmatch 'SIBLING') {
+    throw "G2: sibling no longer readable post-stamp. raw: $($r.raw)"
+  }
+  Write-Host 'G2 ok: DENY ACE + working-tree grant compose — sibling readable, stamped file denied'
+
+  # ── G3: parent-FDC DENY — child cannot del/ren the stamped file ──
+  # The stamp adds (D;OICI;FILE_DELETE_CHILD;;;<sb-SID>) on the
+  # parent; explicit DENY is evaluated first, so even where the
+  # parent inherits an allow-FDC the child has no path through it.
+  $r = RExec @('--', $cmd, '/c', "del `"$secret`"")
+  if (-not (Test-Path $secret) -or
+      (Get-Content -Raw $secret).Trim() -ne 'SECRET') {
+    throw "G3: child deleted/altered the stamped file (parent-FDC DENY did not take). raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "ren `"$secret`" gone.txt")
+  if (-not (Test-Path $secret) -or (Test-Path "$gSub\gone.txt")) {
+    throw "G3: child renamed the stamped file. raw: $($r.raw)"
+  }
+  Write-Host 'G3 ok: parent-FDC DENY ACE — child cannot del/ren the stamped file'
+
+  # ── G3b: parent-FDC DENY overrides BUILTIN\Users:FA on parent ────
+  # The sandbox user is a Users member; without the explicit DENY a
+  # parent with Users:(F) would give it FILE_DELETE_CHILD directly
+  # (the C:\ProgramData case). The DENY ACE is evaluated before
+  # any ALLOW, so the deny still holds.
+  $g3bDir  = Join-Path $gRoot 'g3b'
+  New-Item -ItemType Directory -Path $g3bDir | Out-Null
+  & icacls $g3bDir /grant '*S-1-5-32-545:(OI)(CI)(F)' | Out-Null
+  $g3bFile = Join-Path $g3bDir 'sec.txt'
+  'G3B' | Set-Content -Encoding ASCII $g3bFile
+  Stdin @('acl','stamp','--group-sid',$GroupSid,'--holder-pid',$PID,
+          '--sandbox-user-sid',$sbSid) `
+        "{`"denyRead`":[`"$($g3bFile -replace '\\','\\')`"]}"
+  $r = RExec @('--', $cmd, '/c', "del `"$g3bFile`"")
+  if (-not (Test-Path $g3bFile) -or
+      (Get-Content -Raw $g3bFile).Trim() -ne 'G3B') {
+    throw "G3b: child deleted file under Users:FA parent (DENY did not override). raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$g3bFile`"")
+  if ($r.exit -eq 0 -or $r.out -match 'G3B') {
+    throw "G3b: child READ file under Users:FA parent. raw: $($r.raw)"
+  }
+  Write-Host 'G3b ok: parent-FDC DENY overrides inherited BUILTIN\Users:(F) on parent'
+
+  # ── G4: broker (real user) can still read the stamped file ───────
+  if ((Get-Content -Raw $secret).Trim() -ne 'SECRET') {
+    throw 'G4: broker lost read on the stamped file'
+  }
+  Write-Host 'G4 ok: real-user trustee keeps full access to stamped file'
+
+  # ── G5: directory deny — (OI)(CI) DENY ACE covers the subtree; ───
+  # allowWithinDeny via grant on an inner file.
+  Stdin @('acl','stamp','--group-sid',$GroupSid,'--holder-pid',$PID,
+          '--sandbox-user-sid',$sbSid) `
+        "{`"denyRead`":[`"$($subDeny -replace '\\','\\')`"]}"
+  Stdin @('acl','grant','--group-sid',$GroupSid,'--holder-pid',$PID,
+          '--sandbox-user-sid',$sbSid) `
+        "{`"read`":[`"$($inAllow -replace '\\','\\')`"]}"
+  # Instrumentation: dump exactly what landed on the inner file
+  # post dir-stamp + inner-grant. The icacls/SDDL pair shows the
+  # explicit srt-sandbox ALLOW ACE alongside the inherited DENY
+  # ACE; the child-side `if exist` tells us whether
+  # bypass-traverse through the denied dir works. Kept on the
+  # success path too — the dump is the proof for the design claim
+  # (explicit ALLOW is evaluated before inherited DENY).
+  Write-Host "G5 diag: icacls $inAllow ->"
+  & icacls $inAllow
+  Write-Host "G5 diag: inAllow Sddl=$((Get-Acl $inAllow).Sddl)"
+  Write-Host "G5 diag: subDeny Sddl=$((Get-Acl $subDeny).Sddl)"
+  $r = RExec @('--', $cmd, '/c',
+    "whoami /priv | findstr /i SeChangeNotify")
+  Write-Host "G5 diag: child SeChangeNotify=$($r.out)"
+  $r = RExec @('--', $cmd, '/c', "type `"$inDeny`"")
+  if ($r.exit -eq 0 -or $r.out -match 'INNER') {
+    throw "G5: child read file under denied dir. raw: $($r.raw)"
+  }
+  # Combined probe: echo the path the child sees + if-exist +
+  # type-via-builtin + read-via-stdin-redirect (cmd's `<` is a
+  # direct CreateFileW(GENERIC_READ) — bypasses any extra path
+  # checks `type` might do). Everything goes through one RExec so
+  # the throw carries it all.
+  $r = RExec @('--', $cmd, '/c',
+    ("echo PATH=$inAllow & " +
+     "if exist `"$inAllow`" (echo IFEXIST=YES) else (echo IFEXIST=NO) & " +
+     "type `"$inAllow`" 2>&1 & echo --- & " +
+     "more < `"$inAllow`" 2>&1"))
+  if ($r.out -notmatch 'REALLOW') {
+    throw ("G5: allowWithinDeny grant on inner file did not take " +
+           "effect.`n  child raw: $($r.raw)`n  " +
+           "inAllow Sddl: $((Get-Acl $inAllow).Sddl)`n  " +
+           "subDeny Sddl: $((Get-Acl $subDeny).Sddl)")
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$sibling`"")
+  if ($r.out -notmatch 'SIBLING') {
+    throw "G5: sibling-of-denied-dir lost access. raw: $($r.raw)"
+  }
+  Write-Host 'G5 ok: dir-deny (OI)(CI) covers subtree; sibling unaffected; inner grant overrides'
+
+  # ── G6: revoke + restore — child loses access; DACLs round-trip ──
+  Run @('acl','revoke','--group-sid',$GroupSid,'--holder-pid',$PID,
+        '--sandbox-user-sid',$sbSid)
+  Run @('acl','restore','--group-sid',$GroupSid,'--holder-pid',$PID,
+        '--sandbox-user-sid',$sbSid)
+  $post = (Get-Acl $gRoot).Sddl
+  if ($post -match [regex]::Escape($sbSid)) {
+    throw "G6: srt-sandbox ACE still present on root after revoke: $post"
+  }
+  $postSub = (Get-Acl $subDeny).Sddl
+  if ($postSub -match [regex]::Escape($sbSid)) {
+    throw "G6: srt-sandbox ACE still on dir after restore: $postSub"
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$sibling`"")
+  if ($r.exit -eq 0) {
+    throw "G6: child still reads after revoke. raw: $($r.raw)"
+  }
+  Write-Host 'G6 ok: revoke + restore remove all sb-user ACEs; child loses access'
+} finally {
+  # Best-effort: don't leak ACEs/stamps if a G-row threw mid-way.
+  & $Exe acl revoke  --group-sid $GroupSid --holder-pid $PID `
+        --sandbox-user-sid $sbSid 2>&1 | Out-Null
+  & $Exe acl restore --group-sid $GroupSid --holder-pid $PID `
+        --sandbox-user-sid $sbSid 2>&1 | Out-Null
+  Remove-Item -Recurse -Force $gRoot -ErrorAction SilentlyContinue
+}
+
 # ── R8: exec --as-sandbox-user without provisioning → exit 15 ────
 # Clear the cred row (uninstall does this) and assert the broker
 # refuses with the dedicated exit code instead of failing the
@@ -721,4 +917,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c, R1-R6/R8/R9/R9b incl. R5b)'
+Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c, R1-R6/R8/R9/R9b incl. R5b, G1-G6)'

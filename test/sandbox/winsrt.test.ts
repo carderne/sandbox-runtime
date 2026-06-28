@@ -93,6 +93,7 @@ function createTestConfig(
       groupSid: ADMINS_SID,
       wfpSublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
+      asSandboxUser: false,
     },
   }
 }
@@ -1368,7 +1369,9 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
     await expect(
       SandboxManager.initialize(createFsTestConfig({ allowWrite: [scratch] })),
-    ).rejects.toThrow(/allowWrite is not supported on Windows/)
+    ).rejects.toThrow(
+      /allowWrite is not supported on Windows without windows.asSandboxUser/,
+    )
     await SandboxManager.reset()
   })
 
@@ -1441,7 +1444,9 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     const { argv: a2, env: e2 } = await SandboxManager.wrapWithSandboxArgv(
       `type "${fs2}"`,
       undefined,
-      { filesystem: { denyRead: [secret, fs2] } },
+      {
+        filesystem: { denyRead: [secret, fs2], allowWrite: [], denyWrite: [] },
+      },
     )
     const flags2 = a2.filter(x => x === '--deny-read')
     if (flags2.length !== 1) {
@@ -1486,7 +1491,7 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
       `type "${cfg}"`,
       undefined,
-      { filesystem: { denyRead: [cfg] } },
+      { filesystem: { denyRead: [cfg], allowWrite: [], denyWrite: [] } },
     )
     // The TS filter only drops same-or-stricter session matches;
     // ReadDeny-on-WriteDeny is forwarded to srt-win.
@@ -1544,7 +1549,7 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     const { argv: aN } = await SandboxManager.wrapWithSandboxArgv(
       'exit 0',
       undefined,
-      { filesystem: { denyRead: [f13] } },
+      { filesystem: { denyRead: [f13], allowWrite: [], denyWrite: [] } },
     )
     if (aN.includes('--holder-pid')) {
       throw new Error(
@@ -1681,7 +1686,7 @@ describe.if(isWindows && asSandboxUserEnabled)(
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
-        timeoutMs: 60_000,
+        timeout: 60_000,
       })
     }
 
@@ -1711,5 +1716,174 @@ describe.if(isWindows && asSandboxUserEnabled)(
       // Exit-code only — see B/C convention: any non-zero is fenced.
       expect(r.status).not.toBe(0)
     }, 60_000)
+
+    // ── H5-H8: FS parity under asSandboxUser via SandboxManager ──
+    // The G-rows in smoke-exec.ps1 exercise the srt-win primitives
+    // directly; these check the SandboxManager.initialize() →
+    // grant + stamp → reset() → revoke + restore plumbing.
+    let hScratch: string
+    let hSecret: string
+    let hSibling: string
+
+    function createSbUserFsConfig(fs: FsOverrides): SandboxRuntimeConfig {
+      const base = createFsTestConfig(fs)
+      return { ...base, windows: { ...base.windows!, asSandboxUser: true } }
+    }
+
+    async function rexecSandboxed(cmd: string, fs: FsOverrides) {
+      await SandboxManager.initialize(createSbUserFsConfig(fs))
+      try {
+        const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
+        return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
+          env: wrapped.env,
+          timeout: 60_000,
+        })
+      } finally {
+        await SandboxManager.reset()
+      }
+    }
+
+    it('H5: allowWrite grants the working tree — child reads sibling', async () => {
+      hScratch = mkdtempSync(join(tmpdir(), 'srt-h-'))
+      hSecret = join(hScratch, 'secret.txt')
+      hSibling = join(hScratch, 'sibling.txt')
+      writeFileSync(hSecret, 'SECRET')
+      writeFileSync(hSibling, 'SIBLING')
+      const r = await rexecSandboxed(`type "${hSibling}"`, {
+        allowWrite: [hScratch],
+      })
+      if (r.status !== 0 || !r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H5: child read sibling under allowWrite tree failed — ` +
+            `exit=${r.status} stderr=${JSON.stringify(r.stderr)} ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H6: allowWrite + denyRead — secret denied, sibling readable', async () => {
+      const r = await rexecSandboxed(
+        `type "${hSecret}" & echo --SEP-- & type "${hSibling}"`,
+        { allowWrite: [hScratch], denyRead: [hSecret] },
+      )
+      if (r.stdout.includes('SECRET')) {
+        throw new Error(
+          `H6: child read the denyRead target under asSandboxUser — ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+      if (!r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H6: sibling unreadable post-stamp — ` +
+            `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H7: no allowWrite — child has no rights on real-user file', async () => {
+      const r = await rexecSandboxed(`type "${hSibling}"`, {})
+      if (r.status === 0 || r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H7: child read a real-user file with no grant — ` +
+            `exit=${r.status} stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
+      // Red→green for the per-exec/session-level glob asymmetry:
+      // before this PR a per-exec `glob-*.secret` reached
+      // `srt-win exec --deny-read` raw and `canonicalize_path`
+      // hard-failed; now `wrapWithSandboxArgv` routes it through
+      // `expandWindowsFsDenyPaths` (same chokepoint as session-
+      // level) so the child sees two concrete `--deny-read` paths.
+      const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
+      const a = join(dir, 'glob-a.secret')
+      const b = join(dir, 'glob-b.secret')
+      writeFileSync(a, 'GLOB-A')
+      writeFileSync(b, 'GLOB-B')
+      await SandboxManager.initialize(
+        createSbUserFsConfig({ allowWrite: [dir] }),
+      )
+      try {
+        const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+          `type "${a}" & echo --SEP-- & type "${b}"`,
+          undefined,
+          {
+            filesystem: {
+              denyRead: [join(dir, 'glob-*.secret')],
+              allowWrite: [],
+              denyWrite: [],
+            },
+          },
+        )
+        // Glob expanded TS-side: exactly two --deny-read flags;
+        // no glob char survives onto the argv (Rust would
+        // hard-fail otherwise).
+        const denyIdx = argv.flatMap((x, i) => (x === '--deny-read' ? [i] : []))
+        if (denyIdx.length !== 2) {
+          throw new Error(
+            `H-glob: expected 2 --deny-read flags after glob expand; ` +
+              `got ${denyIdx.length}: ${JSON.stringify(argv)}`,
+          )
+        }
+        for (const i of denyIdx) {
+          if (argv[i + 1].includes('*') || argv[i + 1].includes('?')) {
+            throw new Error(
+              `H-glob: glob char survived into --deny-read value ` +
+                `'${argv[i + 1]}' — per-exec expand not applied`,
+            )
+          }
+        }
+        const r = await spawnAsync(argv[0], argv.slice(1), {
+          env,
+          timeout: 60_000,
+        })
+        if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
+          throw new Error(
+            `H-glob: child read a glob-expanded deny target — ` +
+              `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+        // Per-exec restore: a fresh child (no customConfig) under
+        // the same session can read both — proves the per-exec
+        // stamp was lifted on child exit, not leaked onto disk.
+        const wf = await SandboxManager.wrapWithSandboxArgv(
+          `type "${a}" & type "${b}"`,
+        )
+        const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
+          env: wf.env,
+          timeout: 60_000,
+        })
+        if (!rR.stdout.includes('GLOB-A') || !rR.stdout.includes('GLOB-B')) {
+          throw new Error(
+            `H-glob: per-exec stamp NOT restored — fresh child still ` +
+              `denied. stdout=${JSON.stringify(rR.stdout)} ` +
+              `stderr=${JSON.stringify(rR.stderr)}`,
+          )
+        }
+      } finally {
+        await SandboxManager.reset()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 120_000)
+
+    it('H8: reset() revokes the grant — sandbox-user ACE gone', async () => {
+      // After H5/H6/H7's reset() calls, the root's DACL must NOT
+      // carry an explicit ACE for the sandbox user.
+      const out = spawnSync('icacls', [hScratch], {
+        encoding: 'utf8',
+        timeout: 5_000,
+      })
+      if (out.stdout.includes(sbSid) || out.stdout.includes('srt-sandbox')) {
+        throw new Error(
+          `H8: srt-sandbox ACE still on '${hScratch}' after reset(): ` +
+            out.stdout,
+        )
+      }
+      rmSync(hScratch, { recursive: true, force: true })
+    }, 30_000)
   },
 )
+
+type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>

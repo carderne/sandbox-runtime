@@ -587,15 +587,19 @@ try {
   }
   Write-Host 'A6 ok: child denied write to state.db'
 
-  # ── A7: directory in payload → clear error ────────────────────
-  $json7 = @{ denyRead = @($Scratch) } | ConvertTo-Json -Compress
+  # ── A7: directory in payload → volume root rejected ────────────
+  # Directories are accepted (the stamp gets `(OI)(CI)` and inherits
+  # to the subtree — covered by smoke-exec G5). The remaining hard
+  # error for a dir input is a volume root, which would propagate
+  # broker-only across the drive.
+  $json7 = @{ denyRead = @('C:\') } | ConvertTo-Json -Compress
   $out7 = $json7 | & $Exe acl stamp --group-sid $GroupSid `
     --holder-pid $Holder 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) { throw 'A7: directory was accepted' }
-  if ($out7 -notmatch '(?i)requires explicit file paths') {
+  if ($LASTEXITCODE -eq 0) { throw 'A7: volume-root dir was accepted' }
+  if ($out7 -notmatch '(?i)refusing to deny a volume root') {
     throw "A7: wrong error message: $out7"
   }
-  Write-Host 'A7 ok: directory in payload rejected with clear message'
+  Write-Host 'A7 ok: volume-root directory rejected with clear message'
 
   # ── A8: glob in payload → clear error ─────────────────────────
   $json8 = @{ denyRead = @("$Scratch\*.txt") } | ConvertTo-Json -Compress
