@@ -599,6 +599,20 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
     if !has_schema {
         return Ok(None);
     }
+    // Stale schema → fail closed. `Ok(None)` here would mean
+    // `fence_plan_for_holder()` returns an empty plan and the child
+    // runs unfenced; bailing surfaces an actionable hint everywhere
+    // (`user status`, `exec`'s holder-fence) and install's
+    // `read_setup().ok()` still falls through to re-provision.
+    let ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if ver != 0 && ver != SCHEMA_VERSION {
+        bail!(
+            "state DB at schema v{ver}, expected v{SCHEMA_VERSION}; \
+             re-run `srt-win install` to migrate"
+        );
+    }
     Ok(Some(conn))
 }
 
@@ -614,6 +628,79 @@ fn query_holder_paths(conn: &Connection, pid: HolderPid) -> Result<Vec<String>> 
 /// Open at an arbitrary path. Tests use `:memory:` via
 /// `open_db_at(Path::new(":memory:"))`.
 pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
+    // Schema mismatch → rename + recreate. No ALTER/DROP migration:
+    // the old DB is preserved (debugging/recovery) at
+    // state.db.v<old>.<ts>.bak alongside `path`, and a fresh DB is
+    // created at the expected schema. `acl recover` sweeps orphaned
+    // ACEs by trustee SID without the old rows. The `sandbox_user`
+    // row (cred + ca_cert) is in the renamed-away DB → the hint
+    // says re-run install + trust-ca. The .bak inherits the
+    // PROTECTED broker-only DACL from the state dir (stamped by
+    // [`open_db`]); no per-file stamp needed. Chokepoint here so
+    // direct callers (`clear_setup`, `trust_ca`) don't silently
+    // bump `user_version` on a stale DB.
+    if path.exists() {
+        let probe = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        );
+        if let Ok(c) = probe {
+            let ver: i64 = c
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            drop(c);
+            if ver != 0 && ver != SCHEMA_VERSION {
+                let dir = path.parent().ok_or_else(|| {
+                    anyhow!("state DB path '{}' has no parent", path.display())
+                })?;
+                let stem = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("state.db");
+                let ts = unix_now();
+                let bak = dir.join(format!("{stem}.v{ver}.{ts}.bak"));
+                std::fs::rename(path, &bak).map_err(|e| {
+                    // SQLite's win32 VFS opens with no
+                    // FILE_SHARE_DELETE; another live broker holds
+                    // the file → rename fails 32 here where DROP
+                    // TABLE under WAL would have succeeded.
+                    if e.raw_os_error() == Some(32) {
+                        anyhow!(
+                            "rename incompatible state DB {} → {}: {e} \
+                             — the DB is open in another process \
+                             (likely a running srt-win/broker); close \
+                             it and retry",
+                            path.display(),
+                            bak.display()
+                        )
+                    } else {
+                        anyhow::Error::new(e).context(format!(
+                            "rename incompatible state DB {} → {}",
+                            path.display(),
+                            bak.display()
+                        ))
+                    }
+                })?;
+                // WAL sidecars too (best-effort — they hold no cred,
+                // only journal pages of it).
+                for ext in ["-wal", "-shm"] {
+                    let p = dir.join(format!("{stem}{ext}"));
+                    let to =
+                        dir.join(format!("{stem}.v{ver}.{ts}.bak{ext}"));
+                    let _ = std::fs::rename(&p, &to);
+                }
+                eprintln!(
+                    "srt-win: state DB at schema v{ver} found, expected \
+                     v{SCHEMA_VERSION}; renamed to {} and created fresh. \
+                     Re-run `srt-win install` (and `srt-win user \
+                     trust-ca <pem>` if you use TLS termination) to \
+                     re-provision; run `srt-win acl recover` to clear \
+                     orphaned ACEs.",
+                    bak.display(),
+                );
+            }
+        }
+    }
     let conn = Connection::open(path)
         .with_context(|| format!("sqlite open {}", path.display()))?;
     // WAL = concurrent readers + single writer + crash safety.
@@ -626,34 +713,6 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    // No migration: the ACL feature has not shipped, so any
-    // existing DB at a different `user_version` is dev-only
-    // scratch. Drop and recreate (disk-is-truth: a still-stamped
-    // file is recognized by its on-disk marker regardless).
-    let ver: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .context("read user_version")?;
-    if ver != 0 && ver != SCHEMA_VERSION {
-        eprintln!(
-            "srt-win: discarding dev-only state DB at incompatible \
-             schema v{ver} (no released version uses it)"
-        );
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS holders; \
-             DROP TABLE IF EXISTS ace_holders; \
-             DROP TABLE IF EXISTS grant_holders; \
-             DROP TABLE IF EXISTS brokers; \
-             DROP TABLE IF EXISTS acl_snapshots; \
-             DROP TABLE IF EXISTS parent_stamps; \
-             DROP TABLE IF EXISTS working_aces; \
-             DROP TABLE IF EXISTS working_grants; \
-             DROP INDEX IF EXISTS holders_by_pid; \
-             DROP INDEX IF EXISTS ace_holders_by_pid; \
-             DROP INDEX IF EXISTS grant_holders_by_pid; \
-             DROP INDEX IF EXISTS snapshots_by_parent;",
-        )
-        .context("drop incompatible dev schema")?;
-    }
     conn.execute_batch(SCHEMA_SQL).context("apply schema")?;
     // Additive column on `sandbox_user` (table predates it).
     // `CREATE TABLE IF NOT EXISTS` doesn't add columns, so probe
