@@ -6,10 +6,10 @@
   and Fwpm* both need admin).
 
   Usage (local dev machine):
-    pwsh vendor/srt-win/ci/smoke.ps1 .\target\release\srt-win.exe
+    pwsh vendor/srt-win-src/ci/smoke.ps1 .\target\release\srt-win.exe
 
   Usage (CI — workflow passes the path):
-    pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
+    pwsh vendor/srt-win-src/ci/smoke.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
   All WFP operations target $TestSublayer (a fixed test GUID), NOT
   the production default sublayer — safe to run on a dev machine
@@ -242,6 +242,79 @@ if ($iw.state -ne 'installed' -or $iw.filters -lt 8) {
   throw "install: wfp expected installed/>=8, got $($iw.state)/$($iw.filters)"
 }
 
+# ── sandbox user provisioned by install ────────────────────────────
+$us = J @('user', 'status')
+Write-Host "user status: $($us | ConvertTo-Json -Compress)"
+if (-not $us.user.exists)            { throw "install: sandbox user not provisioned" }
+if (-not $us.user.sid -or -not $us.user.sid.StartsWith('S-1-5-21-')) {
+  throw "install: sandbox user SID missing or malformed: '$($us.user.sid)'"
+}
+if (-not $us.user.group_exists)      { throw "install: sandbox-runtime-users group missing" }
+if (-not $us.user.in_builtin_users)  { throw "install: sandbox user not in BUILTIN\Users" }
+if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandbox-runtime-users" }
+if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
+if (-not $us.cred_present)           { throw "install: credential not present in state DB" }
+if ($us.marker_version -ne 1)        { throw "install: setup marker version expected 1, got $($us.marker_version)" }
+if ($us.marker_user_sid -ne $us.user.sid) {
+  throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
+}
+
+# user-SID-keyed WFP filters present alongside the group set, with
+# the right SID in their tag.
+if ($iw.user_filters -lt 4) {
+  throw "install: expected >=4 user-SID filters, got $($iw.user_filters)"
+}
+if ($iw.user_sid -ne $us.user.sid) {
+  throw "install: WFP user_sid '$($iw.user_sid)' != provisioned '$($us.user.sid)'"
+}
+
+# read-cred returns the cleartext password — 32 chars from the
+# documented alphabet. Run as the real user (the sandbox user is
+# DENY'd on the directory; that side is verified once the runner
+# exists).
+$pw = & $Exe user read-cred
+if ($LASTEXITCODE -ne 0) { throw "user read-cred exited $LASTEXITCODE" }
+if ($pw.Length -ne 32)   { throw "user read-cred: expected 32 chars, got $($pw.Length)" }
+if ($pw -match '["\s\\`&|<>^]') {
+  throw "user read-cred: password contains an excluded char: '$pw'"
+}
+
+# State-dir DACL: explicit DENY for sandbox-runtime-users. This is
+# the load-bearing gate on the credential file (machine-scope DPAPI
+# is not a confidentiality boundary — any local account can decrypt
+# a readable blob). The broker-only PROTECTED allow set already
+# excludes the sandbox user, but the explicit DENY makes the intent
+# auditable.
+$stateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime'
+$acl = Get-Acl $stateDir
+$deny = $acl.Access | Where-Object {
+  $_.AccessControlType -eq 'Deny' -and
+  $_.IdentityReference.Value -match 'sandbox-runtime-users$'
+}
+if (-not $deny) {
+  throw "install: state-dir DACL has no DENY for sandbox-runtime-users; got:`n$($acl.Access | Out-String)"
+}
+if (-not (Test-Path (Join-Path $stateDir 'state.db'))) {
+  throw "install: state.db missing at $stateDir"
+}
+
+# block-user must NOT match the REAL user — its SD allows only the
+# sandbox user's SID. (The sandbox-side "is blocked" assertion needs
+# the runner; deferred.)
+$r = curl.exe -s -m 10 -o NUL -w "%{http_code}" https://example.com
+if ($LASTEXITCODE -ne 0 -or $r -ne '200') {
+  throw "install: real-user egress past block-user expected 200, got exit=$LASTEXITCODE code='$r'"
+}
+Write-Host "install: real-user egress past block-user OK ($r)"
+
+# `wfp install` (group set only) must NOT drop the user-SID set —
+# the two sets are independent.
+Run (@('wfp', 'install', '--name', $instGrp) + $isl + $pr)
+$iwAfter = J (@('wfp', 'status') + $isl)
+if ($iwAfter.user_filters -ne $iw.user_filters) {
+  throw "wfp install perturbed user-SID filters: $($iw.user_filters) -> $($iwAfter.user_filters)"
+}
+
 # Idempotency, same range: second install with identical flags is
 # a no-op (exit 0, "already installed").
 $out = & $Exe @(@('install', '--name', $instGrp) + $isl + $pr) 2>&1 | Out-String
@@ -288,15 +361,175 @@ if ($LASTEXITCODE -ne 11) {
   throw "install: invalid --group-sid expected exit 11, got $LASTEXITCODE"
 }
 
-# Uninstall removes filters only — group remains.
+# `wfp verify` and `user trust-ca` route through
+# CreateProcessWithLogonW (Secondary Logon). GHA runners have it;
+# ensure it's running (idempotent).
+try { Start-Service seclogon -ea Stop } catch {
+  Write-Host "smoke: WARNING: Start-Service seclogon: $_"
+}
+
+# ── wfp verify: behavioral egress-block probe ───────────────────────
+# Spawns the runner as the sandbox user and direct-connects to a
+# target. The block-user filter fires at ALE_AUTH_CONNECT (before
+# any packet leaves) → WSAEACCES → exit 0 + "blocked". This is the
+# non-elevated readiness check (BFE enum is admin-gated; this
+# isn't). stderr (the runner's BLOCKED/UNREACHABLE line) flows to
+# the host so it's in the CI log; stdout is JUST the JSON line.
+#
+# `--target 127.0.0.1:49999` (a local listener bound below) — OUT of
+# the WFP loopback permit range, so block-user fires when the fence
+# is active and the connect succeeds when it isn't. Deterministic;
+# no internet. This is the same shape as the product path
+# (`verifyWindowsWfpEgress` binds an ephemeral out-of-range loopback
+# listener and passes it as `--target`).
+$probePort = 49999
+$probeTgt = "127.0.0.1:$probePort"
+$probeLsn = [System.Net.Sockets.TcpListener]::new(
+  [System.Net.IPAddress]::Loopback, $probePort)
+$probeLsn.Start()
+function WfpVerify([string]$tgt) {
+  $out = & $Exe wfp verify --target $tgt
+  $ec = $LASTEXITCODE
+  Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
+}
+$v = WfpVerify $probeTgt
+if ($v.exit -ne 0 -or $v.json.egress_probe -ne 'blocked') {
+  throw ("wfp verify (fence-active): expected exit 0 + blocked, " +
+         "got exit=$($v.exit) probe='$($v.json.egress_probe)'")
+}
+if ($v.json.target -ne $probeTgt) {
+  throw "wfp verify: --target not honoured; got '$($v.json.target)'"
+}
+Write-Host "wfp verify ok: fence-active → blocked (target=$probeTgt)"
+
+# ── user trust-ca: cert recorded + written ─────────────────────────
+# Cert lifecycle = sandbox-user lifecycle (set via `user trust-ca`,
+# persistent until uninstall); `srt-win install` and `srt-win exec`
+# never touch it. Mint a throwaway self-signed cert (PEM), pass it
+# via `user trust-ca`, and assert `user status` surfaces
+# the thumb + a PEM that round-trips back to the same DER. The
+# one-shot CPWLW(runner) registry write into `HKU\<sbSid>` is
+# verified by the runner's stderr logging + a real-user-store leak
+# check; child-visibility under the restricted token is a Server-SKU
+# anomaly (see cert_store.rs) and is left to Win11 manual probes.
+$caDir = Join-Path $env:TEMP "srt-ca-$(Get-Random)"
+$null = mkdir $caDir
+try {
+  $ca = New-SelfSignedCertificate -Subject 'CN=srt-smoke-ca DO NOT TRUST' `
+          -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
+  $caPem = Join-Path $caDir 'ca.pem'
+  $b64 = [Convert]::ToBase64String($ca.RawData, 'InsertLineBreaks')
+  "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----" |
+    Set-Content -Path $caPem -Encoding ascii
+  $thumb = $ca.Thumbprint
+  Remove-Item "Cert:\CurrentUser\My\$thumb" -ea SilentlyContinue
+
+  # `user trust-ca` is the FIRST `spawn_runner` call (CPWLW + the
+  # WinSta0/BNO grants). A hang here is the broker waiting on a
+  # runner that never finished init — e.g. an under-granted
+  # WinSta0 mask. Marker so a hung CI log shows which step it is
+  # (the captured `$out` never prints on a hang).
+  Write-Host 'ca-trust: spawning runner (CPWLW + station/BNO grants)'
+  $out = & $Exe user trust-ca $caPem 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "user trust-ca exited ${LASTEXITCODE}: $out"
+  }
+  if ($out -notmatch '(?i)CA installed.*thumb=') {
+    throw "user trust-ca: runner did not log CA install. out: $out"
+  }
+  $usCa = J @('user', 'status')
+  if ($usCa.ca_cert_thumb -ne $thumb) {
+    throw "user status: ca_cert_thumb '$($usCa.ca_cert_thumb)' != '$thumb'"
+  }
+  if (-not $usCa.ca_cert_pem -or $usCa.ca_cert_pem -notmatch 'BEGIN CERTIFICATE') {
+    throw "user status: ca_cert_pem missing or malformed"
+  }
+  # PEM round-trips back to the same DER (so der_to_pem and the
+  # state-DB blob agree).
+  $pemBody = ($usCa.ca_cert_pem -replace '-----[^-]+-----', '' -replace '\s', '')
+  if ([Convert]::ToBase64String($ca.RawData) -ne $pemBody) {
+    throw 'user status: ca_cert_pem does not round-trip to original DER'
+  }
+  # Real user's Root must NOT have it — the write is scoped to the
+  # sandbox user's HKU\<SID>.
+  if (Get-ChildItem Cert:\CurrentUser\Root |
+      Where-Object Subject -match 'srt-smoke-ca') {
+    throw 'user trust-ca: CA leaked into REAL user CurrentUser\Root'
+  }
+  Write-Host "ca-trust ok: thumb=$thumb recorded + written into sandbox-user Root"
+
+  # `install --force` re-provisions the account but must preserve
+  # the recorded CA — write_setup_info's ON CONFLICT DO UPDATE
+  # excludes ca_cert (owned by set_ca_cert), so install never
+  # touches it.
+  Run (@('install', '--name', $instGrp, '--force') + $isl + $pr)
+  $usCa3 = J @('user', 'status')
+  if ($usCa3.ca_cert_thumb -ne $thumb) {
+    throw ("install --force: ca_cert wiped — got " +
+           "'$($usCa3.ca_cert_thumb)', expected '$thumb'")
+  }
+  Write-Host 'ca-trust ok: install --force preserves ca_cert'
+} finally {
+  Remove-Item $caDir -Recurse -Force -ea SilentlyContinue
+}
+
+# --keep-user: filters removed, sandbox user + cred file kept.
+Run (@('uninstall', '--keep-user') + $isl)
+$uw0 = J (@('wfp', 'status') + $isl)
+if ($uw0.state -ne 'absent' -or $uw0.user_filters -ne 0) {
+  throw "uninstall --keep-user: wfp expected absent/0, got $($uw0.state)/$($uw0.user_filters)"
+}
+$us0 = J @('user', 'status')
+if (-not $us0.user.exists -or -not $us0.cred_present) {
+  throw "uninstall --keep-user: sandbox user/cred should be kept"
+}
+
+# ── wfp verify (fence-INACTIVE): connect succeeds ───────────────────
+# Filters were just removed (`uninstall --keep-user`) but the
+# sandbox user is kept → the probe runs and the connect to the
+# local listener SUCCEEDS (no WFP block) → exit 3 + "connected".
+# This is the security-boundary proof that exit 0 above wasn't a
+# false positive.
+$v = WfpVerify $probeTgt
+if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
+  throw ("wfp verify (fence-inactive): expected exit 3 + " +
+         "connected, got exit=$($v.exit) probe=" +
+         "'$($v.json.egress_probe)' — probe cannot distinguish " +
+         "fence-active from fence-missing")
+}
+Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
+$probeLsn.Stop()
+
+# Re-install to set up for the full uninstall below.
+Run (@('install', '--name', $instGrp) + $isl + $pr)
+
+# Uninstall removes filters AND the sandbox user — discriminator
+# group remains.
 Run (@('uninstall') + $isl)
 $uw = J (@('wfp', 'status') + $isl)
 if ($uw.state -ne 'absent') {
   throw "uninstall: wfp expected absent, got $($uw.state)"
 }
+if ($uw.user_filters -ne 0) {
+  throw "uninstall: user-SID filters expected 0, got $($uw.user_filters)"
+}
 $ug = J @('group', 'status', '--name', $instGrp)
 if ($ug.state -notin 'created-not-on-token', 'ready') {
   throw "uninstall: group should be left intact, got $($ug.state)"
+}
+$usGone = J @('user', 'status')
+if ($usGone.user.exists) {
+  throw "uninstall: sandbox user should be removed, got $($usGone | ConvertTo-Json -Compress)"
+}
+if ($usGone.cred_present) {
+  throw "uninstall: credential row should be cleared"
+}
+if ($null -ne $usGone.marker_version) {
+  throw "uninstall: setup marker row should be cleared"
+}
+if ($null -ne $usGone.ca_cert_thumb) {
+  throw "uninstall: ca_cert row should be cleared"
 }
 # Idempotent no-op: second uninstall must also exit 0.
 Run (@('uninstall') + $isl)

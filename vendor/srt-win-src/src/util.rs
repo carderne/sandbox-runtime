@@ -71,7 +71,67 @@ pub fn local_free(p: *mut c_void) {
     }
 }
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
+use windows::Win32::Foundation::WIN32_ERROR;
+
+/// `Ok(())` if `r` is `ERROR_SUCCESS`, else `bail!("{label}:
+/// WIN32_ERROR=0x…")`. For Win32 APIs that return a bare
+/// `WIN32_ERROR` rather than a `windows::core::Result` (e.g.
+/// `Get`/`SetNamedSecurityInfoW`).
+pub(crate) fn win32_ok(r: WIN32_ERROR, label: &str) -> Result<()> {
+    if r.is_err() {
+        bail!("{label}: WIN32_ERROR=0x{:08x}", r.0)
+    }
+    Ok(())
+}
+
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE,
+    REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE,
+};
+
+/// `RegCreateKeyExW(root, subkey, KEY_SET_VALUE)` →
+/// `RegSetValueExW(value_name, ty, data)` → `RegCloseKey`. Creates
+/// intermediate subkeys. The single registry-write helper for
+/// `cert_store::install_root_ca` (`HKEY_USERS`, `REG_BINARY`) and
+/// `user::set_logon_ui_hidden` (`HKEY_LOCAL_MACHINE`, `REG_DWORD`).
+pub fn reg_set_value(
+    root: HKEY,
+    subkey: &str,
+    value_name: &str,
+    ty: REG_VALUE_TYPE,
+    data: &[u8],
+) -> Result<()> {
+    let sub_w = wstr(subkey);
+    let val_w = wstr(value_name);
+    let mut hkey = HKEY::default();
+    let r = unsafe {
+        RegCreateKeyExW(
+            root,
+            pcwstr(&sub_w),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(anyhow!("RegCreateKeyExW({subkey}): {r:?}"));
+    }
+    let r =
+        unsafe { RegSetValueExW(hkey, pcwstr(&val_w), None, ty, Some(data)) };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if r.is_err() {
+        return Err(anyhow!("RegSetValueExW({subkey}\\{value_name}): {r:?}"));
+    }
+    Ok(())
+}
+
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
@@ -111,6 +171,19 @@ impl OwnedSd {
             }
         }
         Ok(Self { ptr: psd, len: sz })
+    }
+
+    /// Take ownership of a `PSECURITY_DESCRIPTOR` returned by a Win32
+    /// API documented to require `LocalFree` (e.g.
+    /// `GetNamedSecurityInfoW`). `len` is queried for completeness;
+    /// callers that only need the free-on-drop guard can ignore it.
+    pub fn from_raw(psd: PSECURITY_DESCRIPTOR) -> Self {
+        let len = if psd.0.is_null() {
+            0
+        } else {
+            unsafe { GetSecurityDescriptorLength(psd) }
+        };
+        Self { ptr: psd, len }
     }
 }
 

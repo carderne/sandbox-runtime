@@ -202,6 +202,14 @@ async function forwardUpstream(
   res: ServerResponse,
   target: TerminateTarget,
 ): Promise<void> {
+  // req.url is the request-target verbatim. Inside a CONNECT tunnel almost
+  // every client sends origin-form (`/path?q`), but RFC 7230 §5.3.2 also
+  // permits absolute-form (`https://host/path`) and servers MUST accept it.
+  // Normalize to origin-form so concatenating onto `https://${host}` below
+  // yields a well-formed URL, and discard any client-supplied authority so
+  // the CONNECT-verified target stays authoritative (same rationale as the
+  // Host-header note below).
+  const path = originFormPath(req.url)
   let body: Readable = req
   if (filterRequest) {
     const ac = new AbortController()
@@ -229,7 +237,7 @@ async function forwardUpstream(
       filterRequest,
       req,
       res,
-      `https://${host}${req.url ?? '/'}`,
+      `https://${host}${path}`,
       ac.signal,
     )
     if (out === null) return
@@ -253,7 +261,7 @@ async function forwardUpstream(
     {
       host: target.hostname,
       port: target.port,
-      path: req.url,
+      path,
       method: req.method,
       headers: fwdHeaders,
       // We're a TLS-terminating proxy, not a trust boundary for the upstream
@@ -291,6 +299,18 @@ async function forwardUpstream(
 
   res.on('close', () => upstream.destroy())
   body.pipe(upstream)
+}
+
+function originFormPath(reqUrl: string | undefined): string {
+  const raw = reqUrl ?? '/'
+  if (raw.startsWith('/')) return raw
+  try {
+    const u = new URL(raw)
+    return `${u.pathname}${u.search}` || '/'
+  } catch {
+    // asterisk-form (`OPTIONS *`) or anything else non-absolute — pass through.
+    return raw
+  }
 }
 
 let sockSeq = 0

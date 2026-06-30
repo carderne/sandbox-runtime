@@ -169,8 +169,7 @@ describe('macOS env preamble for masked credentials', () => {
       writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
       setEnvVars: { GH_TOKEN: 'fake_value_test-sentinel' },
     })
-    // shellquote escapes '=' so the env arg is GH_TOKEN\=fake_value_…
-    expect(wrapped).toContain('GH_TOKEN\\=fake_value_test-sentinel')
+    expect(wrapped).toContain('GH_TOKEN=fake_value_test-sentinel')
     expect(wrapped.indexOf('GH_TOKEN')).toBeLessThan(
       wrapped.indexOf('sandbox-exec'),
     )
@@ -185,7 +184,7 @@ describe('macOS env preamble for masked credentials', () => {
       setEnvVars: { GH_TOKEN: 'fake_value_x' },
     })
     expect(wrapped).not.toBe('echo hi')
-    expect(wrapped).toContain('GH_TOKEN\\=fake_value_x')
+    expect(wrapped).toContain('GH_TOKEN=fake_value_x')
   })
 })
 

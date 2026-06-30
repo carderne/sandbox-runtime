@@ -406,6 +406,23 @@ export const NetworkConfigSchema = z.object({
         .min(1)
         .optional()
         .describe('Path to the PEM-encoded private key for caCertPath.'),
+      excludeDomains: z
+        .array(domainPatternSchema)
+        .optional()
+        .describe(
+          'Domain patterns (same syntax as allowedDomains) whose HTTPS ' +
+            'connections are NOT terminated. Matching CONNECTs are opaque ' +
+            'byte tunnels: still subject to the allow/deny domain lists, ' +
+            'but the sandboxed client completes its own TLS handshake with ' +
+            'the upstream, so filterRequest and credential injection do not ' +
+            'apply to their HTTPS traffic (plain-HTTP requests to the same ' +
+            'hosts keep the normal request pipeline). Use for hosts the ' +
+            'proxy must not re-originate: ' +
+            'mTLS upstreams (only the client holds the client certificate) ' +
+            'and clients that pin the upstream certificate and would reject ' +
+            'the MITM CA. Hosts still need to be reachable via ' +
+            'allowedDomains; this list only changes how they are tunnelled.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -428,6 +445,17 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
+  disabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Disable all filesystem policy enforcement. When true, no read or write rules are emitted: ' +
+        'denyRead/allowRead/allowWrite/denyWrite are ignored, and the built-in mandatory write ' +
+        'protections (.git/hooks, .git/config, shell rc files, .mcp.json, .vscode/.idea, ' +
+        '.claude/commands, .claude/agents) are NOT applied. Use only when the sandboxed process ' +
+        'is trusted with full host filesystem access. Network and credential-env restrictions ' +
+        'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
+    ),
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)
@@ -507,6 +535,16 @@ export const WindowsConfigSchema = z.object({
       'WFP sublayer GUID under which the filters were installed. Omit to ' +
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
+    ),
+  asSandboxUser: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Run sandboxed commands as the dedicated `srt-sandbox` local user ' +
+        '(two-hop launch via CreateProcessWithLogonW) instead of the ' +
+        'same-user deny-only-group token. Requires `srt-win install` to ' +
+        'have provisioned the user. Opt-in while the separate-user path ' +
+        'stabilises; the same-user path is unchanged when false.',
     ),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
@@ -658,6 +696,51 @@ export const SandboxRuntimeConfigSchema = z
       }
       if (entry.mode !== 'mask') return
       hasMasked = true
+      // Credential substitution only runs on the TLS-terminated path, so a
+      // host covered by tlsTerminate.excludeDomains can never receive the
+      // real value — the upstream sees the placeholder. Reject the
+      // spellings that are *entirely* self-contradictory:
+      //   - an explicit injectHosts entry whose every concrete host is
+      //     excluded (isInjectHostCoveredByAllowedDomains is the generic
+      //     "pattern fully covered by pattern list" predicate);
+      //   - no injectHosts (= every allowedDomain) while excludeDomains
+      //     covers all of allowedDomains, i.e. injection could never
+      //     happen anywhere.
+      // A *partial* overlap is legitimate (excluded hosts simply don't get
+      // the credential) and is reported at runtime instead.
+      const exclude = cfg.network.tlsTerminate?.excludeDomains
+      if (exclude?.length) {
+        if (entry.injectHosts) {
+          for (const [i, host] of entry.injectHosts.entries()) {
+            if (isInjectHostCoveredByAllowedDomains(host, exclude)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: [...path, 'injectHosts', i],
+                message:
+                  `injectHosts entry "${host}" is entirely covered by ` +
+                  `network.tlsTerminate.excludeDomains. Credential ` +
+                  `injection only runs on TLS-terminated connections, so ` +
+                  `this host would receive the placeholder instead of the ` +
+                  `credential. Remove it from one of the two lists.`,
+              })
+            }
+          }
+        } else if (
+          allowed.length > 0 &&
+          allowed.every(p => isInjectHostCoveredByAllowedDomains(p, exclude))
+        ) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `This masked credential has no injectHosts, so it defaults ` +
+              `to network.allowedDomains — but ` +
+              `network.tlsTerminate.excludeDomains covers every allowed ` +
+              `domain, so it could never be injected anywhere. Credential ` +
+              `injection only runs on TLS-terminated connections.`,
+          })
+        }
+      }
       if (entry.injectHosts !== undefined && entry.injectHosts.length === 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

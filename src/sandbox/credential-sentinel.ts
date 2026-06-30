@@ -73,6 +73,20 @@ export class SentinelRegistry {
     return this.bySentinel.get(sentinel)?.realValue
   }
 
+  /**
+   * Names of the registered credentials whose `injectHosts` cover
+   * `destHost`. Diagnostic helper: the proxy uses it to warn when a host is
+   * exempted from TLS termination (so substitution can never run there) but
+   * a masked credential is configured for injection at it.
+   */
+  namesInjectableAt(destHost: string, matches: HostMatcher): string[] {
+    const names: string[] = []
+    for (const e of this.byName.values()) {
+      if (e.injectHosts.some(p => matches(destHost, p))) names.push(e.name)
+    }
+    return names
+  }
+
   /** Iterate registered `[sentinel, realValue]` pairs. */
   *entries(): IterableIterator<[string, string]> {
     for (const e of this.bySentinel.values()) yield [e.sentinel, e.realValue]

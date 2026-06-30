@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process'
 assert.strictEqual(
   typeof globalThis.Bun,
   'undefined',
-  'This test must run in Node.js, not Bun'
+  'This test must run in Node.js, not Bun',
 )
 
 console.log('Running whichSync Node.js fallback tests...')
@@ -32,12 +32,19 @@ const { whichSync } = await import('../../dist/utils/which.js')
 // Test 1: Should find existing executable
 const lsPath = whichSync('ls')
 assert.ok(lsPath !== null, 'whichSync should find ls')
-assert.ok(lsPath.includes('/ls'), `Expected path to contain /ls, got: ${lsPath}`)
+assert.ok(
+  lsPath.includes('/ls'),
+  `Expected path to contain /ls, got: ${lsPath}`,
+)
 console.log('✓ Found ls at:', lsPath)
 
 // Test 2: Should return null for non-existent executable
 const nonExistent = whichSync('this-command-definitely-does-not-exist-12345')
-assert.strictEqual(nonExistent, null, 'Should return null for non-existent command')
+assert.strictEqual(
+  nonExistent,
+  null,
+  'Should return null for non-existent command',
+)
 console.log('✓ Returns null for non-existent command')
 
 // Test 3: Should find bash
@@ -48,7 +55,11 @@ console.log('✓ Found bash at:', bashPath)
 // Test 4: Verify spawnSync is being used (by checking behavior matches which command)
 const whichResult = spawnSync('which', ['ls'], { encoding: 'utf8' })
 const expectedPath = whichResult.stdout.trim()
-assert.strictEqual(lsPath, expectedPath, 'whichSync output should match which command')
+assert.strictEqual(
+  lsPath,
+  expectedPath,
+  'whichSync output should match which command',
+)
 console.log('✓ Output matches which command')
 
 console.log('\n✅ All Node.js fallback tests passed!')

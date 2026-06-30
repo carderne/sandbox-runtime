@@ -1,4 +1,4 @@
-import shellquote from 'shell-quote'
+import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
@@ -723,8 +723,10 @@ function generateSandboxProfile({
       )
     }
 
-    // Allow localhost TCP operations for the SOCKS proxy
-    if (socksProxyPort !== undefined) {
+    // Allow localhost TCP operations for the SOCKS proxy. Skip when it's
+    // the same port as the HTTP proxy (the mux serves both on one port);
+    // SBPL accepts duplicate allow clauses but there's no need to emit them.
+    if (socksProxyPort !== undefined && socksProxyPort !== httpProxyPort) {
       profile.push(
         `(allow network-bind (local ip "localhost:${socksProxyPort}"))`,
       )
@@ -868,6 +870,7 @@ export function wrapCommandWithSandboxMacOS(
     socksProxyPort,
     caCertPath,
     proxyAuthToken,
+    writeConfig === undefined,
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the
@@ -909,8 +912,8 @@ export function wrapCommandWithSandboxMacOS(
   )
 
   // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that shellquote handles properly, avoiding shell quoting issues
-  const wrappedCommand = shellquote.quote([
+  // argument that quote() escapes properly, avoiding shell quoting issues
+  const wrappedCommand = quote([
     'env',
     ...unsetEnvArgs,
     ...setEnvArgs,

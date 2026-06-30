@@ -22,21 +22,26 @@ use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+    CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, STARTUPINFOEXW, STARTUPINFOW,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use crate::job::Job;
+use crate::job::{is_process_in_job, Job};
 use crate::self_protect;
 use crate::sid::{self, GroupState};
 use crate::token::{self, open_self_token, to_primary};
 use crate::util::{pcwstr, wstr};
-use crate::winsta::WinStaDesk;
+use crate::winsta::{
+    current_desktop_name, current_winsta_name, on_default_desktop,
+    IsolatedDesk,
+};
 
 // ─── RAII handle wrappers ───────────────────────────────────────────
 
@@ -44,23 +49,24 @@ use crate::util::OwnedHandle;
 
 /// Owns a freshly-spawned (suspended) child. If dropped before
 /// [`defuse`] is called, terminates the child — so an error
-/// between `CreateProcessAsUserW` and `WaitForSingleObject`
-/// can't orphan a suspended process that's not yet in the job.
-/// Always closes both handles on drop.
-struct SpawnedChild {
+/// between `CreateProcess*` and `WaitForSingleObject` can't orphan
+/// a suspended process that's not yet in the job. Always closes
+/// both handles on drop. Shared with [`crate::logon::spawn_runner`]
+/// for the same suspended-then-assign-then-resume window.
+pub(crate) struct SpawnedChild {
     pi: PROCESS_INFORMATION,
     armed: bool,
 }
 impl SpawnedChild {
-    fn new(pi: PROCESS_INFORMATION) -> Self {
+    pub(crate) fn new(pi: PROCESS_INFORMATION) -> Self {
         Self { pi, armed: true }
     }
-    fn process(&self) -> HANDLE { self.pi.hProcess }
-    fn thread(&self) -> HANDLE { self.pi.hThread }
+    pub(crate) fn process(&self) -> HANDLE { self.pi.hProcess }
+    pub(crate) fn thread(&self) -> HANDLE { self.pi.hThread }
     /// Disarm the terminate-on-drop. Call after the child has been
     /// assigned to the job AND resumed — past that point
     /// `KILL_ON_JOB_CLOSE` covers cleanup.
-    fn defuse(&mut self) { self.armed = false; }
+    pub(crate) fn defuse(&mut self) { self.armed = false; }
 }
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
@@ -104,105 +110,214 @@ const MITIGATION_IMAGE_LOAD_NO_REMOTE: u64 = 1u64 << 52;
 /// is Low IL.
 const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 
-/// Inputs to a single `srt-win exec` invocation.
-pub struct ExecSpec<'a> {
-    /// Discriminator group SID (already resolved by the caller from
-    /// `--name` / `--group-sid`).
-    pub group_sid: &'a str,
-    /// Skip the "is `group_sid` enabled in the broker's token"
-    /// pre-flight check. **Fail-open** — the WFP fence relies on
-    /// the broker having the group enabled; with this set the
-    /// child may run with weaker isolation if the install was
-    /// incomplete. Surfaced as an explicit CLI flag (not an env
-    /// var) so the bypass is intentional and not accidentally
-    /// inherited from a parent's environment. Used only by CI
-    /// runners that create the group in-job and cannot
-    /// logout/login mid-run.
-    pub skip_group_check: bool,
-    /// Target executable.
-    pub target_exe: &'a Path,
-    /// Target argv (everything after the target).
-    pub target_args: &'a [String],
+/// Which of the two distinct launch shapes [`run_lockdown`] applies.
+/// The two are kept explicitly separate (no `Option<_>` overloading)
+/// so every gate names the path it belongs to. Each variant carries
+/// only the fields that path uses — there is no cross-mode option.
+pub enum LaunchMode<'a> {
+    /// `srt-win exec` (no `--as-sandbox-user`): the broker IS the
+    /// real user, the discriminator group is enabled in its token,
+    /// and the child runs under a restricted token with `group_sid`
+    /// flipped deny-only. The broker has a console.
+    SameUser {
+        group_sid: String,
+        /// Skip the "is `group_sid` enabled in the broker's token"
+        /// pre-flight check. **Fail-open** — the WFP fence relies on
+        /// the broker having the group enabled; with this set the
+        /// child may run with weaker isolation if the install was
+        /// incomplete. Surfaced as an explicit CLI flag (not an env
+        /// var) so the bypass is intentional and not accidentally
+        /// inherited from a parent's environment. Used only by CI
+        /// runners that create the group in-job and cannot
+        /// logout/login mid-run.
+        skip_group_check: bool,
+    },
+    /// `srt-win runner`: this process is `srt-sandbox` (via
+    /// `CreateProcessWithLogonW`), has NO console (broker spawned it
+    /// `CREATE_NO_WINDOW`; stdio are anonymous pipes), and is not a
+    /// member of the discriminator group. The child runs under a
+    /// restricted token with only `BUILTIN\Administrators` flipped.
+    SandboxUser {
+        /// `(KEY, VALUE)` pairs overlaid on the runner's own
+        /// environment when building the child's env block. Overlay
+        /// wins on case-insensitive key conflict; everything else is
+        /// passed through verbatim — so the broker's `PATH` + proxy
+        /// vars ride here while the sandbox-user-profile
+        /// `USERPROFILE`/`TEMP` stay isolated.
+        env_overlay: &'a [(String, String)],
+    },
 }
 
-/// Run the target under the sandbox and return its exit code.
-pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
-    // 1) Pre-flight: the group must be enabled in the broker's
-    //    token. `Absent` means the user hasn't logged out + back
-    //    in since `group create`. `DenyOnly` means we're already
-    //    inside a sandbox child — refuse.
-    match sid::group_state_for_self(spec.group_sid)? {
-        GroupState::Enabled => {}
-        GroupState::Absent if spec.skip_group_check => {
-            eprintln!(
-                "srt-win: WARNING: --skip-group-check is set and \
-                 group {} is absent from the broker's TokenGroups. \
-                 The WFP fence may not be in effect for this \
-                 process tree. This bypass is intended ONLY for \
-                 ephemeral CI runners.",
-                spec.group_sid
-            );
-        }
-        GroupState::Absent => {
-            return Err(anyhow!(
-                "group {} is not present in the broker's \
-                 TokenGroups. Log out and back in to refresh group \
-                 membership, then retry. (Run `srt-win group status` \
-                 to confirm.) Pass --skip-group-check to bypass in CI.",
-                spec.group_sid
-            ));
-        }
-        GroupState::DenyOnly => {
-            return Err(anyhow!(
-                "group {} is deny-only in this token — the broker \
-                 itself is running inside a sandbox child. Refusing \
-                 to launch.",
-                spec.group_sid
-            ));
-        }
-        GroupState::Present => {
-            return Err(anyhow!(
-                "group {} is present but neither enabled nor \
-                 deny-only (unexpected token attribute state).",
-                spec.group_sid
-            ));
+impl LaunchMode<'_> {
+    fn flip_group(&self) -> Option<&str> {
+        match self {
+            Self::SameUser { group_sid, .. } => Some(group_sid),
+            Self::SandboxUser { .. } => None,
         }
     }
+    fn env_overlay(&self) -> &[(String, String)] {
+        match self {
+            Self::SameUser { .. } => &[],
+            Self::SandboxUser { env_overlay } => env_overlay,
+        }
+    }
+}
 
-    // 2) Self-protect: rewrite the broker process DACL so the
-    //    child can't `OpenProcess` us. Best-effort — log on
-    //    failure but don't abort, since a broker without
-    //    self-protect is still strictly safer than no sandbox.
-    if let Err(e) = self_protect::install_broker_dacl(spec.group_sid) {
+/// Run `target_exe target_args…` under the lockdown stack and
+/// return its exit code. Shared by the `SameUser` `srt-win exec`
+/// path and the `SandboxUser` `srt-win runner` path;
+/// [`LaunchMode`] carries the differences.
+pub fn run_lockdown(
+    target_exe: &Path,
+    target_args: &[String],
+    mode: &LaunchMode<'_>,
+) -> Result<u32> {
+    let sandbox_user = matches!(mode, LaunchMode::SandboxUser { .. });
+
+    // 1) Self-protect: rewrite this process's DACL so the child can't
+    //    `OpenProcess` us. Runs on BOTH modes and FIRST — on
+    //    `SandboxUser` the child shares the runner's user SID, so
+    //    without this it could open the runner with
+    //    `PROCESS_CREATE_PROCESS` and parent-spawn under the runner's
+    //    unrestricted token, escaping the job/winsta/mitigations.
+    //    First so the protection holds on every later error path.
+    //    Best-effort — log on failure but don't abort, since a broker
+    //    without self-protect is still strictly safer than no sandbox.
+    if let Err(e) = self_protect::install_broker_dacl(mode.flip_group()) {
         eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
+    }
+
+    // 2) Pre-flight (`SameUser` only): the discriminator group must
+    //    be enabled in the caller's token. `Absent` means the user
+    //    hasn't logged out + back in since `group create`. `DenyOnly`
+    //    means we're already inside a sandbox child — refuse.
+    if let LaunchMode::SameUser { group_sid, skip_group_check } = mode {
+        match sid::group_state_for_self(group_sid)? {
+            GroupState::Enabled => {}
+            GroupState::Absent if *skip_group_check => {
+                eprintln!(
+                    "srt-win: WARNING: --skip-group-check is set and \
+                     group {group_sid} is absent from the broker's \
+                     TokenGroups. The WFP fence may not be in effect \
+                     for this process tree. This bypass is intended \
+                     ONLY for ephemeral CI runners."
+                );
+            }
+            GroupState::Absent => {
+                return Err(anyhow!(
+                    "group {group_sid} is not present in the broker's \
+                     TokenGroups. Log out and back in to refresh group \
+                     membership, then retry. (Run `srt-win group status` \
+                     to confirm.) Pass --skip-group-check to bypass in CI."
+                ));
+            }
+            GroupState::DenyOnly => {
+                return Err(anyhow!(
+                    "group {group_sid} is deny-only in this token — \
+                     the broker itself is running inside a sandbox \
+                     child. Refusing to launch."
+                ));
+            }
+            GroupState::Present => {
+                return Err(anyhow!(
+                    "group {group_sid} is present but neither enabled \
+                     nor deny-only (unexpected token attribute state)."
+                ));
+            }
+        }
     }
 
     // 3) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
     let restricted = OwnedHandle(
-        token::make_sandbox_token(self_tok.raw(), spec.group_sid)
+        token::make_sandbox_token(self_tok.raw(), mode.flip_group())
             .context("make_sandbox_token")?,
     );
     let primary = OwnedHandle(
         to_primary(restricted.raw()).context("to_primary")?,
     );
 
-    // 4) Job.
-    let job = Job::new().context("Job::new")?;
+    // 4) Job. `breakaway_ok = false` — this is the load-bearing
+    //    containment Job; the child must NOT be able to break away.
+    let job = Job::new(false).context("Job::new")?;
 
-    // 5) Window station + desktop.
-    let mut winsta = WinStaDesk::new().context("WinStaDesk::new")?;
+    // `on_default` gates step 5's per-mode desktop handling; the
+    // breakaway flag is gated separately on the launch mode. Computed
+    // (and logged) BEFORE step 5 so the diagnostic identifies which
+    // desktop the caller landed on.
+    let on_default = on_default_desktop()
+        .context("read current desktop name (isolation gate)")?;
+    let caller_in_job =
+        is_process_in_job(unsafe { GetCurrentProcess() }, None);
+    // Breakaway: on `SandboxUser` the caller is in seclogon's job
+    // (and the broker→runner job, both `BREAKAWAY_OK`); without
+    // breakaway the child inherits them and `AssignProcessToJobObject`
+    // below fails. On `SameUser` the broker may be in a CI agent's
+    // job WITHOUT `BREAKAWAY_OK` (where the flag would make
+    // `CreateProcessAsUserW` fail outright).
+    let breakaway = if caller_in_job && sandbox_user {
+        CREATE_BREAKAWAY_FROM_JOB
+    } else {
+        PROCESS_CREATION_FLAGS(0)
+    };
+    let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
+    if dbg {
+        eprintln!(
+            "srt-win: run_lockdown: caller_in_job={} caller_desk={}\\{} \
+             child_desk={} breakaway={}",
+            caller_in_job,
+            current_winsta_name().ok().as_deref().unwrap_or("?"),
+            current_desktop_name().ok().as_deref().unwrap_or("?"),
+            if on_default { "fresh" } else { "inherit" },
+            breakaway.0 != 0,
+        );
+    }
 
-    // 6) Env block — verbatim passthrough of the broker's own
-    //    environment (the TS caller populates it with the full proxy
-    //    set; see `build_env_block`).
-    let mut env = build_env_block();
+    // 5) Isolated desktop. A fresh desktop on the caller's window
+    //    station isolates the child from `Default` (shatter / WM_*
+    //    injection / window enumeration / `WH_KEYBOARD_LL` keylogging
+    //    — message queues are per-desktop, and the Job's
+    //    `UILIMIT_HANDLES` does NOT gate low-level hooks).
+    //    Desktop-only, NOT a fresh window station:
+    //    `CreateWindowStationW` is admin-gated; `CreateDesktopW`
+    //    works non-elevated and the Job's UI limits already cover
+    //    what a separate station would add (clipboard / global
+    //    atoms). See `winsta.rs` module doc.
+    //
+    //    `SameUser`: create here when on `Default` (the broker
+    //    creates desktops on its own station by definition; any error
+    //    propagates fail-closed). When already off `Default` the
+    //    isolation is in place; skip and let the child inherit.
+    //
+    //    `SandboxUser`: the broker created `WinSta0\srt-sb-…` and
+    //    passed it via `lpDesktop` to `CreateProcessWithLogonW`, so
+    //    this runner is already on it. The child inherits via
+    //    `lpDesktop = NULL` in step 9. If we're still on `Default`,
+    //    the broker-side creation/attach failed and the child would
+    //    share the interactive desktop — refuse rather than fall
+    //    through.
+    let mut desk = match (mode, on_default) {
+        (LaunchMode::SandboxUser { .. }, true) => {
+            return Err(anyhow!(
+                "desktop isolation required: runner is on Default — \
+                 broker IsolatedDesk creation or WinSta0 grant failed"
+            ));
+        }
+        (LaunchMode::SameUser { .. }, true) => {
+            Some(IsolatedDesk::new(None).context("IsolatedDesk::new")?)
+        }
+        (_, false) => None,
+    };
+
+    // 6) Env block — this process's own environment (verbatim) with
+    //    the mode's overlay applied on top; see `build_env_block`.
+    let mut env = build_env_block(mode.env_overlay());
 
     // 7) Command line + application name.
-    let cmdline = build_cmdline(spec.target_exe, spec.target_args);
+    let cmdline = build_cmdline(target_exe, target_args);
     let mut cmdline_w = wstr(&cmdline);
-    let app_w = wstr(&spec.target_exe.display().to_string());
+    let app_w = wstr(&target_exe.display().to_string());
 
     // 8) PROC_THREAD_ATTRIBUTE_LIST: mitigation policy + explicit
     //    handle whitelist.
@@ -210,7 +325,9 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
         | MITIGATION_FONT_DISABLE
         | MITIGATION_IMAGE_LOAD_NO_REMOTE
         | MITIGATION_IMAGE_LOAD_NO_LOW_LABEL;
-    let mut handle_list = collect_inheritable_std_handles();
+    let std_handles = collect_inheritable_std_handles();
+    let mut handle_list: Vec<HANDLE> =
+        std_handles.iter().copied().filter(|h| !h.0.is_null()).collect();
     if handle_list.is_empty() {
         return Err(anyhow!(
             "no std handle is inheritable; refusing to spawn. \
@@ -222,13 +339,36 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
     attrs.set_mitigation_policy(&mitigation)?;
     attrs.set_handle_list(&mut handle_list)?;
 
-    // 9) STARTUPINFOEXW.
+    // 9) STARTUPINFOEXW. `STARTF_USESTDHANDLES` + the caller's std
+    //    handles is load-bearing on **`SandboxUser`**: the runner has
+    //    NO console (the broker spawned it with `CREATE_NO_WINDOW`;
+    //    its stdio are the broker's anonymous pipes), so without an
+    //    explicit `hStd*` wiring the child would try to allocate a
+    //    conhost on the non-interactive desktop — which under the
+    //    restricted token hangs. On **`SameUser`** the broker HAS a
+    //    console and the child must KEEP attaching to it:
+    //    `STARTF_USESTDHANDLES` here would feed the broker's stream
+    //    handles as the child's stdio but leave the child WITHOUT a
+    //    console (so `CONIN$`/`_isatty` fail and interactive prompts
+    //    break). So gate on the launch mode.
     let mut six: STARTUPINFOEXW = unsafe { zeroed() };
     six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    if sandbox_user {
+        six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdInput = std_handles[0];
+        six.StartupInfo.hStdOutput = std_handles[1];
+        six.StartupInfo.hStdError = std_handles[2];
+    }
     six.lpAttributeList = attrs.list();
-    six.StartupInfo.lpDesktop = PWSTR(winsta.desktop_name_ptr());
+    // `SameUser` only — `SandboxUser` leaves `lpDesktop = NULL`
+    // (zeroed) so the child inherits this runner's station+desktop,
+    // which is the broker-created `srt-sb-…` per step 5's assertion.
+    if let Some(d) = &mut desk {
+        six.StartupInfo.lpDesktop = PWSTR(d.desktop_name_ptr());
+    }
 
-    // 10) Spawn suspended.
+    // 10) Spawn suspended. `breakaway` was derived above (gated on
+    //     `IsProcessInJob(self)` ∧ `SandboxUser`).
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
     unsafe {
         CreateProcessAsUserW(
@@ -241,9 +381,19 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
             // to take effect (documented Vista-era quirk: with
             // FALSE the kernel ignores the attribute entirely).
             true,
+            // `CREATE_NO_WINDOW` only on `SandboxUser` (see step 9):
+            // the runner has no console for the child to attach to.
+            // On `SameUser` the child attaches to the broker's
+            // console.
             CREATE_SUSPENDED
                 | CREATE_UNICODE_ENVIRONMENT
-                | EXTENDED_STARTUPINFO_PRESENT,
+                | EXTENDED_STARTUPINFO_PRESENT
+                | if sandbox_user {
+                    CREATE_NO_WINDOW
+                } else {
+                    PROCESS_CREATION_FLAGS(0)
+                }
+                | breakaway,
             Some(env.as_mut_ptr() as *const c_void),
             // Inherit cwd.
             PCWSTR::null(),
@@ -254,10 +404,7 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
             &mut pi,
         )
         .with_context(|| {
-            format!(
-                "CreateProcessAsUserW({})",
-                spec.target_exe.display()
-            )
+            format!("CreateProcessAsUserW({})", target_exe.display())
         })?;
     }
 
@@ -272,7 +419,20 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
     //     job and `WaitForSingleObject(INFINITE)` below would
     //     hang the broker forever. Check before defusing the
     //     terminate-on-drop guard.
-    job.assign(child.process())?;
+    if let Err(e) = job.assign(child.process()) {
+        // Self-explaining diagnostics for the next CI run: which
+        // job(s) the child landed in despite breakaway.
+        let in_any = is_process_in_job(child.process(), None);
+        let in_ours = is_process_in_job(child.process(), Some(job.raw()));
+        return Err(e).with_context(|| {
+            format!(
+                "AssignProcessToJobObject(child) — \
+                 caller_in_job={caller_in_job} breakaway={} \
+                 child_in_any_job={in_any} child_in_our_job={in_ours}",
+                breakaway.0 != 0,
+            )
+        });
+    }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {
         return Err(anyhow!(
@@ -282,6 +442,17 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
     }
     // From here the job owns lifetime; disarm terminate-on-drop.
     child.defuse();
+    if dbg {
+        // Post-spawn diagnostic — paired with the pre-spawn line above
+        // so a hung CI run can tell whether `WaitForSingleObject` is
+        // the wait point (this line present) or spawn/assign/resume
+        // itself is the stall (this line absent).
+        eprintln!(
+            "srt-win: run_lockdown: child pid={} assigned+resumed \
+             (prev_suspend={prev_suspend}); waiting",
+            pi.dwProcessId,
+        );
+    }
 
     // 12) Wait + collect exit code.
     let rc = unsafe { WaitForSingleObject(child.process(), INFINITE) };
@@ -296,14 +467,14 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
     // `child` (closes hProcess/hThread), `primary`/`restricted`/
     // `self_tok` (CloseHandle) all drop here.
     // Keep `attrs` (its backing buffer + the borrowed `mitigation`
-    // and `handle_list`), `winsta`, and `job` alive until here.
+    // and `handle_list`), `desk`, and `job` alive until here.
     // The kernel snapshots the attribute list at CreateProcess
     // time, but DeleteProcThreadAttributeList (in attrs.drop) may
-    // re-read pointers; and the WS+desktop must outlive the
-    // child's attach during process creation.
+    // re-read pointers; and the desktop must outlive the child's
+    // attach during process creation.
     drop(attrs);
     drop(handle_list);
-    drop(winsta);
+    drop(desk);
     drop(job);
     Ok(code)
 }
@@ -329,14 +500,18 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
 /// or deduplicated, so if both `HTTP_PROXY` and `http_proxy` are
 /// present both survive into the child.
 ///
-/// The only adjustment on top of the verbatim copy is restoring the
+/// Two adjustments on top of the verbatim copy: (a) restoring the
 /// missing-case variants of `*_PROXY` variables (see
 /// [`add_proxy_case_twins`]) — casing repair of caller-provided
-/// values, not proxy synthesis. Nothing else is added: consumers that
-/// need the broker's identity (e.g. the self-protect probe) discover
-/// it by walking the parent-process chain rather than via an
-/// environment variable.
-fn build_env_block() -> Vec<u16> {
+/// values, not proxy synthesis; (b) applying `overlay` on top, where
+/// each `(KEY, VALUE)` REPLACES any base entry whose name matches
+/// case-insensitively (so the runner's broker-supplied `PATH`
+/// supersedes the sandbox-user default `PATH` while everything else
+/// passes through). Nothing else is added: consumers that need the
+/// broker's identity (e.g. the self-protect probe) discover it by
+/// walking the parent-process chain rather than via an environment
+/// variable.
+fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
     // Lossless base set — `env::vars()` PANICS on any entry whose
@@ -344,19 +519,35 @@ fn build_env_block() -> Vec<u16> {
     // unpaired surrogate from a profile path). Build from
     // `vars_os()` and encode each via `encode_wide` so nothing is
     // dropped and nothing panics.
+    let overlay_upper: std::collections::HashSet<String> =
+        overlay.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
     let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> =
-        std::env::vars_os().collect();
+        std::env::vars_os()
+            .filter(|(k, _)| {
+                // Drop base entries the overlay replaces. The
+                // overlay keys are ASCII (PATH, *_PROXY, …); a base
+                // key that doesn't round-trip as UTF-8 cannot match
+                // one and is kept.
+                k.to_str()
+                    .map(|s| !overlay_upper.contains(&s.to_ascii_uppercase()))
+                    .unwrap_or(true)
+            })
+            .collect();
+    for (k, v) in overlay {
+        entries.push((k.into(), v.into()));
+    }
 
     // Proxy case-twin repair operates on the UTF-8-decodable
     // subset: proxy variable NAMES are ASCII by convention so
     // filtering to entries whose key round-trips as UTF-8 misses
     // nothing relevant; values are passed through lossily (the
-    // helper only inspects names, never values). Built from
-    // `vars_os()` for the same panic-avoidance reason — `vars()`
-    // panics on ANY non-UTF-8 entry, not just the one being read.
-    let mut twin_view: Vec<(String, String)> = std::env::vars_os()
+    // helper only inspects names, never values). Built from the
+    // post-overlay `entries` so an overlay-supplied `HTTP_PROXY`
+    // gets its lowercase twin too.
+    let mut twin_view: Vec<(String, String)> = entries
+        .iter()
         .filter_map(|(k, v)| {
-            Some((k.into_string().ok()?, v.to_string_lossy().into_owned()))
+            Some((k.to_str()?.to_owned(), v.to_string_lossy().into_owned()))
         })
         .collect();
     let before = twin_view.len();
@@ -625,14 +816,24 @@ impl Drop for ProcThreadAttrs {
     }
 }
 
-/// Mark this process's std handles inheritable and return the ones
-/// that succeeded. We need at least one entry to satisfy the
-/// kernel's `HANDLE_LIST` length check; the std handles are the
-/// natural minimal set since the child attaches to the same
-/// console anyway.
-fn collect_inheritable_std_handles() -> Vec<HANDLE> {
-    let mut out = Vec::with_capacity(3);
-    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+/// Mark this process's std handles inheritable and return them as
+/// `[stdin, stdout, stderr]`. A slot whose handle is unavailable
+/// (null / `INVALID_HANDLE_VALUE` / `SetHandleInformation` refused)
+/// is `HANDLE::default()`.
+///
+/// `run_lockdown` plugs the array into BOTH `STARTUPINFO.hStd*`
+/// (`STARTF_USESTDHANDLES`) and the `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+/// inherit whitelist — one source of truth so a handle that didn't
+/// make the whitelist is also `default()` in `hStd*` (the child sees
+/// a null std handle for that stream rather than a stale value the
+/// kernel never duplicated).
+fn collect_inheritable_std_handles() -> [HANDLE; 3] {
+    let mut out = [HANDLE::default(); 3];
+    for (i, which) in
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .enumerate()
+    {
         let h = match unsafe { GetStdHandle(which) } {
             Ok(h) => h,
             Err(_) => continue,
@@ -640,13 +841,13 @@ fn collect_inheritable_std_handles() -> Vec<HANDLE> {
         if h.0.is_null() || (h.0 as isize) == -1 {
             continue;
         }
-        // Best-effort: a detached broker may have non-inheritable
+        // Best-effort: a detached caller may have non-inheritable
         // (or pseudo) handles here; skip rather than fail.
         let r = unsafe {
             SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
         };
         if r.is_ok() {
-            out.push(h);
+            out[i] = h;
         }
     }
     out

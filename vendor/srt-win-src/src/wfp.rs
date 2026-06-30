@@ -62,12 +62,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use windows::core::{GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_MEMBER_IN_ALIAS, HANDLE};
-use windows::Win32::NetworkManagement::NetManagement::{
-    NetLocalGroupAdd, NetLocalGroupAddMembers, NetLocalGroupDel,
-    NERR_GroupExists, NERR_GroupNotFound, LOCALGROUP_INFO_1,
-    LOCALGROUP_MEMBERS_INFO_0,
-};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
     FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
@@ -87,8 +82,8 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_SECURITY_DESCRIPTOR_TYPE, FWP_UINT16, FWP_UINT64,
     FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
 };
-use crate::sid;
-use crate::util::{pcwstr, wstr};
+use crate::util::wstr;
+use crate::{sam, sid};
 
 const GROUP_COMMENT: &str = "sandbox-runtime network sandbox membership";
 
@@ -117,8 +112,38 @@ const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
 const FWP_E_FILTER_NOT_FOUND: u32 = 0x80320003;
 const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x80320007;
 const FWP_E_IN_USE: u32 = 0x8032000A;
+// `FwpmEngineOpen0` / `FwpmFilterCreateEnumHandle0` are admin-gated
+// by BFE; non-elevated callers get one of these.
+const FWP_E_ACCESS_DENIED: u32 = 0x8032_0028;
+const ERROR_ACCESS_DENIED: u32 = 5;
 
 use crate::util::OwnedSd;
+
+/// Typed marker for an admin-gated BFE call returning access-denied.
+/// `FwpmFilterCreateEnumHandle0` (and on some configurations
+/// `FwpmEngineOpen0`) require elevation; a non-elevated `wfp status`
+/// hits this. [`filter_status`] downcasts and degrades to
+/// `state:"cannot-read"`; the host's behavioral check is `wfp
+/// verify`, not the enum.
+#[derive(Debug)]
+pub struct WfpAccessDenied {
+    pub call: &'static str,
+    pub rc: u32,
+}
+impl std::fmt::Display for WfpAccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: 0x{:08x} (BFE filter enumeration is admin-only)",
+            self.call, self.rc
+        )
+    }
+}
+impl std::error::Error for WfpAccessDenied {}
+
+fn is_bfe_access_denied(rc: u32) -> bool {
+    rc == ERROR_ACCESS_DENIED || rc == FWP_E_ACCESS_DENIED
+}
 
 // ────────────────────── small RAII helpers ──────────────────────
 
@@ -139,6 +164,12 @@ impl EngineHandle {
             FwpmEngineOpen0(PCWSTR::null(), 0xFFFF_FFFF, None, None, &mut h)
         };
         if rc != 0 {
+            if is_bfe_access_denied(rc) {
+                return Err(anyhow::Error::new(WfpAccessDenied {
+                    call: "FwpmEngineOpen0",
+                    rc,
+                }));
+            }
             return Err(anyhow!("FwpmEngineOpen0 failed: 0x{rc:08x}"));
         }
         Ok(Self(h))
@@ -156,6 +187,42 @@ impl Drop for EngineHandle {
             }
         }
     }
+}
+
+/// Open the engine, run `f` inside one WFP transaction
+/// (`FwpmTransactionBegin0` … `Commit0`). Aborts the transaction if
+/// `f` returns an error or panics, then closes the engine. Single
+/// owner of the txn-envelope shape so the four
+/// install/uninstall sites can't drift.
+fn with_wfp_txn<T>(
+    f: impl FnOnce(&EngineHandle) -> Result<T>,
+) -> Result<T> {
+    let engine = EngineHandle::open()?;
+    let rc = unsafe { FwpmTransactionBegin0(engine.h(), 0) };
+    if rc != 0 {
+        return Err(anyhow!("FwpmTransactionBegin0: 0x{rc:08x}"));
+    }
+    // Abort-on-unwind: if `f` panics, this guard's Drop aborts the
+    // open txn before EngineHandle's Drop closes the session. On
+    // the success path we `forget` it after Commit.
+    struct AbortOnDrop(HANDLE);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = FwpmTransactionAbort0(self.0);
+            }
+        }
+    }
+    let abort = AbortOnDrop(engine.h());
+    let out = f(&engine)?;
+    let rc = unsafe { FwpmTransactionCommit0(engine.h()) };
+    if rc != 0 {
+        // `abort` drops → Abort0 (no-op after a failed Commit, but
+        // harmless).
+        return Err(anyhow!("FwpmTransactionCommit0: 0x{rc:08x}"));
+    }
+    std::mem::forget(abort);
+    Ok(out)
 }
 
 // ────────────────────── condition builders ──────────────────────
@@ -244,18 +311,28 @@ fn cond_port_range(
 /// filter GUIDs. The optional `port_range` mirrors the
 /// `IP_REMOTE_PORT` range condition on `permit-loopback` filters so
 /// `wfp status` can report it without unsafe condition-walking.
+/// `user_sid` distinguishes the **group-keyed** four-filter set
+/// (`None`) from the **user-SID-keyed** two-filter set
+/// (`Some(<srt-sandbox SID>)`) — both live in the same sublayer
+/// during the transitional window where the deny-only-group exec
+/// path and the separate-user runner coexist.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct FilterTag {
     /// Discriminator: `"srt-win"`. Anything else means the filter
     /// belongs to some other tool that happens to share our sublayer.
     pub tool: String,
-    /// One of `permit-nonmember`, `permit-group`, `permit-loopback`,
-    /// `block`.
+    /// Group set: `permit-nonmember` / `permit-group` /
+    /// `permit-loopback` / `block`. User set:
+    /// `permit-loopback-user` / `block-user`.
     pub kind: String,
-    /// `[low, high]` for `permit-loopback`; `None` otherwise (and on
+    /// `[low, high]` for `permit-loopback*`; `None` otherwise (and on
     /// pre-port-range installs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
+    /// Sandbox user SID for the user-keyed set; `None` for the
+    /// group-keyed set (and on installs that predate the user set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sid: Option<String>,
 }
 
 impl FilterTag {
@@ -264,6 +341,7 @@ impl FilterTag {
             tool: "srt-win".into(),
             kind: kind.into(),
             port_range: None,
+            user_sid: None,
         }
     }
     fn loopback(range: (u16, u16)) -> Self {
@@ -271,6 +349,15 @@ impl FilterTag {
             tool: "srt-win".into(),
             kind: "permit-loopback".into(),
             port_range: Some([range.0, range.1]),
+            user_sid: None,
+        }
+    }
+    fn user(kind: &str, sid: &str, range: Option<(u16, u16)>) -> Self {
+        Self {
+            tool: "srt-win".into(),
+            kind: kind.into(),
+            port_range: range.map(|(l, h)| [l, h]),
+            user_sid: Some(sid.into()),
         }
     }
     fn to_blob_bytes(&self) -> Vec<u8> {
@@ -278,67 +365,43 @@ impl FilterTag {
     }
 }
 
+/// Number of filters in the group-keyed set (4 per layer × v4/v6).
+pub const GROUP_FILTER_COUNT: usize = 8;
+/// Number of filters in the user-SID-keyed set (2 per layer × v4/v6).
+pub const USER_FILTER_COUNT: usize = 4;
+
+// Filter weights — kept below 2^60 so they stay in WFP's
+// "manual weight" class (top 4 bits are auto-classifier). The
+// group-keyed set uses NONMEMBER > GROUP > LOOPBACK > BLOCK so
+// non-members fall straight through to PERMIT. The user-keyed set
+// sits **above** `W_NONMEMBER`: the sandbox user is *not* a member
+// of the discriminator group, so `permit-nonmember` would
+// otherwise let it through; with `block-user` above it the user-
+// keyed fence is load-bearing immediately even while both sets
+// coexist. Module-level so [`install_filters`],
+// [`install_user_filters`], and the const-asserts in `tests` share
+// one source of truth.
+pub(crate) const W_NONMEMBER: u64 = 0x0F00_0000_0000_0000;
+pub(crate) const W_GROUP: u64 = 0x0E00_0000_0000_0000;
+pub(crate) const W_LOOPBACK: u64 = 0x0D00_0000_0000_0000;
+pub(crate) const W_BLOCK: u64 = 0x0100_0000_0000_0000;
+pub(crate) const W_USER_LOOPBACK: u64 = 0x0F80_0000_0000_0000;
+pub(crate) const W_USER_BLOCK: u64 = 0x0F40_0000_0000_0000;
+
 // ────────────────────── local group management ──────────────────────
 
 /// Create the local group if it doesn't exist and add `user_sid` to
-/// it. Idempotent.
+/// it. Idempotent. Thin shim over [`crate::sam`] so the SAM call
+/// shapes are shared with [`crate::user`].
 pub fn ensure_group(name: &str, user_sid: &str) -> Result<()> {
-    unsafe {
-        let mut name_w = wstr(name);
-        let mut comment_w = wstr(GROUP_COMMENT);
-        let info = LOCALGROUP_INFO_1 {
-            lgrpi1_name: PWSTR(name_w.as_mut_ptr()),
-            lgrpi1_comment: PWSTR(comment_w.as_mut_ptr()),
-        };
-        let rc = NetLocalGroupAdd(
-            PCWSTR::null(),
-            1,
-            &info as *const _ as *const u8,
-            None,
-        );
-        // SAM returns ERROR_ALIAS_EXISTS (1379) for an existing local
-        // group; some paths return NERR_GroupExists (2223). Either is
-        // fine for idempotency.
-        const ERROR_ALIAS_EXISTS: u32 = 1379;
-        if rc != 0 && rc != NERR_GroupExists && rc != ERROR_ALIAS_EXISTS {
-            return Err(anyhow!("NetLocalGroupAdd({name}): {rc}"));
-        }
-    }
+    sam::ensure_local_group(name, GROUP_COMMENT)?;
     let psid = sid::LocalPsid::from_string(user_sid)?;
-    unsafe {
-        let name_w = wstr(name);
-        let info = LOCALGROUP_MEMBERS_INFO_0 {
-            lgrmi0_sid: psid.as_psid(),
-        };
-        let rc = NetLocalGroupAddMembers(
-            PCWSTR::null(),
-            pcwstr(&name_w),
-            0,
-            &info as *const _ as *const u8,
-            1,
-        );
-        if rc != 0 && rc != ERROR_MEMBER_IN_ALIAS.0 {
-            return Err(anyhow!(
-                "NetLocalGroupAddMembers({name}, {user_sid}): {rc}"
-            ));
-        }
-    }
-    Ok(())
+    sam::add_member(name, &psid)
 }
 
-/// Delete the local group. Idempotent on `NERR_GroupNotFound`.
+/// Delete the local group. Idempotent on already-absent.
 pub fn delete_group(name: &str) -> Result<()> {
-    unsafe {
-        let name_w = wstr(name);
-        let rc = NetLocalGroupDel(PCWSTR::null(), pcwstr(&name_w));
-        // 2220 (NERR_GroupNotFound) and 1376 (ERROR_NO_SUCH_ALIAS) both
-        // mean "already gone" depending on Windows version.
-        const ERROR_NO_SUCH_ALIAS: u32 = 1376;
-        if rc != 0 && rc != NERR_GroupNotFound && rc != ERROR_NO_SUCH_ALIAS {
-            return Err(anyhow!("NetLocalGroupDel({name}): {rc}"));
-        }
-    }
-    Ok(())
+    sam::delete_local_group(name)
 }
 
 // ────────────────────── filter enumeration ──────────────────────
@@ -373,6 +436,12 @@ fn for_each_tagged_filter(
             FwpmFilterCreateEnumHandle0(engine.h(), Some(&tmpl), &mut h)
         };
         if rc != 0 {
+            if is_bfe_access_denied(rc) {
+                return Err(anyhow::Error::new(WfpAccessDenied {
+                    call: "FwpmFilterCreateEnumHandle0",
+                    rc,
+                }));
+            }
             return Err(anyhow!(
                 "FwpmFilterCreateEnumHandle0({layer_name}): 0x{rc:08x}"
             ));
@@ -444,18 +513,29 @@ fn for_each_tagged_filter(
     Ok(())
 }
 
-/// Delete every srt-win-tagged filter under `sublayer`. Returns the
-/// number deleted. Does not delete the sublayer itself.
+/// Delete every srt-win-tagged filter under `sublayer` whose tag
+/// satisfies `pred`. Returns the number deleted. Does not delete
+/// the sublayer itself.
+///
+/// `install_filters` refreshes only the group-keyed set
+/// (`tag.user_sid.is_none()`); `install_user_filters` only the
+/// user-keyed set (`is_some()`); `uninstall_filters` clears both
+/// (`|_| true`). The two sets are independent — refreshing one
+/// must not perturb the other, or a `wfp install` after a full
+/// `srt-win install` would silently drop the user-SID fence.
 fn delete_tagged_filters(
     engine: &EngineHandle,
     sublayer: &GUID,
+    mut pred: impl FnMut(&FilterTag) -> bool,
 ) -> Result<usize> {
     // Collect across both layers, then delete. Deletion is by global
     // filterKey GUID inside one txn, so per-layer ordering is not
     // load-bearing.
     let mut to_delete: Vec<GUID> = Vec::new();
-    for_each_tagged_filter(engine, sublayer, |_, key, _| {
-        to_delete.push(key);
+    for_each_tagged_filter(engine, sublayer, |_, key, tag| {
+        if pred(tag) {
+            to_delete.push(key);
+        }
     })?;
     let mut deleted = 0usize;
     for key in to_delete {
@@ -549,6 +629,17 @@ pub fn sddl_group(group_sid: &str) -> String {
 /// SDDL for filter 3 — ALLOW Everyone. Grants for every token.
 pub const SDDL_EVERYONE: &str = "O:LSG:LSD:(A;;CC;;;WD)";
 
+/// SDDL for the user-SID-keyed BLOCK — ALLOW `<sandbox_user_sid>`.
+/// Same shape as [`sddl_group`]: matches iff the connecting token
+/// carries that SID **enabled**, which for a *user* SID means
+/// "is that user". The broker, services, and the deny-only-group
+/// child all carry a different user SID → no match → fall through
+/// to the group-keyed filters (or, once those are removed, to
+/// default-permit).
+pub fn sddl_sandbox_user(sid: &str) -> String {
+    format!("O:LSG:LSD:(A;;CC;;;{sid})")
+}
+
 /// Install (or refresh) the eight machine-wide filters under
 /// `sublayer`, keyed only on `group_sid`. Filter 2's loopback
 /// permit is restricted to `port_range` (inclusive). Idempotent:
@@ -567,13 +658,7 @@ pub fn install_filters(
     let sd_everyone =
         OwnedSd::from_sddl(SDDL_EVERYONE).context("build Everyone SD")?;
 
-    let engine = EngineHandle::open()?;
-    let rc = unsafe { FwpmTransactionBegin0(engine.h(), 0) };
-    if rc != 0 {
-        return Err(anyhow!("FwpmTransactionBegin0: 0x{rc:08x}"));
-    }
-
-    let result: Result<()> = (|| {
+    with_wfp_txn(|engine| {
         // Sublayer (idempotent). Display name identifies the owning
         // tool, not the group.
         let mut sl_name = wstr("srt-win");
@@ -598,17 +683,14 @@ pub fn install_filters(
             return Err(anyhow!("FwpmSubLayerAdd0: 0x{rc:08x}"));
         }
 
-        // Idempotency: drop any stale filter set before re-adding.
-        // (Inside the transaction so a crash leaves the previous
-        // state intact.)
-        let _ = delete_tagged_filters(&engine, sublayer)?;
-
-        // Weights — kept below 2^60 so we stay in WFP's "manual
-        // weight" class (top 4 bits are auto-classifier).
-        const W_NONMEMBER: u64 = 0x0F00_0000_0000_0000;
-        const W_GROUP: u64 = 0x0E00_0000_0000_0000;
-        const W_LOOPBACK: u64 = 0x0D00_0000_0000_0000;
-        const W_BLOCK: u64 = 0x0100_0000_0000_0000;
+        // Idempotency: drop any stale GROUP-keyed filter set before
+        // re-adding. The user-keyed set (if present) is left in
+        // place — it's managed by `install_user_filters`. (Inside
+        // the transaction so a crash leaves the previous state
+        // intact.)
+        let _ = delete_tagged_filters(engine, sublayer, |t| {
+            t.user_sid.is_none()
+        })?;
 
         let mut sd_nonmember_blob = sd_byte_blob(&sd_nonmember);
         let mut sd_group_blob = sd_byte_blob(&sd_group);
@@ -715,55 +797,149 @@ pub fn install_filters(
         }
 
         Ok(())
-    })();
+    })
+}
 
-    if let Err(e) = result {
-        unsafe {
-            let _ = FwpmTransactionAbort0(engine.h());
+/// Install (or refresh) the **user-SID-keyed** filter pair under
+/// `sublayer`, alongside the group-keyed four-filter set. Two
+/// filters at each of the v4/v6 ALE-connect layers
+/// ([`USER_FILTER_COUNT`] total):
+///
+///   - **PERMIT loopback** (`permit-loopback-user`, weight
+///     [`W_USER_LOOPBACK`]) — `IP_REMOTE_ADDRESS ∈ 127/8` (or
+///     `::1`) ∩ `IP_REMOTE_PORT ∈ port_range`. Same condition
+///     shape as the group set's `permit-loopback`, but at a
+///     **higher** weight than `block-user` so the sandbox user
+///     can still reach the host proxies.
+///   - **BLOCK sandbox user** (`block-user`, weight
+///     [`W_USER_BLOCK`]) — `ALE_USER_ID` SD =
+///     [`sddl_sandbox_user`]. Matches only tokens whose user SID
+///     is `sandbox_user_sid`.
+///
+/// **Weights sit above the group set's `permit-nonmember`
+/// (0x0F).** That's deliberate: the sandbox user is *not* a
+/// member of the discriminator group, so `permit-nonmember`
+/// would otherwise let it through. Placing `block-user` above it
+/// makes the user-keyed fence load-bearing immediately, even
+/// while the group-keyed set is still installed — and once the
+/// group set is removed, this pair stands alone (everyone except
+/// the sandbox user falls through both filters to default-permit).
+///
+/// Idempotent: any existing user-keyed filters under `sublayer`
+/// are dropped first, inside one WFP transaction. Group-keyed
+/// filters are untouched.
+pub fn install_user_filters(
+    sublayer: &GUID,
+    sandbox_user_sid: &str,
+    port_range: (u16, u16),
+) -> Result<()> {
+    debug_assert!(port_range.0 <= port_range.1);
+    let sd_user = OwnedSd::from_sddl(&sddl_sandbox_user(sandbox_user_sid))
+        .context("build sandbox-user SD")?;
+
+    with_wfp_txn(|engine| {
+        // Sublayer must already exist (created by
+        // `install_filters`). Refresh: drop any stale user-keyed
+        // filters; leave the group set alone.
+        let _ = delete_tagged_filters(engine, sublayer, |t| {
+            t.user_sid.is_some()
+        })?;
+
+        let mut sd_user_blob = sd_byte_blob(&sd_user);
+        let mut v4_loop = FWP_V4_ADDR_AND_MASK {
+            addr: 0x7F00_0000,
+            mask: 0xFF00_0000,
+        };
+        let mut v6_loop = FWP_BYTE_ARRAY16 { byteArray16: [0; 16] };
+        v6_loop.byteArray16[15] = 1;
+        let mut port_range_slot = FWP_RANGE0 {
+            valueLow: fwp_uint16(port_range.0),
+            valueHigh: fwp_uint16(port_range.1),
+        };
+
+        let mut tag_lb = FilterTag::user(
+            "permit-loopback-user", sandbox_user_sid, Some(port_range),
+        )
+        .to_blob_bytes();
+        let mut tag_bk =
+            FilterTag::user("block-user", sandbox_user_sid, None)
+                .to_blob_bytes();
+
+        for (layer, label) in [
+            (FWPM_LAYER_ALE_AUTH_CONNECT_V4, "v4"),
+            (FWPM_LAYER_ALE_AUTH_CONNECT_V6, "v6"),
+        ] {
+            // PERMIT loopback ∩ port-range (no user condition).
+            let addr_cond = if label == "v4" {
+                cond_v4_subnet(
+                    FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v4_loop,
+                )
+            } else {
+                cond_v6_addr(
+                    FWPM_CONDITION_IP_REMOTE_ADDRESS, &mut v6_loop,
+                )
+            };
+            let mut c_lb = [
+                addr_cond,
+                cond_port_range(
+                    FWPM_CONDITION_IP_REMOTE_PORT,
+                    &mut port_range_slot,
+                ),
+            ];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-permit-loopback-user"),
+                W_USER_LOOPBACK,
+                FWP_ACTION_PERMIT,
+                &mut c_lb,
+                &mut tag_lb,
+            )?;
+            // BLOCK sandbox user.
+            let mut c_bk =
+                [cond_sd(FWPM_CONDITION_ALE_USER_ID, &mut sd_user_blob)];
+            add_filter(
+                engine.h(),
+                sublayer,
+                layer,
+                &format!("srt-win-{label}-block-user"),
+                W_USER_BLOCK,
+                FWP_ACTION_BLOCK,
+                &mut c_bk,
+                &mut tag_bk,
+            )?;
         }
-        return Err(e);
-    }
-    let rc = unsafe { FwpmTransactionCommit0(engine.h()) };
-    if rc != 0 {
-        return Err(anyhow!("FwpmTransactionCommit0: 0x{rc:08x}"));
-    }
-    Ok(())
+        Ok(())
+    })
+}
+
+/// Remove only the user-SID-keyed filters under `sublayer`.
+/// Returns the number deleted. The group-keyed set and the
+/// sublayer itself are left in place.
+pub fn uninstall_user_filters(sublayer: &GUID) -> Result<usize> {
+    with_wfp_txn(|engine| {
+        delete_tagged_filters(engine, sublayer, |t| t.user_sid.is_some())
+    })
 }
 
 /// Remove every srt-win-tagged filter under `sublayer`, then attempt
 /// to delete the sublayer itself (best-effort; `FWP_E_IN_USE` means
 /// foreign filters are still under it).
 pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
-    let engine = EngineHandle::open()?;
-    let rc = unsafe { FwpmTransactionBegin0(engine.h(), 0) };
-    if rc != 0 {
-        return Err(anyhow!("FwpmTransactionBegin0: 0x{rc:08x}"));
-    }
-    let n = match delete_tagged_filters(&engine, sublayer) {
-        Ok(n) => n,
-        Err(e) => {
-            unsafe {
-                let _ = FwpmTransactionAbort0(engine.h());
-            }
-            return Err(e);
+    with_wfp_txn(|engine| {
+        let n = delete_tagged_filters(engine, sublayer, |_| true)?;
+        let rc =
+            unsafe { FwpmSubLayerDeleteByKey0(engine.h(), sublayer) };
+        if rc != 0
+            && rc != FWP_E_SUBLAYER_NOT_FOUND
+            && rc != FWP_E_FILTER_NOT_FOUND
+            && rc != FWP_E_IN_USE
+        {
+            return Err(anyhow!("FwpmSubLayerDeleteByKey0: 0x{rc:08x}"));
         }
-    };
-    let rc = unsafe { FwpmSubLayerDeleteByKey0(engine.h(), sublayer) };
-    if rc != 0
-        && rc != FWP_E_SUBLAYER_NOT_FOUND
-        && rc != FWP_E_FILTER_NOT_FOUND
-        && rc != FWP_E_IN_USE
-    {
-        unsafe {
-            let _ = FwpmTransactionAbort0(engine.h());
-        }
-        return Err(anyhow!("FwpmSubLayerDeleteByKey0: 0x{rc:08x}"));
-    }
-    let rc = unsafe { FwpmTransactionCommit0(engine.h()) };
-    if rc != 0 {
-        return Err(anyhow!("FwpmTransactionCommit0: 0x{rc:08x}"));
-    }
-    Ok(n)
+        Ok(n)
+    })
 }
 
 /// Status of the WFP fence under `sublayer`. `installed` iff at
@@ -773,37 +949,103 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
 /// `port_range` is read from the first `permit-loopback` tag;
 /// `None` when no loopback filter is present or it predates the
 /// port-range design.
+///
+/// `cannot-read` is the graceful-degrade state when BFE
+/// enumeration is admin-gated ([`WfpAccessDenied`]). The
+/// non-elevated readiness check is `srt-win wfp verify` (a
+/// behavioral probe — spawns the runner as the sandbox user and
+/// expects WSAEACCES on a direct connect), not this enum.
 #[derive(Debug, Serialize)]
 pub struct WfpStatus {
     pub state: &'static str,
     pub filters: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
+    /// Number of user-SID-keyed filters present (subset of
+    /// `filters`). Zero when `srt-win install` predates the
+    /// sandbox-user provisioning step, or when only `wfp install`
+    /// (group set) was run.
+    pub user_filters: usize,
+    /// Sandbox-user SID read from the first user-keyed tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_sid: Option<String>,
+    /// Populated only on `cannot-read`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
+/// Live BFE enumeration. Admin-gated — a non-elevated caller gets
+/// `state:"cannot-read"` (not an error) so `wfp status` exits 0
+/// with a hint pointing at `wfp verify`. Elevated callers
+/// (`install`'s early-return, the smoke scripts) get the real
+/// per-filter counts.
 pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
-    let engine = EngineHandle::open()?;
+    let engine = match EngineHandle::open() {
+        Ok(e) => e,
+        Err(e) if e.downcast_ref::<WfpAccessDenied>().is_some() => {
+            return Ok(cannot_read(e));
+        }
+        Err(e) => return Err(e),
+    };
     let mut filters = 0usize;
+    let mut user_filters = 0usize;
     let mut have_permit_group = false;
     let mut have_block = false;
     let mut port_range: Option<[u16; 2]> = None;
-    for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
+    let mut user_sid: Option<String> = None;
+    let enum_result = for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
         filters += 1;
+        if tag.user_sid.is_some() {
+            user_filters += 1;
+            if user_sid.is_none() {
+                user_sid.clone_from(&tag.user_sid);
+            }
+        }
         match tag.kind.as_str() {
             "permit-group" => have_permit_group = true,
             "block" => have_block = true,
-            "permit-loopback" if port_range.is_none() => {
+            // Prefer the GROUP-set loopback's port_range — the
+            // `Cmd::Install` no-op-vs-exit-13 check compares
+            // against it, and the group set is the legacy
+            // contract. Only fall back to the user-set loopback
+            // when no group loopback tag is present (e.g. once
+            // the group set is removed).
+            "permit-loopback" => port_range = tag.port_range,
+            "permit-loopback-user" if port_range.is_none() => {
                 port_range = tag.port_range;
             }
             _ => {}
         }
-    })?;
+    });
+    if let Err(e) = enum_result {
+        if e.downcast_ref::<WfpAccessDenied>().is_some() {
+            return Ok(cannot_read(e));
+        }
+        return Err(e);
+    }
     let state = if have_permit_group && have_block {
         "installed"
     } else {
         "absent"
     };
-    Ok(WfpStatus { state, filters, port_range })
+    Ok(WfpStatus {
+        state, filters, port_range, user_filters, user_sid,
+        hint: None,
+    })
+}
+
+fn cannot_read(e: anyhow::Error) -> WfpStatus {
+    WfpStatus {
+        state: "cannot-read",
+        filters: 0,
+        port_range: None,
+        user_filters: 0,
+        user_sid: None,
+        hint: Some(format!(
+            "{e}; elevation required for filter enum — run `srt-win \
+             wfp verify` for a behavioral check"
+        )),
+    }
 }
 
 /// Parse a `--proxy-port-range LOW-HIGH` argument. Both ends are
@@ -863,13 +1105,18 @@ pub fn parse_guid(s: &str) -> Result<GUID> {
 mod tests {
     use super::*;
 
-    /// All three SDDL templates used by `install_filters` must
-    /// parse for a representative SID. Catches template typos
-    /// without needing a live WFP engine.
+    /// All four SDDL templates used by `install_filters` /
+    /// `install_user_filters` must parse for a representative SID.
+    /// Catches template typos without needing a live WFP engine.
     #[test]
     fn sddl_templates_parse() {
         let g = "S-1-5-32-545";
-        for sddl in [sddl_nonmember(g), sddl_group(g), SDDL_EVERYONE.into()] {
+        for sddl in [
+            sddl_nonmember(g),
+            sddl_group(g),
+            SDDL_EVERYONE.into(),
+            sddl_sandbox_user(g),
+        ] {
             let sd = OwnedSd::from_sddl(&sddl).expect("sddl");
             assert!(!sd.ptr.0.is_null());
             assert!(sd.len > 0);
@@ -900,11 +1147,45 @@ mod tests {
 
     #[test]
     fn filter_tag_parses_legacy() {
-        // A pre-port-range tag (no port_range key) must still parse.
+        // A pre-port-range / pre-user-sid tag must still parse.
         let legacy = br#"{"tool":"srt-win","kind":"permit-loopback"}"#;
         let t: FilterTag = serde_json::from_slice(legacy).unwrap();
         assert_eq!(t.kind, "permit-loopback");
         assert_eq!(t.port_range, None);
+        assert_eq!(t.user_sid, None);
+    }
+
+    #[test]
+    fn filter_tag_user_set() {
+        let sid = "S-1-5-21-1-2-3-1005";
+        let bk = FilterTag::user("block-user", sid, None);
+        assert_eq!(bk.user_sid.as_deref(), Some(sid));
+        assert_eq!(bk.port_range, None);
+        let lb =
+            FilterTag::user("permit-loopback-user", sid, Some((60080, 60089)));
+        assert_eq!(lb.port_range, Some([60080, 60089]));
+        // Round-trips through JSON.
+        let back: FilterTag =
+            serde_json::from_slice(&lb.to_blob_bytes()).unwrap();
+        assert_eq!(back, lb);
+        // Group-set tags omit user_sid from JSON entirely (so a
+        // pre-user-set status reader doesn't choke).
+        let g = FilterTag::new("block").to_blob_bytes();
+        assert!(!std::str::from_utf8(&g).unwrap().contains("user_sid"));
+    }
+
+    /// Module-level [`W_NONMEMBER`]/[`W_USER_BLOCK`]/
+    /// [`W_USER_LOOPBACK`] are the production weights; const-assert
+    /// the invariant directly against them so a reshuffle in
+    /// `install_filters`'s table fails to compile here.
+    #[test]
+    fn weight_invariant() {
+        const { assert!(W_USER_BLOCK > W_NONMEMBER) };
+        const { assert!(W_USER_LOOPBACK > W_USER_BLOCK) };
+        // Group-set internal ordering (existing contract).
+        const { assert!(W_NONMEMBER > W_GROUP) };
+        const { assert!(W_GROUP > W_LOOPBACK) };
+        const { assert!(W_LOOPBACK > W_BLOCK) };
     }
 
     #[test]

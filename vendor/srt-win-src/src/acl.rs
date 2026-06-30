@@ -23,17 +23,14 @@
 //! "no explicit DACL, inheritance on" rather than persisting the
 //! inherited ACEs as explicit ones.
 //!
-//! Directories and globs are **rejected**; the parent-directory
-//! allow-list stamp protects an individual file's name, not the
-//! directory's own contents.
+//! Globs are **rejected**. Directory targets get the same
+//! broker-only ACE list with `(OI)(CI)` so the stamp inherits to
+//! the whole subtree (the marker ACE stays non-inheriting).
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::ffi::c_void;
 use std::mem::size_of;
-use windows::Win32::Foundation::{
-    HANDLE, INVALID_HANDLE_VALUE,
-};
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -47,21 +44,18 @@ use windows::Win32::Security::{
     ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
     OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleW, FILE_ALL_ACCESS,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_NAME_NORMALIZED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
+    FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
 
+use crate::path_id::FileId;
 use crate::sid::LocalPsid;
-use crate::util::{local_free, pcwstr, wstr, OwnedHandle};
+use crate::util::{local_free, pcwstr, win32_ok, wstr, OwnedSd};
 
 /// Owner-Rights well-known SID. ANY ACE for this SID replaces
 /// the kernel's implicit `READ_CONTROL|WRITE_DAC` grant to the
@@ -98,6 +92,7 @@ impl Mask {
     // File/dir-specific.
     pub const FILE_DELETE_CHILD:    Self = Self(0x0000_0040);
     pub const FILE_ALL:             Self = Self(FILE_ALL_ACCESS.0);
+    pub const FILE_WRITE_ATTRIBUTES: Self = Self(0x0000_0100);
     pub const FILE_GENERIC_READ:    Self = Self(FILE_GENERIC_READ.0);
     pub const FILE_GENERIC_WRITE:   Self =
         Self(windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE.0);
@@ -166,12 +161,9 @@ impl Allow<'static> {
 /// Self-owning ACL: `buf` holds the `ACL` header + ACEs.
 /// `AddAccessAllowedAceEx` copies SID bytes inline into each ACE
 /// (`SidStart` embeds the SID — see the size calc in
-/// [`build_allow_dacl`]), so once built `buf` is self-contained.
+/// [`rebuild_acl`]), so once built `buf` is self-contained.
 pub struct BuiltAcl {
     buf: Vec<u8>,
-    /// Retained for Drop ordering only — SID bytes are already
-    /// inline in `buf`, so this is belt-and-braces.
-    _marker: Option<LocalPsid>,
 }
 
 impl BuiltAcl {
@@ -275,46 +267,21 @@ impl ParsedAces {
             .map(|h| LocalPsid::from_string(&marker_sid_string(h)))
             .transpose()
             .context("parse marker SID")?;
-
-        // ACL header + Σ ACE size. `ACE_FIXED` (8) + GetLengthSid
-        // per ACE (`SidStart` embeds the SID).
-        let mut total = size_of::<ACL>();
-        for (s, _, _) in &self.rows {
-            total +=
-                ACE_FIXED + unsafe { GetLengthSid(s.as_psid()) } as usize;
-        }
-        if let Some(m) = &marker_sid {
-            total +=
-                ACE_FIXED + unsafe { GetLengthSid(m.as_psid()) } as usize;
-        }
-        total = (total + 3) & !3; // DWORD-align
-
-        let mut buf = vec![0u8; total];
-        let acl = buf.as_mut_ptr() as *mut ACL;
-        unsafe {
-            InitializeAcl(acl, total as u32, ACL_REVISION)
-                .context("InitializeAcl")?;
-            for (s, m, fl) in &self.rows {
-                AddAccessAllowedAceEx(
-                    acl, ACL_REVISION, *fl, m.bits(), s.as_psid(),
-                )
-                .with_context(|| {
-                    format!("AddAccessAllowedAceEx({:#x})", m.bits())
-                })?;
-            }
-            if let Some(m) = &marker_sid {
-                // READ_CONTROL not 0; NO_INHERIT — see hash-ACE note.
-                AddAccessDeniedAceEx(
-                    acl,
-                    ACL_REVISION,
-                    NO_INHERIT,
-                    Mask::READ_CONTROL.bits(),
-                    m.as_psid(),
-                )
-                .context("AddAccessDeniedAceEx(marker)")?;
-            }
-        }
-        Ok(BuiltAcl { buf, _marker: marker_sid })
+        let head: Vec<NewAce> = self
+            .rows
+            .iter()
+            .map(|(s, m, fl)| NewAce::Allow(s.as_psid(), m.bits(), *fl))
+            .collect();
+        // READ_CONTROL not 0; NO_INHERIT — see hash-ACE note.
+        let tail: Vec<NewAce> = marker_sid
+            .iter()
+            .map(|m| {
+                NewAce::Deny(m.as_psid(), Mask::READ_CONTROL.bits(), NO_INHERIT)
+            })
+            .collect();
+        rebuild_acl(ACL_REVISION, &head, &KeptAces::EMPTY, &tail)
+        // `marker_sid` (and `self.rows`' LocalPsids) drop here; the
+        // SID bytes are already inline in the returned ACL buffer.
     }
 }
 
@@ -351,6 +318,72 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 /// (Header 4 + Mask 4); `SidStart` is the first DWORD of the SID.
 const ACE_FIXED: usize = 8;
 
+/// `n` rounded up to a DWORD boundary — `InitializeAcl` requires the
+/// ACL buffer length to be DWORD-aligned.
+const fn dword_align(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// One ACE to add at the head/tail of a [`rebuild_acl`] output.
+/// `PSID` borrows the caller's SID buffer; keep it alive across the
+/// call.
+pub(crate) enum NewAce {
+    Allow(PSID, u32, ACE_FLAGS),
+    Deny(PSID, u32, ACE_FLAGS),
+}
+
+impl NewAce {
+    fn sid(&self) -> PSID {
+        let (Self::Allow(s, ..) | Self::Deny(s, ..)) = self;
+        *s
+    }
+}
+
+/// Size + `InitializeAcl(rev)` + `head` ACEs + `kept` raw ACEs +
+/// `tail` ACEs → [`BuiltAcl`]. The single ACL-construction
+/// chokepoint: [`ParsedAces::build_with_marker`] (head + marker
+/// tail, `rev = ACL_REVISION`), [`apply_sandbox_aces`] (head + kept,
+/// `rev` from the source ACL via [`filter_aces`]),
+/// [`build_explicit_only_acl`] (kept only), and
+/// `winsta::recompose_dacl` (kept + tail) all thread through here.
+///
+/// `rev` MUST match the kept ACEs' source revision when `kept` is
+/// non-empty (`AddAce` requires `ACL_REVISION_DS` when copying
+/// object-type ACEs); pass [`KeptAces::src_rev`].
+pub(crate) fn rebuild_acl(
+    rev: ACE_REVISION,
+    head: &[NewAce],
+    kept: &KeptAces,
+    tail: &[NewAce],
+) -> Result<BuiltAcl> {
+    let mut total = size_of::<ACL>() + kept.total_sz;
+    for a in head.iter().chain(tail) {
+        total += ACE_FIXED + unsafe { GetLengthSid(a.sid()) } as usize;
+    }
+    total = dword_align(total);
+    let mut buf = vec![0u8; total];
+    let acl = buf.as_mut_ptr() as *mut ACL;
+    unsafe { InitializeAcl(acl, total as u32, rev) }
+        .context("InitializeAcl")?;
+    let add = |a: &NewAce| match *a {
+        NewAce::Allow(s, m, f) => unsafe {
+            AddAccessAllowedAceEx(acl, rev, f, m, s)
+        }
+        .with_context(|| format!("AddAccessAllowedAceEx({m:#x})")),
+        NewAce::Deny(s, m, f) => unsafe {
+            AddAccessDeniedAceEx(acl, rev, f, m, s)
+        }
+        .with_context(|| format!("AddAccessDeniedAceEx({m:#x})")),
+    };
+    head.iter().try_for_each(&add)?;
+    for (ace, sz) in &kept.aces {
+        unsafe { AddAce(acl, rev, u32::MAX, *ace, *sz as u32) }
+            .context("AddAce(keep)")?;
+    }
+    tail.iter().try_for_each(&add)?;
+    Ok(BuiltAcl { buf })
+}
+
 /// `h` → string SID `S-1-0-h0-h1-…-h7` (Null SID Authority, 8
 /// sub-authorities = 8×u32 LE = 256 bits). Round-trips through
 /// `ConvertStringSidToSidW`/`ConvertSidToStringSidW` byte-exact.
@@ -385,27 +418,45 @@ pub fn set_file_dacl_protected(
     dacl: &BuiltAcl,
     label: &str,
 ) -> Result<()> {
-    let w = wstr(canonical_path);
+    write_file_dacl(canonical_path, dacl.as_ptr(), Protection::Protected)
+        .context(label.to_owned())
+}
+
+/// Whether [`write_file_dacl`] sets `PROTECTED_` (block inheritance
+/// from the parent — used for the broker-only allow-list stamp and
+/// state-DB dir) or `UNPROTECTED_DACL_SECURITY_INFORMATION`
+/// (re-derive inherited ACEs from the parent — used by
+/// [`apply_sandbox_aces`]).
+pub(crate) enum Protection {
+    Protected,
+    Unprotected,
+}
+
+/// Write `acl` as `path`'s DACL via
+/// `SetNamedSecurityInfoW(SE_FILE_OBJECT, DACL | <p>)`. Mirror of
+/// [`read_file_dacl`].
+pub(crate) fn write_file_dacl(
+    path: &str,
+    acl: *const ACL,
+    p: Protection,
+) -> Result<()> {
+    let prot = match p {
+        Protection::Protected => PROTECTED_DACL_SECURITY_INFORMATION,
+        Protection::Unprotected => UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let w = wstr(path);
     let r = unsafe {
         SetNamedSecurityInfoW(
             pcwstr(&w),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | prot,
             None,
             None,
-            Some(dacl.as_ptr()),
+            Some(acl),
             None,
         )
     };
-    if r.is_err() {
-        bail!(
-            "SetNamedSecurityInfoW({label} '{canonical_path}'): \
-             WIN32_ERROR=0x{:08x}",
-            r.0
-        );
-    }
-    Ok(())
+    win32_ok(r, &format!("SetNamedSecurityInfoW('{path}')"))
 }
 
 /// Stamp shape. `ReadDeny` makes the file broker-only for ALL
@@ -465,6 +516,10 @@ pub enum StampClass {
     Unstamped,
     /// Broker file-stamp ACEs for `mask` + one marker encoding `h`.
     File(AclMask, MarkerHash),
+    /// Broker dir-stamp ACEs (`(OI)(CI)` `broker_only_aces`) for
+    /// `mask` + one non-inheriting marker. Inherits to the whole
+    /// subtree; the marker stays on the dir itself.
+    DirTarget(AclMask, MarkerHash),
     /// Parent allow-list ACEs + one marker.
     ParentAllowList(MarkerHash),
     /// PROTECTED and either (a) a broker shape with NO marker
@@ -527,6 +582,113 @@ impl From<Vec<u8>> for CapturedSd {
     }
 }
 
+// ─── DACL read + ACE-walk primitives ────────────────────────────────
+// Shared low-level wrappers so the recompose / explicit-only / walk
+// callers don't each open-code GetNamedSecurityInfoW + GetAce loops.
+// `winsta.rs::recompose_dacl` will adopt `filter_aces` with its own
+// predicate (it KEEPS inherited ACEs; the file callers here drop
+// them).
+
+/// Read a file's DACL via
+/// `GetNamedSecurityInfoW(SE_FILE_OBJECT, DACL_SECURITY_INFORMATION)`.
+/// The returned `*mut ACL` points INTO the returned `OwnedSd`'s
+/// buffer — keep the `OwnedSd` alive while using the pointer.
+pub(crate) fn read_file_dacl(
+    canonical_path: &str,
+) -> Result<(OwnedSd, *mut ACL)> {
+    let w = wstr(canonical_path);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetNamedSecurityInfoW(
+            pcwstr(&w),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut psd,
+        )
+    };
+    win32_ok(r, &format!("GetNamedSecurityInfoW('{canonical_path}')"))?;
+    Ok((OwnedSd::from_raw(psd), dacl))
+}
+
+/// Kept ACE pointers from a [`filter_aces`] walk, plus their
+/// summed size and the source ACL's revision (so a [`rebuild_acl`]
+/// caller can preserve `ACL_REVISION_DS` for object-type ACEs).
+pub(crate) struct KeptAces {
+    pub(crate) aces: Vec<(*const c_void, u16)>,
+    pub(crate) total_sz: usize,
+    pub(crate) src_rev: ACE_REVISION,
+}
+
+impl KeptAces {
+    /// No kept ACEs; `src_rev = ACL_REVISION` (the no-object-ACE
+    /// default).
+    pub(crate) const EMPTY: Self =
+        Self { aces: Vec::new(), total_sz: 0, src_rev: ACL_REVISION };
+}
+
+/// Walk every ACE of `acl` and collect `(ptr, AceSize)` for those
+/// `keep` accepts. Returns `(kept, Σ kept sizes, source AclRevision)`.
+/// `acl == null` → `(∅, 0, ACL_REVISION)`. The kept pointers point
+/// into `acl`'s buffer; caller must keep that buffer alive.
+///
+/// `keep` receives the raw `ACE_HEADER` and `body` = the full ACE
+/// bytes (`hdr.AceSize` long, starting at the ACE pointer — so
+/// `body[ACE_FIXED..]` is the embedded SID).
+///
+/// The source's `AclRevision` is returned so a caller building a
+/// fresh ACL from kept ACEs can preserve it: `AddAce` requires
+/// `ACL_REVISION_DS` (4) when copying object-type ACEs, and
+/// `RtlValidAcl` rejects an ACL whose revision doesn't match its
+/// ACEs.
+pub(crate) fn filter_aces(
+    acl: *const ACL,
+    mut keep: impl FnMut(&ACE_HEADER, &[u8]) -> bool,
+) -> Result<KeptAces> {
+    if acl.is_null() {
+        return Ok(KeptAces::EMPTY);
+    }
+    let src_rev = ACE_REVISION(unsafe { (*acl).AclRevision } as u32);
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            acl,
+            &mut info as *mut _ as *mut c_void,
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+        .context("GetAclInformation")?;
+    }
+    let mut kept = KeptAces { aces: Vec::new(), total_sz: 0, src_rev };
+    for i in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        unsafe { GetAce(acl, i, &mut ace) }
+            .map_err(|e| anyhow!("GetAce({i}): {e}"))?;
+        if ace.is_null() {
+            bail!("GetAce({i}) returned null");
+        }
+        let hdr = unsafe { &*(ace as *const ACE_HEADER) };
+        let body = unsafe {
+            std::slice::from_raw_parts(ace as *const u8, hdr.AceSize as usize)
+        };
+        if keep(hdr, body) {
+            kept.aces.push((ace as *const c_void, hdr.AceSize));
+            kept.total_sz += hdr.AceSize as usize;
+        }
+    }
+    Ok(kept)
+}
+
+/// True iff `body[ACE_FIXED..]` starts with exactly `sid_bytes` —
+/// i.e. the ACE's trustee SID is `sid_bytes`.
+pub(crate) fn ace_sid_is(body: &[u8], sid_bytes: &[u8]) -> bool {
+    body.get(ACE_FIXED..ACE_FIXED + sid_bytes.len()) == Some(sid_bytes)
+}
+
 /// One ACE split into `(type, flags, mask, sid)` for comparison.
 #[derive(Debug, Clone)]
 struct AceView {
@@ -562,43 +724,29 @@ impl AceView {
 }
 
 /// Walk every ACE of `dacl` (SID bytes copied out).
-unsafe fn walk_aces(dacl: *const ACL) -> Result<Vec<AceView>> {
-    let mut info = ACL_SIZE_INFORMATION::default();
-    unsafe {
-        GetAclInformation(
-            dacl,
-            &mut info as *mut _ as *mut c_void,
-            size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-        .context("GetAclInformation(walk)")?;
-    }
-    let mut out = Vec::with_capacity(info.AceCount as usize);
-    for i in 0..info.AceCount {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        unsafe { GetAce(dacl, i, &mut ace) }
-            .map_err(|e| anyhow!("GetAce({i}): {e}"))?;
-        let hdr = ace as *const ACE_HEADER;
-        let (ace_type, ace_flags, ace_size) =
-            unsafe { ((*hdr).AceType, (*hdr).AceFlags, (*hdr).AceSize) };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(ace as *const u8, ace_size as usize)
-        };
-        if (ace_size as usize) < ACE_FIXED + 8 {
-            bail!("walk_aces: ACE {i} too small ({ace_size}B)");
+fn walk_aces(dacl: *const ACL) -> Result<Vec<AceView>> {
+    let mut out = Vec::new();
+    let mut bad: Option<usize> = None;
+    filter_aces(dacl, |hdr, body| {
+        if body.len() < ACE_FIXED + 8 {
+            bad.get_or_insert(body.len());
+            return false;
         }
-        let mask = u32::from_le_bytes([
-            bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        let sid_start = &bytes[ACE_FIXED..];
+        let mask =
+            u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        let sid_start = &body[ACE_FIXED..];
         let sub = sid_start.get(1).copied().unwrap_or(0) as usize;
         let sid_len = (8 + 4 * sub).min(sid_start.len());
         out.push(AceView {
-            ace_type,
-            ace_flags,
+            ace_type: hdr.AceType,
+            ace_flags: hdr.AceFlags,
             mask,
             sid: sid_start[..sid_len].to_vec(),
         });
+        false // we copied what we need; don't keep ptrs
+    })?;
+    if let Some(sz) = bad {
+        bail!("walk_aces: ACE too small ({sz}B)");
     }
     Ok(out)
 }
@@ -624,12 +772,15 @@ fn ace_keys(aces: &[AceView]) -> AceKeys {
 pub struct StampCalibration {
     read_deny: AceKeys,
     write_deny: AceKeys,
+    dir_read_deny: AceKeys,
+    dir_write_deny: AceKeys,
     parent: AceKeys,
 }
 
 #[derive(Copy, Clone)]
 enum Shape {
     File(AclMask),
+    Dir(AclMask),
     Parent,
 }
 
@@ -639,6 +790,10 @@ impl StampCalibration {
             Some(Shape::File(AclMask::ReadDeny))
         } else if *keys == self.write_deny {
             Some(Shape::File(AclMask::WriteDeny))
+        } else if *keys == self.dir_read_deny {
+            Some(Shape::Dir(AclMask::ReadDeny))
+        } else if *keys == self.dir_write_deny {
+            Some(Shape::Dir(AclMask::WriteDeny))
         } else if *keys == self.parent {
             Some(Shape::Parent)
         } else {
@@ -655,37 +810,71 @@ impl StampCalibration {
 pub struct PrebuiltDacls {
     read_deny: ParsedAces,
     write_deny: ParsedAces,
+    dir_read_deny: ParsedAces,
+    dir_write_deny: ParsedAces,
     parent: ParsedAces,
     pub calib: StampCalibration,
 }
 
 impl PrebuiltDacls {
-    pub fn build(group_sid: &str, user_sid: &str) -> Result<Self> {
+    /// Same-user mode: trustee = the discriminator group; parent
+    /// allow-list applied. The `user_sid` for the parent allow-list
+    /// is read here so callers don't repeat the lookup.
+    ///
+    /// (Separate-user mode does NOT use this — it applies an
+    /// additive DENY ACE for the sandbox user via [`SbAceSet`]
+    /// instead of a PROTECTED rewrite.)
+    pub fn for_current_user(group_sid: &str) -> Result<Self> {
+        let user_sid = crate::sid::current_user_sid()?;
+        Self::build(group_sid, &user_sid)
+    }
+
+    pub fn build(
+        trustee_sid: &str,
+        user_sid: &str,
+    ) -> Result<Self> {
         let read_deny = ParsedAces::parse(&broker_only_aces(
-            group_sid, AclMask::ReadDeny, false,
+            trustee_sid, AclMask::ReadDeny, false,
         ))?;
         let write_deny = ParsedAces::parse(&broker_only_aces(
-            group_sid, AclMask::WriteDeny, false,
+            trustee_sid, AclMask::WriteDeny, false,
+        ))?;
+        let dir_read_deny = ParsedAces::parse(&broker_only_aces(
+            trustee_sid, AclMask::ReadDeny, true,
+        ))?;
+        let dir_write_deny = ParsedAces::parse(&broker_only_aces(
+            trustee_sid, AclMask::WriteDeny, true,
         ))?;
         let parent = ParsedAces::parse(&parent_allow_list_aces(
-            group_sid, user_sid,
+            trustee_sid, user_sid,
         ))?;
         let keys_of = |a: &ParsedAces| -> Result<AceKeys> {
             let d = a.build_with_marker(None)?;
-            Ok(ace_keys(&unsafe { walk_aces(d.as_ptr()) }?))
+            Ok(ace_keys(&walk_aces(d.as_ptr())?))
         };
         let calib = StampCalibration {
             read_deny: keys_of(&read_deny)?,
             write_deny: keys_of(&write_deny)?,
+            dir_read_deny: keys_of(&dir_read_deny)?,
+            dir_write_deny: keys_of(&dir_write_deny)?,
             parent: keys_of(&parent)?,
         };
-        Ok(Self { read_deny, write_deny, parent, calib })
+        Ok(Self {
+            read_deny,
+            write_deny,
+            dir_read_deny,
+            dir_write_deny,
+            parent,
+            calib,
+        })
     }
 
-    fn file_aces(&self, mask: AclMask) -> &ParsedAces {
-        match mask {
-            AclMask::ReadDeny => &self.read_deny,
-            AclMask::WriteDeny => &self.write_deny,
+    fn target_aces(&self, mask: AclMask, is_dir: bool) -> &ParsedAces {
+        match (is_dir, mask) {
+            (false, AclMask::ReadDeny) => &self.read_deny,
+            (false, AclMask::WriteDeny) => &self.write_deny,
+            (true, AclMask::ReadDeny) => &self.dir_read_deny,
+            (true, AclMask::WriteDeny) => &self.dir_write_deny,
         }
     }
 }
@@ -717,7 +906,7 @@ pub fn classify_sd(
     if !present.as_bool() || dacl.is_null() {
         return Ok(StampClass::Unstamped);
     }
-    let all = unsafe { walk_aces(dacl)? };
+    let all = walk_aces(dacl)?;
     let mut marker: Option<MarkerHash> = None;
     let mut rest: Vec<AceView> = Vec::with_capacity(all.len());
     for a in all {
@@ -734,6 +923,7 @@ pub fn classify_sd(
     }
     Ok(match (calib.shape_of(&ace_keys(&rest)), marker) {
         (Some(Shape::File(m)), Some(h)) => StampClass::File(m, h),
+        (Some(Shape::Dir(m)), Some(h)) => StampClass::DirTarget(m, h),
         (Some(Shape::Parent), Some(h)) => StampClass::ParentAllowList(h),
         // Shape match + no marker, OR no shape match + marker
         // present (extra/tweaked ACE, or a stamp from a different
@@ -746,161 +936,6 @@ pub fn classify_sd(
     })
 }
 
-/// True iff `decoded` round-trips back to `original` via
-/// `encode_utf16` — i.e., `from_utf16_lossy(original)` was
-/// lossless (no unpaired-surrogate substitution).
-#[inline]
-fn utf16_roundtrips(original: &[u16], decoded: &str) -> bool {
-    decoded.encode_utf16().eq(original.iter().copied())
-}
-
-/// Typed [`canonicalize_path`] error. The hard-error vs
-/// soft-skip decision in `main.rs` matches on the variant rather
-/// than a substring of the formatted message, so a wording change
-/// here cannot silently downgrade a glob to a skip.
-#[derive(Debug)]
-pub enum CanonError {
-    /// Input contains `*` or `?` (outside the `\\?\` prefix).
-    /// Always a config bug — never transient.
-    Glob,
-    /// Open / final-path / attribute read failed (covers
-    /// `ERROR_FILE_NOT_FOUND`, unpaired-surrogate canonical paths,
-    /// and any other Win32 error).
-    Other(anyhow::Error),
-}
-
-impl std::fmt::Display for CanonError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Glob => write!(
-                f,
-                "Windows fs deny requires explicit file or directory \
-                 paths; got glob"
-            ),
-            Self::Other(e) => write!(f, "{e:#}"),
-        }
-    }
-}
-impl std::error::Error for CanonError {}
-
-/// Resolve `path` to its kernel-canonical form via
-/// `GetFinalPathNameByHandleW` (handles symlinks, junctions, 8.3
-/// short names, drive-letter case). Returns the `\\?\`-prefixed
-/// path and whether it's a directory.
-///
-/// `state_db.rs` uses the canonical path as the DB key so a stamp
-/// via two equivalent paths (e.g. `C:\PROGRA~1\…` and
-/// `C:\Program Files\…`) refcounts correctly.
-///
-/// Returns [`CanonError::Other`] for any open/resolve failure,
-/// including a canonical path that is not UTF-8-representable
-/// (unpaired surrogates) — fail closed rather than round-trip a
-/// U+FFFD-substituted string into the wrong filesystem object.
-pub fn canonicalize_path(
-    path: &str,
-) -> Result<(String, bool), CanonError> {
-    // Glob check on the INPUT, ignoring the `\\?\` extended-path
-    // prefix (its `?` is not a wildcard). Without the strip,
-    // canonicalize_path would reject its OWN output (which always
-    // carries the prefix).
-    let glob_in = path.strip_prefix(r"\\?\").unwrap_or(path);
-    if glob_in.contains('*') || glob_in.contains('?') {
-        return Err(CanonError::Glob);
-    }
-    (|| -> Result<(String, bool)> {
-        // Open without requesting any data access so we don't
-        // need read permission on the target.
-        // `BACKUP_SEMANTICS` lets directories open too.
-        let h = open_for_metadata(path).with_context(|| {
-            format!("open '{path}' for canonicalization")
-        })?;
-
-        let buf = final_path_from_handle(h.raw()).with_context(|| {
-            format!("GetFinalPathNameByHandleW('{path}')")
-        })?;
-        let canonical = String::from_utf16_lossy(&buf);
-        if !utf16_roundtrips(&buf, &canonical) {
-            bail!(
-                "canonical path for '{path}' is not representable as \
-                 UTF-8 (contains unpaired surrogates); not supported"
-            );
-        }
-
-        // Directory check on the OPEN HANDLE (not a path
-        // re-resolve): the handle was opened without
-        // `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink-to-dir was
-        // already followed and `h` is the directory itself.
-        use windows::Win32::Storage::FileSystem::{
-            FileBasicInfo, GetFileInformationByHandleEx,
-            FILE_BASIC_INFO,
-        };
-        let mut info = FILE_BASIC_INFO::default();
-        unsafe {
-            GetFileInformationByHandleEx(
-                h.raw(),
-                FileBasicInfo,
-                (&mut info as *mut FILE_BASIC_INFO).cast(),
-                size_of::<FILE_BASIC_INFO>() as u32,
-            )
-        }
-        .with_context(|| {
-            format!(
-                "GetFileInformationByHandleEx(FileBasicInfo) '{path}'"
-            )
-        })?;
-        let is_dir =
-            info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-        Ok((canonical, is_dir))
-    })()
-    .map_err(CanonError::Other)
-}
-
-/// Open `path` with no data access (`dwDesiredAccess = 0`), full
-/// sharing, `BACKUP_SEMANTICS` (so directories open), `OPEN_EXISTING`.
-/// Shared by every metadata-query helper so a future change to the
-/// open flags (e.g. `FILE_FLAG_OPEN_REPARSE_POINT`) lands once.
-fn open_for_metadata(path: &str) -> Result<OwnedHandle> {
-    let w = wstr(path);
-    let h = unsafe {
-        CreateFileW(
-            pcwstr(&w),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            None,
-        )
-    }?;
-    if h == INVALID_HANDLE_VALUE {
-        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
-    }
-    Ok(OwnedHandle(h))
-}
-
-/// `GetFinalPathNameByHandleW` two-call sizing pattern. Returns the
-/// raw UTF-16 buffer (no NUL); caller decodes and round-trip-checks.
-fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
-    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(
-        FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0,
-    );
-    let need = unsafe { GetFinalPathNameByHandleW(h, &mut [], flags) };
-    if need == 0 {
-        bail!("sizing: {}", std::io::Error::last_os_error());
-    }
-    let mut buf = vec![0u16; need as usize + 1];
-    let n = unsafe { GetFinalPathNameByHandleW(h, &mut buf, flags) };
-    if n == 0 || n as usize >= buf.len() {
-        // n >= buf.len() means "buffer too small" (a concurrent
-        // rename grew the path between the size probe and the
-        // data call). We bail rather than retry — narrow window,
-        // and the caller can re-stamp.
-        bail!("{}", std::io::Error::last_os_error());
-    }
-    buf.truncate(n as usize);
-    Ok(buf)
-}
-
 /// Capture DACL+Owner+Group as a self-relative SD blob suitable for
 /// storage and round-tripping into `restore_sd`.
 pub fn capture_sd(canonical_path: &str) -> Result<CapturedSd> {
@@ -909,8 +944,8 @@ pub fn capture_sd(canonical_path: &str) -> Result<CapturedSd> {
         | OWNER_SECURITY_INFORMATION
         | GROUP_SECURITY_INFORMATION;
     let mut psd = PSECURITY_DESCRIPTOR::default();
-    unsafe {
-        let r = GetNamedSecurityInfoW(
+    let r = unsafe {
+        GetNamedSecurityInfoW(
             pcwstr(&w),
             SE_FILE_OBJECT,
             info,
@@ -919,14 +954,9 @@ pub fn capture_sd(canonical_path: &str) -> Result<CapturedSd> {
             None,
             None,
             &mut psd,
-        );
-        if r.is_err() {
-            bail!(
-                "GetNamedSecurityInfoW('{canonical_path}'): WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
-    }
+        )
+    };
+    win32_ok(r, &format!("GetNamedSecurityInfoW('{canonical_path}')"))?;
     // The returned SD is documented self-relative; copy it out so we
     // own the bytes.
     let len = unsafe { GetSecurityDescriptorLength(psd) } as usize;
@@ -1031,30 +1061,33 @@ pub fn restore_sd(canonical_path: &str, sd: &CapturedSd) -> Result<()> {
             dacl_arg,
             None,
         );
-        if r.is_err() {
-            bail!(
-                "SetNamedSecurityInfoW(restore '{canonical_path}'): \
-                 WIN32_ERROR=0x{:08x}",
-                r.0
-            );
-        }
+        win32_ok(
+            r,
+            &format!("SetNamedSecurityInfoW(restore '{canonical_path}')"),
+        )?;
     }
     Ok(())
 }
 
 /// Broker-only ACE list for `mask`. `inherit` adds `(OI)(CI)` to
-/// every ALLOW ACE (state-DB directory).
+/// every ALLOW ACE (directory targets and the state-DB dir).
+///
+/// `trustee_sid` is "who CAN access" — under the same-user model
+/// this is the discriminator group SID (the broker is in it; the
+/// child has it deny-only); under the separate-user model it's the
+/// REAL user's SID (the broker matches; the sandbox-user child
+/// does not).
 fn broker_only_aces(
-    group_sid: &str,
+    trustee_sid: &str,
     mask: AclMask,
     inherit: bool,
 ) -> Vec<Allow<'_>> {
     let fl = if inherit { OICI } else { NO_INHERIT };
     let ow = if inherit { Allow::OWNER_RIGHTS_OICI } else { Allow::OWNER_RIGHTS };
     let mut aces = vec![
-        Allow(group_sid,          Mask::FILE_ALL, fl),
+        Allow(trustee_sid,        Mask::FILE_ALL, fl),
         Allow(SID_SYSTEM,         Mask::FILE_ALL, fl),
-        Allow(SID_BUILTIN_ADMINS, Mask::FILE_ALL, fl), // dedup'd if == group
+        Allow(SID_BUILTIN_ADMINS, Mask::FILE_ALL, fl), // dedup'd if == trustee
         ow,
     ];
     // WriteDeny: leave read+execute open to Everyone so the file
@@ -1110,30 +1143,289 @@ pub fn build_parent_allow_list_dacl(
         .build_with_marker(marker)
 }
 
-/// Build + apply the broker-only file stamp (DACL+marker,
-/// `PROTECTED`) in one atomic `SetNamedSecurityInfoW`. The
-/// ORIGINAL SD must already have been captured and persisted.
-pub fn stamp_file_apply(
+/// Build + apply the broker-only stamp (DACL+marker, `PROTECTED`)
+/// in one atomic `SetNamedSecurityInfoW`. The ORIGINAL SD must
+/// already have been captured and persisted. `is_dir` selects the
+/// `(OI)(CI)`-inheriting ACE shape so the stamp covers the whole
+/// subtree; the marker stays `flags=0` (non-inheriting) so a
+/// pure-inherit descendant's `classify_sd` is `Unstamped`.
+pub fn stamp_target_apply(
     canonical_path: &str,
     dacls: &PrebuiltDacls,
     mask: AclMask,
+    is_dir: bool,
     marker: &MarkerHash,
 ) -> Result<()> {
-    let dacl = dacls.file_aces(mask).build_with_marker(Some(marker))?;
+    let dacl =
+        dacls.target_aces(mask, is_dir).build_with_marker(Some(marker))?;
     set_file_dacl_protected(canonical_path, &dacl, "stamp")
 }
 
 /// Apply the broker-only DACL to a directory with `(OI)(CI)`
-/// inheritance. Used by `state_db.rs` to protect
-/// `%LOCALAPPDATA%\sandbox-runtime\`. NOT exposed to the CLI —
-/// directory targets in `acl stamp` are not yet supported.
+/// inheritance, optionally **prefixed** by a `(D;OICI;FA;;;
+/// <deny_sid>)` ACE. Used by `state_db.rs` and `install.rs` to
+/// protect `%LOCALAPPDATA%\sandbox-runtime\`.
+///
+/// `deny_sid` is the [`crate::user::SANDBOX_GROUP`] SID when the
+/// sandbox user has been provisioned: the credential file in this
+/// directory is encrypted with **machine-scope** DPAPI, which any
+/// local account can decrypt — so the sandbox account MUST NOT be
+/// able to read it. The broker-only `PROTECTED` allow set already
+/// excludes the sandbox user (it's not in `<group_sid>` / SYSTEM /
+/// Admins), but the explicit DENY makes that intent visible in
+/// `Get-Acl` and survives any future widening of the allow set.
+///
+/// Built via SDDL because [`build_allow_dacl`] only emits ALLOW
+/// ACEs (plus the marker DENY), and adding a generic DENY row to
+/// the [`Allow`]/[`ParsedAces`] table would invite misuse in the
+/// per-file stamp paths where DENY ACEs interact badly with
+/// inheritance. NOT the `acl stamp` directory-target path —
+/// that uses the marker-carrying [`PrebuiltDacls`] shapes.
 pub fn stamp_dir_inheriting(
     canonical_path: &str,
     group_sid: &str,
+    deny_sid: Option<&str>,
 ) -> Result<()> {
-    let dacl =
-        build_broker_only_dacl(group_sid, AclMask::ReadDeny, true, None)?;
-    set_file_dacl_protected(canonical_path, &dacl, "state-db dir")
+    let deny = deny_sid
+        .map(|s| format!("(D;OICI;FA;;;{s})"))
+        .unwrap_or_default();
+    // Same trustees and masks as `broker_only_aces(ReadDeny,
+    // inherit=true)`: <group>/SY/BA = FILE_ALL `(OI)(CI)`,
+    // OWNER_RIGHTS = READ_CONTROL `(OI)(CI)`. SDDL's `FA` =
+    // `FILE_ALL_ACCESS`; `RC` = `READ_CONTROL`; `S-1-3-4` =
+    // OWNER_RIGHTS. Canonical ACE order = DENY before ALLOW.
+    let sddl = format!(
+        "D:P{deny}\
+         (A;OICI;FA;;;{group_sid})\
+         (A;OICI;FA;;;SY)\
+         (A;OICI;FA;;;BA)\
+         (A;OICI;RC;;;S-1-3-4)"
+    );
+    set_path_dacl_from_sddl(canonical_path, &sddl, "state-db dir")
+}
+
+/// SDDL → SD → DACL pointer → `SetNamedSecurityInfoW(PROTECTED)`.
+/// One-shot helper for the few call sites that need a DENY ACE
+/// (which the [`BuiltAcl`] machinery deliberately doesn't expose).
+/// The `D:P` prefix in `sddl` is informational; `PROTECTED` is set
+/// here regardless via `PROTECTED_DACL_SECURITY_INFORMATION`.
+pub fn set_path_dacl_from_sddl(
+    path: &str,
+    sddl: &str,
+    label: &str,
+) -> Result<()> {
+    use windows::Win32::Security::GetSecurityDescriptorDacl;
+    let sd = crate::util::OwnedSd::from_sddl(sddl)
+        .with_context(|| format!("{label}: build SD from SDDL"))?;
+    let mut present = windows::core::BOOL::from(false);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = windows::core::BOOL::from(false);
+    unsafe {
+        GetSecurityDescriptorDacl(
+            sd.ptr, &mut present, &mut dacl, &mut defaulted,
+        )
+        .with_context(|| format!("{label}: GetSecurityDescriptorDacl"))?;
+    }
+    if !present.as_bool() || dacl.is_null() {
+        bail!("{label}: SDDL '{sddl}' yielded no DACL");
+    }
+    write_file_dacl(path, dacl, Protection::Protected)
+        .context(label.to_owned())
+}
+
+// ─── Additive grants (working-tree access for the sandbox user) ─────
+//
+// Under the separate-user model the sandbox user has NO inherent
+// rights on real-user-owned files. `acl grant` adds an inheritable
+// ALLOW ACE for the sandbox user's SID on a path (typically the
+// working-tree root) so the child can read/write there; `acl stamp
+// --sandbox-user-sid` adds an explicit DENY ACE on a path (and a
+// `(OI)(CI)` `FILE_DELETE_CHILD` DENY on its parent) so the child
+// can NOT read/write/delete it even when an inherited
+// `BUILTIN\Users` ACE would otherwise allow. Both are ADDITIVE
+// (the path keeps its own explicit ACEs and inheritance);
+// revoke/restore drops the SID's ACEs by walk-and-filter, not a
+// full-SD restore.
+
+/// Per-grant access level. `Modify` is [`Mask::MODIFY_NO_FDC`] (the
+/// working-tree grant — read/write/create/delete-own but NOT
+/// `FILE_DELETE_CHILD`, so a denied file inside the granted tree
+/// cannot be deleted via parent-FDC even where the only sb-user
+/// access comes from this grant). `ReadOnly` is
+/// [`Mask::FILE_READ_EXEC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantMask {
+    ReadOnly,
+    Modify,
+}
+
+/// Per-deny mask. `ReadDeny` denies everything; `WriteDeny` leaves
+/// read+execute. The bits are the *denied* rights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyMask {
+    WriteDeny,
+    ReadDeny,
+}
+
+/// One explicit ACE the sandbox user holds on a path. The
+/// separate-user FS model is entirely additive: `acl grant` adds
+/// ALLOW ACEs, `acl stamp --sandbox-user-sid` adds DENY ACEs (plus
+/// a `(OI)(CI)` `FILE_DELETE_CHILD` DENY on the parent). Restore
+/// drops the SID's ACEs via walk-and-filter — no PROTECTED rewrite,
+/// no SD snapshot, no calibration. The same-user model still uses
+/// [`PrebuiltDacls`]; the two paths share nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbAce {
+    Grant(GrantMask),
+    Deny(DenyMask),
+    /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
+    /// of every denied target so the sandbox user cannot `del`/`ren`
+    /// it via parent-FDC even when the parent carries an inherited
+    /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
+    /// would otherwise pick up).
+    DenyFdc,
+}
+
+impl GrantMask {
+    fn bits(self) -> u32 {
+        match self {
+            GrantMask::ReadOnly => Mask::FILE_READ_EXEC.bits(),
+            GrantMask::Modify => Mask::MODIFY_NO_FDC.bits(),
+        }
+    }
+}
+
+impl DenyMask {
+    fn bits(self) -> u32 {
+        match self {
+            DenyMask::ReadDeny => Mask::FILE_ALL.bits(),
+            DenyMask::WriteDeny => Mask::FILE_GENERIC_WRITE
+                .with(Mask::DELETE)
+                .with(Mask::FILE_WRITE_ATTRIBUTES)
+                .bits(),
+        }
+    }
+}
+
+impl SbAce {
+    /// `'grant' | 'deny' | 'deny_fdc'` — the row's `kind` column.
+    pub fn kind(self) -> &'static str {
+        match self {
+            SbAce::Grant(_) => "grant",
+            SbAce::Deny(_) => "deny",
+            SbAce::DenyFdc => "deny_fdc",
+        }
+    }
+    /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
+    /// row's `mask` / holder's `want_mask` column. Round-trips via
+    /// [`SbAce::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SbAce::Grant(GrantMask::ReadOnly) => "read",
+            SbAce::Grant(GrantMask::Modify) => "modify",
+            SbAce::Deny(DenyMask::ReadDeny) => "denyRead",
+            SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
+            SbAce::DenyFdc => "fdc",
+        }
+    }
+    pub fn parse(kind: &str, mask: &str) -> Result<Self> {
+        Ok(match (kind, mask) {
+            ("grant", "read") => SbAce::Grant(GrantMask::ReadOnly),
+            ("grant", "modify") => SbAce::Grant(GrantMask::Modify),
+            ("deny", "denyRead") => SbAce::Deny(DenyMask::ReadDeny),
+            ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
+            ("deny_fdc", _) => SbAce::DenyFdc,
+            (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
+        })
+    }
+    /// Widening within one kind: `Modify ⊃ ReadOnly`, `ReadDeny ⊃
+    /// WriteDeny`, `DenyFdc` is unit. Cross-kind is meaningless (a
+    /// path can hold one `Grant` row AND one `Deny` row; never
+    /// merged).
+    pub fn max(self, other: Self) -> Self {
+        use DenyMask::ReadDeny as Dr;
+        use GrantMask::Modify as Gm;
+        match (self, other) {
+            (SbAce::Grant(Gm), _) | (_, SbAce::Grant(Gm)) => {
+                SbAce::Grant(Gm)
+            }
+            (SbAce::Grant(_), _) | (_, SbAce::Grant(_)) => self,
+            (SbAce::Deny(Dr), _) | (_, SbAce::Deny(Dr)) => SbAce::Deny(Dr),
+            _ => self,
+        }
+    }
+}
+
+/// What [`apply_sandbox_aces`] should converge a path to: at most one
+/// ALLOW ACE, one DENY ACE, and one parent-FDC DENY for the sandbox
+/// user. State-DB recomputes this from the live holder rows on every
+/// change so cross-holder mask escalation/downgrade and the
+/// grant/deny-on-same-path interaction are handled in one place.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SbAceSet {
+    pub grant: Option<GrantMask>,
+    pub deny: Option<DenyMask>,
+    pub deny_fdc: bool,
+}
+
+impl SbAceSet {
+    /// The set's entries as [`NewAce`]s for `sid`, in canonical
+    /// deny → deny-fdc → allow order. All carry [`OICI`].
+    fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
+        let mut v = Vec::with_capacity(3);
+        if let Some(m) = self.deny {
+            v.push(NewAce::Deny(sid, m.bits(), OICI));
+        }
+        if self.deny_fdc {
+            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+        }
+        if let Some(m) = self.grant {
+            v.push(NewAce::Allow(sid, m.bits(), OICI));
+        }
+        v
+    }
+}
+
+/// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to
+/// exactly `set`. Idempotent — every existing explicit ACE for the
+/// SID (allow AND deny) is dropped, then `set`'s entries are
+/// prepended in canonical (deny-before-allow) order. Inherited ACEs
+/// are dropped too; `SetNamedSecurityInfoW` without `PROTECTED_`
+/// re-derives them from the parent.
+///
+/// `SetEntriesInAclW(REVOKE_ACCESS)` is NOT used: per MSDN it
+/// removes `ACCESS_ALLOWED_ACE`/`SYSTEM_AUDIT_ACE` for the trustee,
+/// not `ACCESS_DENIED_ACE` — so a prior `Deny`/`DenyFdc` ACE would
+/// survive. `SET_ACCESS` discards all but adds a new ALLOW ACE,
+/// which is wrong when `set` is empty. So we walk + filter
+/// manually.
+///
+/// Both grant and deny carry `(OI)(CI)` so directory targets cover
+/// the subtree; on a file the inheritance flags are inert.
+pub fn apply_sandbox_aces(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+) -> Result<()> {
+    let sid = LocalPsid::from_string(sandbox_sid)
+        .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+    let sid_bytes = sid.as_bytes();
+    // 1. Read the current DACL. `_sd` owns the buffer `old`/`kept`
+    //    point into; it's freed after step 4's write.
+    let (_sd, old) = read_file_dacl(canonical_path)
+        .with_context(|| format!("recompose '{canonical_path}'"))?;
+    // 2. Collect surviving explicit ACEs (drop inherited and any
+    //    explicit ACE whose SID == sandbox_sid — allow AND deny).
+    let kept = filter_aces(old, |hdr, body| {
+        hdr.AceFlags & INHERITED_ACE == 0 && !ace_sid_is(body, sid_bytes)
+    })?;
+    // 3. Build fresh ACL: set's entries (deny-first canonical order)
+    //    then surviving explicit ACEs.
+    let new = rebuild_acl(kept.src_rev, &set.head_aces(sid.as_psid()), &kept, &[])?;
+    // 4. Write back. UNPROTECTED so the kernel re-derives inherited
+    //    ACEs from the parent.
+    write_file_dacl(canonical_path, new.as_ptr(), Protection::Unprotected)
+        .with_context(|| format!("recompose '{canonical_path}'"))
 }
 
 /// Build + apply the parent allow-list (DACL+marker, `PROTECTED`).
@@ -1162,188 +1454,6 @@ pub fn build_init_mutex_sa(group_sid: &str) -> Result<OwnedSa> {
     .into_security_attributes()
 }
 
-/// Immediate parent of a `\\?\…` canonical path, as a string.
-/// Returns `None` when there is no stampable parent (the path
-/// is a root, or its immediate parent is a root — stamping a
-/// volume root would propagate the allow-list across the drive).
-pub fn canonical_parent_of(canonical_path: &str) -> Option<String> {
-    std::path::Path::new(canonical_path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty() && p.parent().is_some())
-        .map(|p| p.display().to_string())
-}
-
-// ─── File identity (FILE_ID_INFO) ───────────────────────────────────
-
-/// A file's stable identity on a volume — the
-/// `(VolumeSerialNumber, FileId128)` pair from `FILE_ID_INFO`. On
-/// NTFS this is the MFT record identity, so it survives rename
-/// and lets us both VALIDATE at restore time (the path still
-/// resolves to the same file we stamped) and LOCATE a relocated
-/// file for reporting. Stored as a 24-byte blob (8 + 16).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileId {
-    pub volume_serial: u64,
-    pub id128: [u8; 16],
-}
-
-impl FileId {
-    pub fn as_bytes(&self) -> [u8; 24] {
-        let mut out = [0u8; 24];
-        out[..8].copy_from_slice(&self.volume_serial.to_le_bytes());
-        out[8..].copy_from_slice(&self.id128);
-        out
-    }
-    pub fn from_bytes(b: &[u8]) -> Result<Self> {
-        if b.len() != 24 {
-            bail!("FileId::from_bytes: expected 24 bytes, got {}", b.len());
-        }
-        let mut vs = [0u8; 8];
-        vs.copy_from_slice(&b[..8]);
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&b[8..]);
-        Ok(Self { volume_serial: u64::from_le_bytes(vs), id128: id })
-    }
-    pub fn to_hex(&self) -> String {
-        let b = self.as_bytes();
-        let mut s = String::with_capacity(48);
-        for x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
-    }
-}
-
-/// `FILE_ID_INFO` of an already-open handle.
-fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
-    use windows::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
-    };
-    let mut info = FILE_ID_INFO::default();
-    unsafe {
-        GetFileInformationByHandleEx(
-            h,
-            FileIdInfo,
-            (&mut info as *mut FILE_ID_INFO).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    }
-    .context("GetFileInformationByHandleEx(FileIdInfo)")?;
-    Ok(FileId {
-        volume_serial: info.VolumeSerialNumber,
-        id128: info.FileId.Identifier,
-    })
-}
-
-/// `(file_id, NumberOfLinks)` from ONE metadata open (both are
-/// `GetFileInformationByHandleEx` queries on the same handle).
-/// `links > 1` means an alternate hardlink name exists, possibly
-/// under an unstamped parent directory — so the parent allow-list
-/// alone cannot fence delete/rename via that other name; callers
-/// route such files to the per-exec handle fence.
-pub fn capture_id_and_links(
-    canonical_path: &str,
-) -> Result<(FileId, u32)> {
-    use windows::Win32::Storage::FileSystem::{
-        FileStandardInfo, GetFileInformationByHandleEx,
-        FILE_STANDARD_INFO,
-    };
-    let h = open_for_metadata(canonical_path).with_context(|| {
-        format!("open '{canonical_path}' for file_id+links")
-    })?;
-    let id = file_id_from_handle(h.raw())
-        .with_context(|| format!("file_id '{canonical_path}'"))?;
-    let mut std_info = FILE_STANDARD_INFO::default();
-    unsafe {
-        GetFileInformationByHandleEx(
-            h.raw(),
-            FileStandardInfo,
-            (&mut std_info as *mut FILE_STANDARD_INFO).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "GetFileInformationByHandleEx(FileStandardInfo) \
-             '{canonical_path}'"
-        )
-    })?;
-    Ok((id, std_info.NumberOfLinks))
-}
-
-/// `FILE_ID_INFO` of `canonical_path`. Opens with no data access
-/// (identity query only), so a broker-only DACL on the file does
-/// not interfere.
-pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
-    let h = open_for_metadata(canonical_path).with_context(|| {
-        format!("open '{canonical_path}' for file_id")
-    })?;
-    file_id_from_handle(h.raw())
-        .with_context(|| format!("file_id '{canonical_path}'"))
-}
-
-/// Best-effort: locate the CURRENT path of a file by its captured
-/// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
-/// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`. Returns `None` if the file was
-/// deleted or the open fails for any reason. Used ONLY for
-/// reporting `movedTo` — restore is path-anchored and never
-/// relocates by inode (chasing the file by ID to remove its stamp
-/// would re-expose a relocated secret).
-pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
-    use windows::Win32::Storage::FileSystem::{
-        OpenFileById, ExtendedFileIdType, FILE_ID_128,
-        FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
-    };
-    // Open the volume root the file lived on. We need a handle ON
-    // the volume to anchor OpenFileById; the captured volume
-    // serial doesn't directly map to a drive letter, so try each
-    // mounted local drive and match the serial — keeping the
-    // locate volume-keyed (a moved file may not be on the drive
-    // its canonical_path was recorded under).
-    for drive in b'A'..=b'Z' {
-        let root = format!(r"\\?\{}:\", drive as char);
-        let vh = match open_for_metadata(&root) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        // Match the volume by reading FILE_ID_INFO of the root.
-        match file_id_from_handle(vh.raw()) {
-            Ok(id) if id.volume_serial == file_id.volume_serial => {}
-            _ => continue,
-        }
-        let desc = FILE_ID_DESCRIPTOR {
-            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
-            Type: ExtendedFileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 {
-                ExtendedFileId: FILE_ID_128 {
-                    Identifier: file_id.id128,
-                },
-            },
-        };
-        // dwDesiredAccess = 0: GetFinalPathNameByHandleW needs only
-        // a valid handle, not read-data, so a relocated file whose
-        // DACL no longer grants the broker read still resolves.
-        let fh = match unsafe {
-            OpenFileById(
-                vh.raw(),
-                &desc,
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                FILE_FLAG_BACKUP_SEMANTICS,
-            )
-        } {
-            Ok(h) => OwnedHandle(h),
-            Err(_) => return None,
-        };
-        let buf = final_path_from_handle(fh.raw()).ok()?;
-        let s = String::from_utf16_lossy(&buf);
-        return utf16_roundtrips(&buf, &s).then_some(s);
-    }
-    None
-}
-
 const INHERITED_ACE: u8 = 0x10;
 
 /// Build a fresh ACL containing only the EXPLICIT (non-`INHERITED_ACE`)
@@ -1353,58 +1463,15 @@ const INHERITED_ACE: u8 = 0x10;
 /// inherited ACEs. If `src` is purely inherited the result is an
 /// empty ACL ("no explicit DACL").
 unsafe fn build_explicit_only_acl(src: *mut ACL) -> Result<Vec<u8>> {
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // Preserve the source's AclRevision: AddAce requires
-    // ACL_REVISION_DS (4) when copying object-type ACEs, and the
-    // resulting ACL must carry the same revision as its ACEs or
-    // RtlValidAcl rejects it under SetNamedSecurityInfoW.
-    let src_rev = ACE_REVISION(unsafe { (*src).AclRevision } as u32);
-    unsafe {
-        GetAclInformation(
-            src,
-            &mut info as *mut _ as *mut c_void,
-            size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-        .context("GetAclInformation(src)")?;
-    }
-    // Collect explicit ACEs (pointer + byte size).
-    let mut explicit: Vec<(*const c_void, u16)> = Vec::new();
-    let mut total = size_of::<ACL>();
-    for i in 0..info.AceCount {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        unsafe { GetAce(src, i, &mut ace) }
-            .map_err(|e| anyhow!("GetAce({i}): {e}"))?;
-        if ace.is_null() {
-            bail!("GetAce({i}) returned null");
-        }
-        let hdr = ace as *const ACE_HEADER;
-        let flags = unsafe { (*hdr).AceFlags };
-        if flags & INHERITED_ACE != 0 {
-            continue; // skip inherited; kernel re-adds them
-        }
-        let sz = unsafe { (*hdr).AceSize };
-        explicit.push((ace as *const c_void, sz));
-        total += sz as usize;
-    }
-    total = (total + 3) & !3; // DWORD-align
-    let mut buf = vec![0u8; total];
-    let acl = buf.as_mut_ptr() as *mut ACL;
-    unsafe {
-        InitializeAcl(acl, total as u32, src_rev)
-            .context("InitializeAcl(explicit-only)")?;
-        for (ace, sz) in explicit {
-            // u32::MAX appends; copy the raw ACE bytes verbatim.
-            AddAce(acl, src_rev, u32::MAX, ace, sz as u32)
-                .context("AddAce(explicit)")?;
-        }
-    }
-    Ok(buf)
+    let kept =
+        filter_aces(src, |hdr, _| hdr.AceFlags & INHERITED_ACE == 0)?;
+    Ok(rebuild_acl(kept.src_rev, &[], &kept, &[])?.buf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_id::canonicalize_path;
 
     fn ace_count(d: &BuiltAcl) -> u16 {
         // ACL.AceCount is bytes 4–5 (LE u16).
@@ -1442,7 +1509,7 @@ mod tests {
         .unwrap();
         // 4 broker ACEs + 1 marker.
         assert_eq!(ace_count(&d), 5);
-        let aces = unsafe { walk_aces(d.as_ptr()) }.unwrap();
+        let aces = walk_aces(d.as_ptr()).unwrap();
         let m: Vec<_> =
             aces.iter().filter_map(AceView::marker_hash).collect();
         assert_eq!(m, vec![h], "marker hash not recovered");
@@ -1533,6 +1600,28 @@ mod tests {
         );
     }
 
+    /// IsolatedDesk's `[broker, sb, SY]:GA` DACL — 3 ACEs,
+    /// revision 2, GENERIC_ALL on each. Regression for the
+    /// `KeptAces`/`rebuild_acl` chokepoint: a sizing or revision
+    /// bug here breaks the SandboxUser desktop attach (R1 hang).
+    #[test]
+    fn isolated_desk_dacl_shape() {
+        let d = build_allow_dacl(&[
+            Allow("S-1-5-21-1-2-3-1000", Mask::GENERIC_ALL, NO_INHERIT),
+            Allow("S-1-5-21-1-2-3-1004", Mask::GENERIC_ALL, NO_INHERIT),
+            Allow(SID_SYSTEM,            Mask::GENERIC_ALL, NO_INHERIT),
+        ])
+        .unwrap();
+        assert_eq!(d.buf[0], 2, "AclRevision");
+        assert_eq!(ace_count(&d), 3);
+        let aces = walk_aces(d.as_ptr()).unwrap();
+        for a in &aces {
+            assert_eq!(a.ace_type, 0, "ACCESS_ALLOWED_ACE_TYPE");
+            assert_eq!(a.mask, Mask::GENERIC_ALL.bits());
+            assert_eq!(a.ace_flags, 0);
+        }
+    }
+
     #[test]
     fn build_allow_dacl_dedup() {
         // Same SID twice (case-insensitive) → 1 ACE; first wins.
@@ -1565,81 +1654,6 @@ mod tests {
             assert_eq!(AclMask::parse(m.as_str()).unwrap(), m);
         }
         assert!(AclMask::parse("nope").is_err());
-    }
-
-    #[test]
-    fn canonicalize_rejects_globs() {
-        for p in ["C:\\foo\\*.txt", "C:\\foo\\bar?.txt"] {
-            assert!(
-                matches!(canonicalize_path(p), Err(CanonError::Glob)),
-                "{p}"
-            );
-        }
-        assert!(matches!(
-            canonicalize_path(r"C:\srt-win-no-such-path"),
-            Err(CanonError::Other(_))
-        ));
-    }
-
-    #[test]
-    fn canonicalize_round_trip_self() {
-        // The test binary's own path is a real file we definitely
-        // can open.
-        let exe = std::env::current_exe().unwrap();
-        let (canon, is_dir) =
-            canonicalize_path(&exe.display().to_string()).unwrap();
-        assert!(canon.starts_with(r"\\?\"), "got {canon}");
-        assert!(!is_dir);
-        // Round-trip: canonicalizing the canonical path is a no-op.
-        let (again, _) = canonicalize_path(&canon).unwrap();
-        assert_eq!(canon, again);
-    }
-
-    /// The parent of a file directly under a drive root IS the
-    /// volume root. Stamping a volume root with the PROTECTED
-    /// inherit-to-children allow-list DACL would re-propagate
-    /// across every file on the drive — so `canonical_parent_of`
-    /// must return `None` for a top-level child, routing it to
-    /// the handle-fence fallback instead. Rust's `Path::parent()`
-    /// returns the root (not `None`) in this case, so the helper
-    /// has to recognize and reject it.
-    #[test]
-    fn parent_at_volume_root_is_not_stampable() {
-        for p in [
-            r"\\?\C:\foo.txt",
-            r"\\?\C:\ProgramData",
-            r"\\?\D:\x",
-        ] {
-            assert_eq!(
-                canonical_parent_of(p),
-                None,
-                "would stamp the volume root for top-level child {p:?}: \
-                 got {:?}",
-                canonical_parent_of(p),
-            );
-        }
-        // Anchors (already pass today, must keep passing):
-        // the root itself has no parent; a nested path's parent
-        // is the immediate directory.
-        assert_eq!(canonical_parent_of(r"\\?\C:\"), None);
-        assert_eq!(
-            canonical_parent_of(r"\\?\C:\a\b").as_deref(),
-            Some(r"\\?\C:\a"),
-        );
-    }
-
-    #[test]
-    fn lossy_canonical_path_detected() {
-        // Lone high surrogate → from_utf16_lossy substitutes
-        // U+FFFD, so the round-trip check must reject it.
-        let bad = [0x0041, 0xD800, 0x0042];
-        assert!(!utf16_roundtrips(&bad, &String::from_utf16_lossy(&bad)));
-        // A valid surrogate PAIR (U+1F600 = D83D DE00) and plain
-        // ASCII both round-trip.
-        let pair = [0x0041, 0xD83D, 0xDE00, 0x0042];
-        assert!(utf16_roundtrips(&pair, &String::from_utf16_lossy(&pair)));
-        let ok = [0x0041, 0x0042];
-        assert!(utf16_roundtrips(&ok, &String::from_utf16_lossy(&ok)));
     }
 
     #[test]

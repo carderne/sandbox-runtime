@@ -1,6 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  renameSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isWindows } from '../helpers/platform.js'
@@ -11,11 +21,15 @@ import {
   getSrtWinPath,
   getWindowsGroupStatus,
   getWindowsWfpStatus,
+  getWindowsSandboxUserStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
+  verifyWindowsWfpEgress,
   deleteWindowsGroup,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
+  restoreWindowsAcl,
+  expandWindowsFsDenyPaths,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -32,7 +46,7 @@ import {
  * sandbox state on the same machine.
  *
  * Real end-to-end (the actual fence) is also covered by
- * `vendor/srt-win/ci/smoke-exec.ps1` which runs before this file in
+ * `vendor/srt-win-src/ci/smoke-exec.ps1` which runs before this file in
  * CI; this suite proves the TS layer wires correctly on top.
  */
 
@@ -79,6 +93,7 @@ function createTestConfig(
       groupSid: ADMINS_SID,
       wfpSublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
+      asSandboxUser: false,
     },
   }
 }
@@ -231,6 +246,35 @@ async function bindOutOfRange(): Promise<BoundListener> {
   )
 }
 
+// Pure-JS object test — runs on all platforms (the Windows env
+// case-insensitivity bug is in the plain-object scrub, not in any
+// Windows API). SRT_WIN_PATH is pointed at any existing file so
+// getSrtWinPath() doesn't throw on non-Windows hosts.
+describe('wrapCommandWithSandboxWindows env scrub (pure, all platforms)', () => {
+  it('unsetEnvVars scrubs case-insensitively', () => {
+    const prevSrtWin = process.env.SRT_WIN_PATH
+    process.env.SRT_WIN_PATH = process.execPath
+    process.env.test_secret_lower = 'x'
+    try {
+      const { env } = wrapCommandWithSandboxWindows({
+        command: 'echo',
+        group: { groupName: 'g' },
+        unsetEnvVars: ['TEST_SECRET_LOWER'],
+      })
+      // No casing of the name should survive.
+      for (const k of Object.keys(env)) {
+        expect(k.toUpperCase()).not.toBe('TEST_SECRET_LOWER')
+      }
+      expect(env.test_secret_lower).toBeUndefined()
+      expect(env.TEST_SECRET_LOWER).toBeUndefined()
+    } finally {
+      delete process.env.test_secret_lower
+      if (prevSrtWin === undefined) delete process.env.SRT_WIN_PATH
+      else process.env.SRT_WIN_PATH = prevSrtWin
+    }
+  })
+})
+
 describe('parseWindowsBinShell (pure, all platforms)', () => {
   it('maps tokens/paths and rejects the rest', () => {
     expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
@@ -297,27 +341,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
   })
 
-  it('wrapCommandWithSandboxWindows: sublayerGuid lands on the exec argv', () => {
-    const sl = '11111111-2222-3333-4444-555555555555'
-    const { argv } = wrapCommandWithSandboxWindows({
-      command: 'exit 0',
-      group: { groupSid: ADMINS_SID },
-      sublayerGuid: sl,
-    })
-    // `srt-win exec` refuses to launch when no WFP filter set is
-    // installed under this sublayer (fail-closed network fence).
-    const i = argv.indexOf('--sublayer-guid')
-    expect(i).toBeGreaterThan(0)
-    expect(argv[i + 1]).toBe(sl)
-    expect(i).toBeLessThan(argv.indexOf('--'))
-    // Omitted → no flag (srt-win checks its compile-time default).
-    const { argv: noSl } = wrapCommandWithSandboxWindows({
-      command: 'exit 0',
-      group: { groupSid: ADMINS_SID },
-    })
-    expect(noSl).not.toContain('--sublayer-guid')
-  })
-
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
     const ws = getWindowsWfpStatus({
       sublayerGuid: '11111111-2222-3333-4444-555555555555',
@@ -329,11 +352,46 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('initialize() throws with install instructions when group is absent', async () => {
     const cfg = createTestConfig()
     cfg.windows!.groupSid = 'S-1-5-32-9999' // valid form, definitely absent
-    expect(SandboxManager.initialize(cfg)).rejects.toThrow(
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(SandboxManager.initialize(cfg)).rejects.toThrow(
       /one-time install.*npx sandbox-runtime windows-install/is,
     )
     await SandboxManager.reset()
   })
+
+  // The non-elevated readiness check that initialize() runs.
+  // Hermetic sublayer + full-uninstall in finally so the
+  // round-trips test below starts from an unprovisioned state.
+  it('verifyWindowsWfpEgress: blocked after install; throws after uninstall --keep-user', async () => {
+    const sl = '6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60'
+    installWindowsSandbox({
+      groupSid: ADMINS_SID,
+      sublayerGuid: sl,
+      proxyPortRange: PORT_RANGE,
+    })
+    try {
+      // Fence active: WFP block-user filter fires at
+      // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
+      // probe binds a local out-of-range loopback listener; no
+      // external host involved.
+      const v = await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+      expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
+      // Filters removed, sandbox user kept → fence inactive →
+      // throws. This is the throw initialize() relays when a stale
+      // install (user provisioned, filters since removed) would
+      // otherwise run every exec with full egress. The regex
+      // matches both the exit-3 (`is not active`) and exit-2
+      // (`could not be verified`) messages — either is correct
+      // fail-closed behaviour.
+      uninstallWindowsSandbox({ sublayerGuid: sl, keepUser: true })
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(
+        verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE }),
+      ).rejects.toThrow(/WFP egress fence/i)
+    } finally {
+      uninstallWindowsSandbox({ sublayerGuid: sl })
+    }
+  }, 60_000)
 
   it('installWindowsSandbox round-trips group + wfp under a fresh sublayer', () => {
     // Use a unique group name + sublayer so this test is hermetic.
@@ -356,6 +414,18 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.group.sid).toMatch(/^S-1-5-/)
       expect(r.wfp.state).toBe('installed')
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
+      // Sandbox user provisioned alongside the group + WFP.
+      expect(r.user.provisioned).toBe(true)
+      expect(r.user.sid).toMatch(/^S-1-5-21-/)
+      expect(r.user.groupExists).toBe(true)
+      expect(r.user.inBuiltinUsers).toBe(true)
+      expect(r.user.inSandboxGroup).toBe(true)
+      expect(r.user.credPresent).toBe(true)
+      expect(r.user.markerVersion).toBe(1)
+      // user-SID-keyed filter set present alongside the group set,
+      // tagged with the provisioned SID.
+      expect(r.wfp.userFilters).toBeGreaterThanOrEqual(4)
+      expect(r.wfp.userSid).toBe(r.user.sid)
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
         groupName: grp,
@@ -370,9 +440,15 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(u.cancelled).toBeUndefined()
       deleteWindowsGroup({ groupName: grp })
     }
-    // After uninstall+delete, both gone.
+    // After uninstall+delete, all three gone (group, WFP, sandbox
+    // user). Discriminator group needed explicit delete; sandbox
+    // user is removed by uninstall (no --keep-user).
     expect(getWindowsWfpStatus({ sublayerGuid: sl }).state).toBe('absent')
     expect(getWindowsGroupStatus({ groupName: grp }).state).toBe('absent')
+    const u = getWindowsSandboxUserStatus()
+    expect(u.provisioned).toBe(false)
+    expect(u.credPresent).toBe(false)
+    expect(u.markerVersion).toBeUndefined()
   })
 
   it('installWindowsSandbox refuses different-config without force (exit 13)', () => {
@@ -461,8 +537,9 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     })
   })
 
-  it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', () => {
-    expect(SandboxManager.wrapWithSandbox('echo hi')).rejects.toThrow(
+  it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(SandboxManager.wrapWithSandbox('echo hi')).rejects.toThrow(
       /wrapWithSandboxArgv/,
     )
   })
@@ -479,18 +556,19 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(argv).not.toContain('--http-proxy')
     expect(argv).not.toContain('--socks-proxy')
 
-    // Standard proxy vars present and pointed at an in-range port.
+    // Standard proxy vars present and pointed at the in-range mux port.
+    // The mux serves both protocols on one port. ALL_PROXY is advertised
+    // as http:// (not socks5h://) so httpx-style clients don't try to
+    // import a SOCKS dependency; the mux still answers SOCKS on that port.
     const httpProxy = env.HTTP_PROXY ?? env.http_proxy
     const allProxy = env.ALL_PROXY ?? env.all_proxy
     expect(httpProxy).toMatch(/^http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^socks5h:\/\/.+:\d+$/)
+    expect(allProxy).toMatch(/^http:\/\/.+:\d+$/)
     const httpPort = Number(httpProxy!.split(':').pop())
     const socksPort = Number(allProxy!.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    expect(socksPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
-    expect(socksPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    expect(httpPort).not.toBe(socksPort)
+    expect(httpPort).toBe(socksPort)
 
     // The FULL set rides along, not just the standard trio — assert an
     // extra var from generateProxyEnvVars is present too.
@@ -1017,3 +1095,795 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(r.stdout).not.toMatch(/General failure/i)
   }, 20_000)
 })
+
+// ────────────────────────────────────────────────────────────────────
+// Group F — file deny (denyRead/denyWrite via srt-win acl)
+// ────────────────────────────────────────────────────────────────────
+//
+// End-to-end through SandboxManager: initialize() runs `srt-win acl
+// stamp`; wrapWithSandboxArgv() passes `--holder-pid` so exec
+// engages the per-exec dir/file fence; reset() runs `acl restore
+// --json`. The per-Rust-arm cases (A1-A25, H1-H9) are covered by
+// vendor/srt-win-src/ci/smoke-acl.ps1 — these rows prove the TS layer
+// wires correctly on top.
+
+/**
+ * Capture a file's effective DACL via icacls. The leading file
+ * path and the per-ACE `(I)` (INHERITED_ACE) flag are stripped:
+ * `(I)` is OS-managed inheritance metadata — a parent-DACL write
+ * (e.g. `srt-win`'s parent stamp+restore) re-evaluates inheritance
+ * for children and can flip an ACE between explicit and inherited
+ * with no change to who-can-do-what. Same noise class as
+ * SE_DACL_AUTO_INHERITED (which `acl::sd_equiv` already masks).
+ */
+function captureEffectiveDacl(p: string): string {
+  const r = spawnSync('icacls', [p], { encoding: 'utf8', timeout: 5_000 })
+  if (r.status !== 0) {
+    throw new Error(`icacls "${p}" exit ${r.status}: ${r.stderr || r.stdout}`)
+  }
+  return r.stdout
+    .replace(p, '')
+    .replace(/\(I\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function createFsTestConfig(
+  fs: Partial<SandboxRuntimeConfig['filesystem']>,
+): SandboxRuntimeConfig {
+  const base = createTestConfig()
+  return { ...base, filesystem: { ...base.filesystem, ...fs } }
+}
+
+describe.if(isWindows)('Windows sandbox: file deny', () => {
+  // One scratch dir per suite under the user's temp; the parent
+  // allow-list stamp lands on this dir. cleanup.ps1 runs `acl
+  // recover --force` after the suite, so a left-over stamp from a
+  // throw mid-test is mopped up.
+  let scratch: string
+  let secret: string // denyRead target
+  let cfg: string // denyWrite target
+
+  beforeAll(async () => {
+    scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
+    secret = join(scratch, 'secret.txt')
+    cfg = join(scratch, 'config.txt')
+    writeFileSync(secret, 'TOP-SECRET')
+    writeFileSync(cfg, 'CONFIG-V1')
+    // Glob targets (F6).
+    writeFileSync(join(scratch, 'a.env'), 'ENV-A')
+    writeFileSync(join(scratch, 'b.env'), 'ENV-B')
+    // F4 impostor.
+    writeFileSync(join(scratch, 'impostor.txt'), 'IMPOSTOR')
+
+    // Reuse the network describe's WFP install (already done in CI
+    // by smoke.ps1 or the network suite's beforeAll). If filters
+    // are absent, install them — same shape as the network suite.
+    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        groupSid: ADMINS_SID,
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+      })
+    }
+
+    await SandboxManager.initialize(
+      createFsTestConfig({ denyRead: [secret], denyWrite: [cfg] }),
+    )
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    // Best-effort scratch cleanup. If a stamp was left behind
+    // (relocated/missing/…), the per-run %LOCALAPPDATA% override in
+    // smoke-acl.ps1 doesn't apply here — but cleanup.ps1 runs
+    // `acl recover --force` after the suite.
+    try {
+      rmSync(scratch, { recursive: true, force: true })
+    } catch {
+      /* left-over stamps can block this; cleanup.ps1 handles it */
+    }
+  })
+
+  it('F1: denyRead — child cannot read the secret', async () => {
+    const r = await runSandboxed(`type "${secret}"`)
+    if (r.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F1: child read the denyRead target — exit=${r.status} ` +
+          `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    // cmd `type` exits non-zero on access-denied; assert on the
+    // CONTENT (the line above) plus exit≠0, not on the localised
+    // error string.
+    expect(r.status).not.toBe(0)
+  })
+
+  it('F2: denyWrite — child cannot write but CAN read', async () => {
+    const w = await runSandboxed(`echo POISONED>"${cfg}"`)
+    const after = readFileSync(cfg, 'utf8')
+    if (after !== 'CONFIG-V1') {
+      throw new Error(
+        `F2: denyWrite target was modified — content=${JSON.stringify(after)} ` +
+          `exit=${w.status} stderr=${JSON.stringify(w.stderr)}`,
+      )
+    }
+    // denyWrite leaves read open.
+    const r = await runSandboxed(`type "${cfg}"`)
+    expect(r.stdout.trim()).toBe('CONFIG-V1')
+  })
+
+  it('F3: child cannot delete the denyRead target (parent allow-list)', async () => {
+    // cmd `del` exit code is UNRELIABLE on sharing-violation /
+    // access-denied — gate on existence + content, not exit code.
+    await runSandboxed(`del /f /q "${secret}"`)
+    if (!existsSync(secret) || readFileSync(secret, 'utf8') !== 'TOP-SECRET') {
+      throw new Error(`F3: child deleted the denyRead target`)
+    }
+  })
+
+  it('F4: child cannot rename over the denyWrite target', async () => {
+    const impostor = join(scratch, 'impostor.txt')
+    await runSandboxed(`move /y "${impostor}" "${cfg}"`)
+    const after = readFileSync(cfg, 'utf8')
+    if (after !== 'CONFIG-V1') {
+      throw new Error(
+        `F4: rename-over succeeded — content=${JSON.stringify(after)}`,
+      )
+    }
+    // Impostor should still be at its original path.
+    expect(existsSync(impostor)).toBe(true)
+  })
+
+  it('F8: --holder-pid reaches exec (dir-fence diag in stderr)', async () => {
+    const r = await runSandboxed('echo F8')
+    // `srt-win exec --holder-pid` emits `dir fence: N/N dir(s)
+    // fenced` to stderr when it engages. With at least one stamped
+    // file, ≥1 parent dir + the state-DB dir are fenced.
+    if (!/dir fence:\s*\d+\/\d+\s*dir/i.test(r.stderr)) {
+      throw new Error(
+        `F8: no dir-fence diag — --holder-pid not received? ` +
+          `stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+  })
+
+  it('F6: glob denyRead — *.env all denied (point-in-time)', async () => {
+    // Re-init with a glob; the existing session must reset first.
+    await SandboxManager.reset()
+    const pattern = join(scratch, '*.env')
+    // Sanity: expansion finds both files and rejects nothing.
+    const expanded = expandWindowsFsDenyPaths([pattern])
+    expect(expanded.sort()).toEqual(
+      [join(scratch, 'a.env'), join(scratch, 'b.env')].sort(),
+    )
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [pattern] }))
+    for (const f of ['a.env', 'b.env']) {
+      const r = await runSandboxed(`type "${join(scratch, f)}"`)
+      if (/ENV-/.test(r.stdout)) {
+        throw new Error(
+          `F6: child read ${f} via glob denyRead — ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }
+  }, 30_000)
+
+  // F5 overlaps smoke-acl A9/A11 (the Rust-level DACL round-trip).
+  // Intentional defence-in-depth: those rows pin the srt-win
+  // behaviour; this row pins that SandboxManager calls into it
+  // correctly end-to-end (initialize→stamp, reset→restore).
+  it('F5: reset() restores a target to its pre-stamp effective DACL', async () => {
+    // The F6 session is active; reset it.
+    await SandboxManager.reset()
+    // Fresh subdir + fresh file → its parent has never been
+    // stamp-cycled by an earlier F-row, so the before/stamped/after
+    // capture is isolated from prior parent-restore inheritance
+    // re-evaluation on the suite-shared `scratch`.
+    const sub = mkdtempSync(join(scratch, 'f5-'))
+    const tgt = join(sub, 'f5.txt')
+    writeFileSync(tgt, 'F5')
+    const before = captureEffectiveDacl(tgt)
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [tgt] }))
+    const stamped = captureEffectiveDacl(tgt)
+    expect(stamped).not.toBe(before)
+    await SandboxManager.reset()
+    const after = captureEffectiveDacl(tgt)
+    if (after !== before) {
+      throw new Error(
+        `F5: post-reset effective DACL differs from pre-stamp.\n` +
+          `  before:  ${before}\n` +
+          `  stamped: ${stamped}\n` +
+          `  after:   ${after}`,
+      )
+    }
+  }, 30_000)
+
+  // F7 overlaps smoke-acl A19 (relocated → leftStamped at the
+  // Rust level). Intentional defence-in-depth at the
+  // SandboxManager↔srt-win integration boundary: smoke-acl pins
+  // the Rust behaviour; this row pins that the TS plumbing
+  // surfaces the same outcome.
+  it('F7: relocated file → restore reports relocated, stays stamped', async () => {
+    const reloc = join(scratch, 'reloc.txt')
+    const sub = join(scratch, 'moved')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(reloc, 'RELOC')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [reloc] }))
+    // Move from OUTSIDE the sandbox (the host does this; the
+    // protection model says a file moved by the host is no longer
+    // at its recorded path → restore must fail-closed).
+    const movedTo = join(sub, 'reloc.txt')
+    renameSync(reloc, movedTo)
+    // Call restore directly so we can inspect the per-path
+    // outcome (SandboxManager.reset() only logs it). This also
+    // releases the holder, so the reset() below has nothing
+    // left to restore.
+    const out = restoreWindowsAcl({
+      group: { groupSid: ADMINS_SID },
+    })
+    expect(out).toBeDefined()
+    const entry = out!.paths.find(e => e.path.endsWith('reloc.txt'))
+    if (!entry || entry.status !== 'relocated') {
+      throw new Error(
+        `F7: expected status=relocated, got ` + `${JSON.stringify(out!.paths)}`,
+      )
+    }
+    expect(entry.leftStamped).toBe(true)
+    expect(entry.movedTo).toMatch(/reloc\.txt$/i)
+    // The relocated file must still be read-denied (stamp travels
+    // with the inode). Stamp a fresh session so runSandboxed has a
+    // sandbox to run under, then probe.
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createFsTestConfig({}))
+    const r = await runSandboxed(`type "${movedTo}"`)
+    if (r.stdout.includes('RELOC')) {
+      throw new Error(
+        `F7: relocated file is readable after restore — stamp lost`,
+      )
+    }
+    // Cleanup: move it back so a later `acl recover` can clear it.
+    await SandboxManager.reset()
+    renameSync(movedTo, reloc)
+  }, 30_000)
+
+  it('F9: changing fs via reset+initialize takes effect', async () => {
+    const swap1 = join(scratch, 'swap1.txt')
+    const swap2 = join(scratch, 'swap2.txt')
+    writeFileSync(swap1, 'SWAP1')
+    writeFileSync(swap2, 'SWAP2')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap1] }))
+    expect((await runSandboxed(`type "${swap1}"`)).stdout).not.toMatch(/SWAP1/)
+    expect((await runSandboxed(`type "${swap2}"`)).stdout).toMatch(/SWAP2/)
+    // updateConfig with a different denyRead does NOT live-swap
+    // (it warns); reset+initialize is the contract.
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap2] }))
+    expect((await runSandboxed(`type "${swap1}"`)).stdout).toMatch(/SWAP1/)
+    expect((await runSandboxed(`type "${swap2}"`)).stdout).not.toMatch(/SWAP2/)
+    await SandboxManager.reset()
+  }, 30_000)
+
+  it('F10: filesystem.allowWrite throws on Windows (deny-only)', async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(
+      SandboxManager.initialize(createFsTestConfig({ allowWrite: [scratch] })),
+    ).rejects.toThrow(
+      /allowWrite is not supported on Windows without windows.asSandboxUser/,
+    )
+    await SandboxManager.reset()
+  })
+
+  it('F11: per-exec deny via customConfig — stamped, denied, restored', async () => {
+    // Session-level stamp on `secret` so we can assert it stays
+    // intact across the per-exec stamp/restore cycle.
+    writeFileSync(secret, 'TOP-SECRET')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
+    const cred = join(scratch, 'f11-cred.txt')
+    const fs2 = join(scratch, 'f11-fs.txt')
+    writeFileSync(cred, 'F11-CRED')
+    writeFileSync(fs2, 'F11-FS')
+    // Pre: broker can read both (not yet stamped).
+    expect(readFileSync(cred, 'utf8')).toBe('F11-CRED')
+    // (a) credentials.files[mode=deny] — the original throw-case.
+    const { argv: a1, env: e1 } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${cred}" & type "${secret}"`,
+      undefined,
+      { credentials: { files: [{ path: cred, mode: 'deny' }] } },
+    )
+    // The per-exec path made it onto the argv as a --deny-read
+    // flag; the session-level path (already stamped) did NOT.
+    expect(a1).toContain('--deny-read')
+    expect(a1[a1.indexOf('--deny-read') + 1]).toContain('f11-cred.txt')
+    expect(a1.filter(x => x === '--deny-read')).toHaveLength(1)
+    const r1 = await spawnAsync(a1[0], a1.slice(1), {
+      timeout: 30_000,
+      env: e1,
+    })
+    if (r1.stdout.includes('F11-CRED')) {
+      throw new Error(
+        `F11(a): child read the per-exec credential deny target — ` +
+          `stdout=${JSON.stringify(r1.stdout)} stderr=${JSON.stringify(r1.stderr)}`,
+      )
+    }
+    if (r1.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F11(a): child read the SESSION-level denyRead target — ` +
+          `session stamp lost during per-exec? ` +
+          `stderr=${JSON.stringify(r1.stderr)}`,
+      )
+    }
+    expect(r1.stderr).toMatch(/per-exec deny: holder_pid=\d+ → 1 path/)
+    // Post: per-exec stamp restored on child exit. The broker
+    // (this process) would read `cred` REGARDLESS (group enabled
+    // → matches the broker-only DACL), so prove restore via a
+    // SECOND sandboxed child with no per-exec deny — only true if
+    // the stamp was lifted.
+    const rR = await runSandboxed(`type "${cred}"`)
+    if (!rR.stdout.includes('F11-CRED')) {
+      throw new Error(
+        `F11(a): per-exec stamp NOT restored — fresh child still ` +
+          `denied. stdout=${JSON.stringify(rR.stdout)} ` +
+          `stderr=${JSON.stringify(rR.stderr)}`,
+      )
+    }
+    // Session-level stamp on `secret` survived: a fresh child
+    // (no per-exec deny) is still denied.
+    const rS = await runSandboxed(`type "${secret}"`)
+    if (rS.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F11(a): session-level stamp on '${secret}' was torn down ` +
+          `by the per-exec restore — refcount broken`,
+      )
+    }
+    // (b) filesystem.denyRead — same mechanism, different config
+    // key. Include the session-stamped `secret` to assert the
+    // per-exec set is filtered against `windowsFsStampedSet` —
+    // only `fs2` should reach the argv.
+    const { argv: a2, env: e2 } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${fs2}"`,
+      undefined,
+      {
+        filesystem: { denyRead: [secret, fs2], allowWrite: [], denyWrite: [] },
+      },
+    )
+    const flags2 = a2.filter(x => x === '--deny-read')
+    if (flags2.length !== 1) {
+      throw new Error(
+        `F11(b): expected exactly one --deny-read (session-stamped ` +
+          `'${secret}' should be filtered out); got ${flags2.length}: ` +
+          JSON.stringify(a2),
+      )
+    }
+    expect(a2[a2.indexOf('--deny-read') + 1]).toContain('f11-fs.txt')
+    const r2 = await spawnAsync(a2[0], a2.slice(1), {
+      timeout: 30_000,
+      env: e2,
+    })
+    if (r2.stdout.includes('F11-FS')) {
+      throw new Error(
+        `F11(b): child read the per-exec filesystem.denyRead target — ` +
+          `stdout=${JSON.stringify(r2.stdout)} stderr=${JSON.stringify(r2.stderr)}`,
+      )
+    }
+    const rR2 = await runSandboxed(`type "${fs2}"`)
+    if (!rR2.stdout.includes('F11-FS')) {
+      throw new Error(
+        `F11(b): per-exec stamp NOT restored — fresh child still denied. ` +
+          `stderr=${JSON.stringify(rR2.stderr)}`,
+      )
+    }
+    await SandboxManager.reset()
+  }, 60_000)
+
+  it('F12: per-exec refuse-escalation — ReadDeny on a session-WriteDeny path fails the exec', async () => {
+    // Session holds `cfg` at WriteDeny. A per-exec ReadDeny on the
+    // same canonical path would escalate the on-disk mask; the
+    // per-exec restore would then see refcount>0 (session holder)
+    // and leave it ReadDeny for the rest of the session. The guard
+    // lives in srt-win's `ensure_stamped` (refuse_escalation) — NOT
+    // a TS string-compare — so canonical-path identity and
+    // concurrent holders are authoritative. The exec FAILS rather
+    // than silently stick the stricter mask.
+    writeFileSync(cfg, 'CONFIG-V1')
+    await SandboxManager.initialize(createFsTestConfig({ denyWrite: [cfg] }))
+    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+      `type "${cfg}"`,
+      undefined,
+      { filesystem: { denyRead: [cfg], allowWrite: [], denyWrite: [] } },
+    )
+    // The TS filter only drops same-or-stricter session matches;
+    // ReadDeny-on-WriteDeny is forwarded to srt-win.
+    expect(argv).toContain('--deny-read')
+    const r = await spawnAsync(argv[0], argv.slice(1), {
+      timeout: 30_000,
+      env,
+    })
+    if (r.status === 0) {
+      throw new Error(
+        `F12: exec succeeded — refuse-escalation guard did not fire. ` +
+          `stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    if (!/would escalate .* from WriteDeny to ReadDeny/.test(r.stderr)) {
+      throw new Error(
+        `F12: expected refuse-escalation error in stderr; got ` +
+          `status=${r.status} stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    // Mask was NOT escalated: a fresh child (no per-exec deny) can
+    // still read `cfg` (WriteDeny leaves read open). And the
+    // session WriteDeny stamp survived the failed batch's rollback.
+    const rR = await runSandboxed(`type "${cfg}"`)
+    if (!rR.stdout.includes('CONFIG-V1')) {
+      throw new Error(
+        `F12: child cannot read a WriteDeny-only file — mask was ` +
+          `escalated to ReadDeny despite refuse-escalation. ` +
+          `stderr=${JSON.stringify(rR.stderr)}`,
+      )
+    }
+    const rW = await runSandboxed(`echo POISON > "${cfg}"`)
+    if (readFileSync(cfg, 'utf8').includes('POISON')) {
+      throw new Error(
+        `F12: session WriteDeny stamp was torn down by the failed ` +
+          `per-exec batch's rollback. stderr=${JSON.stringify(rW.stderr)}`,
+      )
+    }
+    await SandboxManager.reset()
+  }, 60_000)
+
+  it('F13: per-exec deny self-registers — --holder-pid only when session stamped', async () => {
+    // Per-exec `--deny-*` stamps under the exec process's OWN
+    // pid (`std::process::id()`), not a flag-passed holder. The
+    // `--holder-pid` flag is the SESSION fence's holder and is
+    // independent — present iff this session ran `acl stamp`
+    // (windowsFsStampedSet set). Assert both halves so the two
+    // concerns can't be re-coupled.
+    await SandboxManager.reset()
+    const f13 = join(scratch, 'f13.txt')
+    writeFileSync(f13, 'F13')
+    // (a) No session-level fs deny → windowsFsStampedSet is
+    // undefined → no --holder-pid; per-exec deny still rides.
+    await SandboxManager.initialize(createFsTestConfig({}))
+    const { argv: aN } = await SandboxManager.wrapWithSandboxArgv(
+      'exit 0',
+      undefined,
+      { filesystem: { denyRead: [f13], allowWrite: [], denyWrite: [] } },
+    )
+    if (aN.includes('--holder-pid')) {
+      throw new Error(
+        `F13(a): --holder-pid present with no session stamp — ` +
+          `per-exec deny is not self-registering. argv=${JSON.stringify(aN)}`,
+      )
+    }
+    expect(aN).toContain('--deny-read')
+    await SandboxManager.reset()
+    // (b) Session-level stamp → --holder-pid present (session
+    // fence), independent of per-exec flags.
+    writeFileSync(secret, 'TOP-SECRET')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
+    const { argv: aS } = await SandboxManager.wrapWithSandboxArgv('exit 0')
+    if (!aS.includes('--holder-pid')) {
+      throw new Error(
+        `F13(b): --holder-pid absent despite session stamp — ` +
+          `session fence not engaged. argv=${JSON.stringify(aS)}`,
+      )
+    }
+    expect(aS[aS.indexOf('--holder-pid') + 1]).toBe(`${process.pid}`)
+    expect(aS).not.toContain('--deny-read')
+    await SandboxManager.reset()
+  }, 60_000)
+})
+
+// ────────────────────────────────────────────────────────────────────
+// Group H — --as-sandbox-user two-hop launch (separate-user path)
+//
+// H0 is a pure argv-shape assertion (runs on every platform). H1+ do
+// actual two-hop execs and are gated on
+// `SRT_WIN_AS_SANDBOX_USER=1`: they need the `srt-sandbox` account
+// provisioned, and the same-user E/B/C/D/F rows above must stay
+// green regardless of whether the separate-user path is enabled.
+// `vendor/srt-win-src/ci/smoke-exec.ps1` R1-R9b cover the two-hop
+// end-to-end on every CI run; this block proves the TS plumbing on
+// top once the path is enabled.
+// ────────────────────────────────────────────────────────────────────
+
+describe('Windows sandbox: --as-sandbox-user argv shape (pure, all platforms)', () => {
+  it('H0: asSandboxUser:true adds --as-sandbox-user before --, omits when false', () => {
+    const prev = process.env.SRT_WIN_PATH
+    process.env.SRT_WIN_PATH = process.execPath
+    try {
+      const on = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        group: { groupSid: ADMINS_SID },
+        asSandboxUser: true,
+        caCertPath: 'C:/ca.pem',
+        httpProxyPort: 60080,
+      })
+      expect(on.argv).toContain('--as-sandbox-user')
+      // CA trust is install-time, NEVER on the per-exec argv.
+      expect(on.argv).not.toContain('--ca-trust')
+      // Flags must precede `--` (clap stops parsing after it).
+      expect(on.argv.indexOf('--as-sandbox-user')).toBeLessThan(
+        on.argv.indexOf('--'),
+      )
+      // Two-hop overlay rides on --env: PATH + the single-sourced
+      // proxy set. Values follow each --env as KEY=VALUE.
+      const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
+      expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+      expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
+      // CA-bundle vars are NOT forwarded under asSandboxUser — the
+      // bundle lives in broker %TEMP%, unreadable by srt-sandbox.
+      // Schannel trust comes from `user trust-ca` instead.
+      expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(
+        false,
+      )
+      expect(envArgs.some(e => e.startsWith('SSL_CERT_FILE='))).toBe(false)
+      // Every --env must precede `--`.
+      expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
+      const off = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        group: { groupSid: ADMINS_SID },
+      })
+      expect(off.argv).not.toContain('--as-sandbox-user')
+      expect(off.argv).not.toContain('--env')
+    } finally {
+      if (prev === undefined) delete process.env.SRT_WIN_PATH
+      else process.env.SRT_WIN_PATH = prev
+    }
+  })
+})
+
+const asSandboxUserEnabled = process.env.SRT_WIN_AS_SANDBOX_USER === '1'
+
+describe.if(isWindows && asSandboxUserEnabled)(
+  'Windows sandbox: --as-sandbox-user two-hop (H-rows)',
+  () => {
+    let exe: string
+    let sbSid: string
+
+    beforeAll(() => {
+      exe = getSrtWinPath()
+      // Full install under the test sublayer — provisions
+      // srt-sandbox + cred + user-SID WFP filters. Idempotent.
+      const inst = spawnSync(
+        exe,
+        [
+          'install',
+          '--group-sid',
+          ADMINS_SID,
+          '--sublayer-guid',
+          TEST_SUBLAYER,
+          '--proxy-port-range',
+          `${PORT_RANGE[0]}-${PORT_RANGE[1]}`,
+        ],
+        { encoding: 'utf8' },
+      )
+      if (inst.status !== 0) {
+        throw new Error(`srt-win install failed: ${inst.stderr || inst.stdout}`)
+      }
+      const us = getWindowsSandboxUserStatus()
+      if (!us.provisioned || !us.sid || !us.credPresent) {
+        throw new Error(
+          `srt-sandbox not provisioned after install: ${JSON.stringify(us)}`,
+        )
+      }
+      sbSid = us.sid
+    })
+
+    afterAll(() => {
+      spawnSync(exe, ['uninstall', '--sublayer-guid', TEST_SUBLAYER], {
+        encoding: 'utf8',
+      })
+    })
+
+    async function rexec(tail: string) {
+      const { argv, env } = wrapCommandWithSandboxWindows({
+        command: tail,
+        group: { groupSid: ADMINS_SID },
+        asSandboxUser: true,
+      })
+      return spawnAsync(argv[0], argv.slice(1), {
+        env,
+        timeout: 60_000,
+      })
+    }
+
+    it('H1: child runs as srt-sandbox (different user SID)', async () => {
+      const r = await rexec('whoami /user /FO CSV /NH')
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain(sbSid)
+    }, 60_000)
+
+    it('H2: stdout marker pipes through runner to broker', async () => {
+      const r = await rexec('echo H2-STDOUT-MARK')
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain('H2-STDOUT-MARK')
+    }, 60_000)
+
+    it('H3: USERPROFILE isolated to srt-sandbox', async () => {
+      const r = await rexec('echo %USERPROFILE%')
+      expect(r.status).toBe(0)
+      expect(r.stdout.toLowerCase()).toContain('srt-sandbox')
+    }, 60_000)
+
+    it('H4: direct outbound blocked by F-USER-BLOCK', async () => {
+      const r = await rexec(
+        'set "HTTP_PROXY=" & set "HTTPS_PROXY=" & set "ALL_PROXY=" & ' +
+          'curl -sS -m 5 https://example.com',
+      )
+      // Exit-code only — see B/C convention: any non-zero is fenced.
+      expect(r.status).not.toBe(0)
+    }, 60_000)
+
+    // ── H5-H8: FS parity under asSandboxUser via SandboxManager ──
+    // The G-rows in smoke-exec.ps1 exercise the srt-win primitives
+    // directly; these check the SandboxManager.initialize() →
+    // grant + stamp → reset() → revoke + restore plumbing.
+    let hScratch: string
+    let hSecret: string
+    let hSibling: string
+
+    function createSbUserFsConfig(fs: FsOverrides): SandboxRuntimeConfig {
+      const base = createFsTestConfig(fs)
+      return { ...base, windows: { ...base.windows!, asSandboxUser: true } }
+    }
+
+    async function rexecSandboxed(cmd: string, fs: FsOverrides) {
+      await SandboxManager.initialize(createSbUserFsConfig(fs))
+      try {
+        const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
+        return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
+          env: wrapped.env,
+          timeout: 60_000,
+        })
+      } finally {
+        await SandboxManager.reset()
+      }
+    }
+
+    it('H5: allowWrite grants the working tree — child reads sibling', async () => {
+      hScratch = mkdtempSync(join(tmpdir(), 'srt-h-'))
+      hSecret = join(hScratch, 'secret.txt')
+      hSibling = join(hScratch, 'sibling.txt')
+      writeFileSync(hSecret, 'SECRET')
+      writeFileSync(hSibling, 'SIBLING')
+      const r = await rexecSandboxed(`type "${hSibling}"`, {
+        allowWrite: [hScratch],
+      })
+      if (r.status !== 0 || !r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H5: child read sibling under allowWrite tree failed — ` +
+            `exit=${r.status} stderr=${JSON.stringify(r.stderr)} ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H6: allowWrite + denyRead — secret denied, sibling readable', async () => {
+      const r = await rexecSandboxed(
+        `type "${hSecret}" & echo --SEP-- & type "${hSibling}"`,
+        { allowWrite: [hScratch], denyRead: [hSecret] },
+      )
+      if (r.stdout.includes('SECRET')) {
+        throw new Error(
+          `H6: child read the denyRead target under asSandboxUser — ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+      if (!r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H6: sibling unreadable post-stamp — ` +
+            `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H7: no allowWrite — child has no rights on real-user file', async () => {
+      const r = await rexecSandboxed(`type "${hSibling}"`, {})
+      if (r.status === 0 || r.stdout.includes('SIBLING')) {
+        throw new Error(
+          `H7: child read a real-user file with no grant — ` +
+            `exit=${r.status} stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
+      // Red→green for the per-exec/session-level glob asymmetry:
+      // before this PR a per-exec `glob-*.secret` reached
+      // `srt-win exec --deny-read` raw and `canonicalize_path`
+      // hard-failed; now `wrapWithSandboxArgv` routes it through
+      // `expandWindowsFsDenyPaths` (same chokepoint as session-
+      // level) so the child sees two concrete `--deny-read` paths.
+      const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
+      const a = join(dir, 'glob-a.secret')
+      const b = join(dir, 'glob-b.secret')
+      writeFileSync(a, 'GLOB-A')
+      writeFileSync(b, 'GLOB-B')
+      await SandboxManager.initialize(
+        createSbUserFsConfig({ allowWrite: [dir] }),
+      )
+      try {
+        const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+          `type "${a}" & echo --SEP-- & type "${b}"`,
+          undefined,
+          {
+            filesystem: {
+              denyRead: [join(dir, 'glob-*.secret')],
+              allowWrite: [],
+              denyWrite: [],
+            },
+          },
+        )
+        // Glob expanded TS-side: exactly two --deny-read flags;
+        // no glob char survives onto the argv (Rust would
+        // hard-fail otherwise).
+        const denyIdx = argv.flatMap((x, i) => (x === '--deny-read' ? [i] : []))
+        if (denyIdx.length !== 2) {
+          throw new Error(
+            `H-glob: expected 2 --deny-read flags after glob expand; ` +
+              `got ${denyIdx.length}: ${JSON.stringify(argv)}`,
+          )
+        }
+        for (const i of denyIdx) {
+          if (argv[i + 1].includes('*') || argv[i + 1].includes('?')) {
+            throw new Error(
+              `H-glob: glob char survived into --deny-read value ` +
+                `'${argv[i + 1]}' — per-exec expand not applied`,
+            )
+          }
+        }
+        const r = await spawnAsync(argv[0], argv.slice(1), {
+          env,
+          timeout: 60_000,
+        })
+        if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
+          throw new Error(
+            `H-glob: child read a glob-expanded deny target — ` +
+              `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+        // Per-exec restore: a fresh child (no customConfig) under
+        // the same session can read both — proves the per-exec
+        // stamp was lifted on child exit, not leaked onto disk.
+        const wf = await SandboxManager.wrapWithSandboxArgv(
+          `type "${a}" & type "${b}"`,
+        )
+        const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
+          env: wf.env,
+          timeout: 60_000,
+        })
+        if (!rR.stdout.includes('GLOB-A') || !rR.stdout.includes('GLOB-B')) {
+          throw new Error(
+            `H-glob: per-exec stamp NOT restored — fresh child still ` +
+              `denied. stdout=${JSON.stringify(rR.stdout)} ` +
+              `stderr=${JSON.stringify(rR.stderr)}`,
+          )
+        }
+      } finally {
+        await SandboxManager.reset()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 120_000)
+
+    it('H8: reset() revokes the grant — sandbox-user ACE gone', async () => {
+      // After H5/H6/H7's reset() calls, the root's DACL must NOT
+      // carry an explicit ACE for the sandbox user.
+      const out = spawnSync('icacls', [hScratch], {
+        encoding: 'utf8',
+        timeout: 5_000,
+      })
+      if (out.stdout.includes(sbSid) || out.stdout.includes('srt-sandbox')) {
+        throw new Error(
+          `H8: srt-sandbox ACE still on '${hScratch}' after reset(): ` +
+            out.stdout,
+        )
+      }
+      rmSync(hScratch, { recursive: true, force: true })
+    }, 30_000)
+  },
+)
+
+type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>

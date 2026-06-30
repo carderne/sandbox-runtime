@@ -14,9 +14,9 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW,
 };
 use windows::Win32::Security::{
-    EqualSid, GetTokenInformation, LookupAccountNameW, LookupAccountSidW,
-    PSID, SID_NAME_USE, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY,
-    TOKEN_USER,
+    EqualSid, GetLengthSid, GetTokenInformation, LookupAccountNameW,
+    LookupAccountSidW, PSID, SID_NAME_USE, TokenGroups, TokenUser,
+    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::SystemServices::{
     SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY,
@@ -45,6 +45,13 @@ impl LocalPsid {
     pub fn as_psid(&self) -> PSID {
         self.0
     }
+
+    /// The SID's binary form (`GetLengthSid` bytes at the PSID).
+    /// Borrow lives as long as `self`.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = unsafe { GetLengthSid(self.0) } as usize;
+        unsafe { std::slice::from_raw_parts(self.0 .0 as *const u8, len) }
+    }
 }
 
 impl Drop for LocalPsid {
@@ -55,6 +62,13 @@ impl Drop for LocalPsid {
             }
         }
     }
+}
+
+/// String SID → owned self-relative SID bytes. Cast `.as_ptr()` to
+/// `PSID` for Win32 calls; the buffer is the canonical wire form so
+/// byte-equality is SID-equality.
+pub fn sid_bytes(sid_str: &str) -> Result<Vec<u8>> {
+    Ok(LocalPsid::from_string(sid_str)?.as_bytes().to_vec())
 }
 
 /// Stringify a `PSID`. Used for serialisation and logging.
@@ -158,6 +172,48 @@ pub fn lookup_account_sid(name: &str) -> Result<String> {
         .map_err(|e| anyhow!("LookupAccountNameW({name}): {e}"))?;
         psid_to_string(PSID(sid_buf.as_mut_ptr() as *mut c_void))
     }
+}
+
+/// Reverse of [`lookup_account_sid`]: SID string → account name
+/// (without domain). Used to find the localised name of well-known
+/// groups (`BUILTIN\Users` is "Benutzer" on de-DE) so SAM calls
+/// that take a group *name* work on non-English Windows.
+pub fn lookup_account_name(sid_str: &str) -> Result<String> {
+    let psid = LocalPsid::from_string(sid_str)?;
+    let mut cch_name: u32 = 0;
+    let mut cch_dom: u32 = 0;
+    let mut use_: SID_NAME_USE = SID_NAME_USE::default();
+    unsafe {
+        let _ = LookupAccountSidW(
+            windows::core::PCWSTR::null(),
+            psid.as_psid(),
+            None,
+            &mut cch_name,
+            None,
+            &mut cch_dom,
+            &mut use_,
+        );
+    }
+    if cch_name == 0 {
+        return Err(anyhow!(
+            "LookupAccountSidW({sid_str}): sizing returned 0"
+        ));
+    }
+    let mut name = vec![0u16; cch_name as usize];
+    let mut dom = vec![0u16; cch_dom.max(1) as usize];
+    unsafe {
+        LookupAccountSidW(
+            windows::core::PCWSTR::null(),
+            psid.as_psid(),
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut cch_name,
+            Some(PWSTR(dom.as_mut_ptr())),
+            &mut cch_dom,
+            &mut use_,
+        )
+        .map_err(|e| anyhow!("LookupAccountSidW({sid_str}): {e}"))?;
+    }
+    Ok(String::from_utf16_lossy(&name[..cch_name as usize]))
 }
 
 /// String SID of the current process token's user.

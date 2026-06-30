@@ -7,7 +7,7 @@
   smoke.ps1 wrote one to $env:SRT_ALT_GUID.
 
   Usage:
-    pwsh vendor/srt-win/ci/cleanup.ps1 <path-to-srt-win.exe> [group-name]
+    pwsh vendor/srt-win-src/ci/cleanup.ps1 <path-to-srt-win.exe> [group-name]
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -44,8 +44,18 @@ if ($env:SRT_ALT_GUID) {
 # delete it here — harmless leftover state on an ephemeral runner.
 & $Exe wfp uninstall --sublayer-guid 8d2f1e91-4b3c-5a6e-af9d-2e3f4a5b6c7d
 & $Exe wfp uninstall --sublayer-guid 9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e
+# winsrt.test.ts verifyWindowsWfpEgress row.
+& $Exe wfp uninstall --sublayer-guid 6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60
 & $Exe group delete --name $GroupName
 & $Exe group delete --name "$GroupName-inst"
+# Sandbox user + credential/marker rows in state.db — `srt-win
+# install` provisions these; `uninstall` (no --keep-user) removes
+# them, so this only matters if smoke.ps1 threw mid-section.
+& $Exe uninstall --sublayer-guid $InstallSublayer
+Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
+Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
+Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
+  -Name srt-sandbox -ea SilentlyContinue
 # Restore any leaked ACL stamps (smoke-acl.ps1 mid-failure) and
 # clear orphaned snapshot rows. --force overwrites third-party
 # DACL edits — fine on an ephemeral runner.

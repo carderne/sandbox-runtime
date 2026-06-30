@@ -13,7 +13,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
-import type { SecureContext } from 'node:tls'
+import { rootCertificates, type SecureContext } from 'node:tls'
 import { logForDebugging } from '../utils/debug.js'
 import type { LeafCert } from './mitm-leaf.js'
 
@@ -22,6 +22,17 @@ const { pki, md, random, util } = forge
 export type MitmCA = {
   certPath: string
   keyPath: string
+  /**
+   * PEM bundle the sandboxed child's trust env vars point at: this CA
+   * followed by the host's regular roots (Node's bundled Mozilla store plus
+   * the parent's NODE_EXTRA_CA_CERTS, if any). Most of the per-tool vars
+   * (SSL_CERT_FILE, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, ...) REPLACE the
+   * tool's trust store rather than extend it, so pointing them at the CA
+   * alone would leave the child unable to verify any real certificate —
+   * which matters for connections SRT does not terminate
+   * (tlsTerminate.excludeDomains). Always lives in an SRT-owned temp dir.
+   */
+  trustBundlePath: string
   certPem: string
   keyPem: string
   /** Parsed CA certificate (issuer for minted leaf certs). */
@@ -63,16 +74,48 @@ export function createMitmCA(opts: {
   return generateEphemeralCA()
 }
 
-/** Remove the temp directory for an SRT-generated CA. No-op for user CAs. */
+/**
+ * Remove the SRT-owned temp directories for this CA: the trust-bundle dir
+ * always, and the cert/key dir too when SRT generated the CA (for an
+ * ephemeral CA they are the same directory). User-supplied CA files are
+ * left alone.
+ */
 export async function disposeMitmCA(ca: MitmCA): Promise<void> {
-  if (!ca.ephemeral) return
-  try {
-    await rm(dirname(ca.certPath), { recursive: true, force: true })
-  } catch (err) {
-    logForDebugging(`[mitm-ca] cleanup failed: ${(err as Error).message}`, {
-      level: 'warn',
-    })
+  const dirs = new Set([dirname(ca.trustBundlePath)])
+  if (ca.ephemeral) dirs.add(dirname(ca.certPath))
+  for (const dir of dirs) {
+    try {
+      await rm(dir, { recursive: true, force: true })
+    } catch (err) {
+      logForDebugging(`[mitm-ca] cleanup failed: ${(err as Error).message}`, {
+        level: 'warn',
+      })
+    }
   }
+}
+
+/**
+ * Write the child-facing trust bundle into `dir` and return its path: the
+ * MITM CA first, then the roots the host would normally trust, so HTTPS
+ * clients in the sandbox accept proxy-minted leaves AND can still verify the
+ * real certificate of any host SRT tunnels opaquely instead of terminating
+ * (tlsTerminate.excludeDomains). Bundling Node's root store is best-effort
+ * compatibility — a tool with its own CA file config is unaffected.
+ */
+function writeTrustBundle(dir: string, caCertPem: string): string {
+  const parts = [caCertPem.trim(), ...rootCertificates]
+  // Honour extra roots the parent process trusts (e.g. a corporate CA).
+  const extra = process.env.NODE_EXTRA_CA_CERTS
+  if (extra) {
+    try {
+      parts.push(readFileSync(extra, 'utf8').trim())
+    } catch {
+      // Missing/unreadable NODE_EXTRA_CA_CERTS: ignore, same as Node does.
+    }
+  }
+  const path = join(dir, 'trust-bundle.crt')
+  writeFileSync(path, parts.join('\n') + '\n', { mode: 0o644 })
+  return path
 }
 
 function loadCA(certPath: string, keyPath: string): MitmCA {
@@ -95,10 +138,16 @@ function loadCA(certPath: string, keyPath: string): MitmCA {
     throw new Error(`tlsTerminate.caKeyPath: CA key at ${keyPath} must be RSA`)
   }
 
+  // The CA files are the user's; the trust bundle still needs an SRT-owned
+  // directory of its own.
+  const bundleDir = mkdtempSync(join(tmpdir(), 'srt-ca-'))
+  const trustBundlePath = writeTrustBundle(bundleDir, certPem)
+
   logForDebugging(`[mitm-ca] loaded CA from ${certPath}`)
   return {
     certPath,
     keyPath,
+    trustBundlePath,
     certPem,
     keyPem,
     cert,
@@ -145,11 +194,13 @@ function generateEphemeralCA(): MitmCA {
   const keyPath = join(dir, 'ca.key')
   writeFileSync(certPath, certPem, { mode: 0o644 })
   writeFileSync(keyPath, keyPem, { mode: 0o600 })
+  const trustBundlePath = writeTrustBundle(dir, certPem)
 
   logForDebugging(`[mitm-ca] generated ephemeral CA at ${certPath}`)
   return {
     certPath,
     keyPath,
+    trustBundlePath,
     certPem,
     keyPem,
     cert,

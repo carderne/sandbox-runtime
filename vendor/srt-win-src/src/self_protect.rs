@@ -8,9 +8,9 @@
 //!   - `<group_sid>` — child has it deny-only
 //!   - SYSTEM (S-1-5-18) — child doesn't carry it
 //!   - BUILTIN\Admins — child has it deny-only
-//!   - OWNER RIGHTS = 0 — suppresses the owner's implicit
-//!     `READ_CONTROL|WRITE_DAC`, which would otherwise let the
-//!     child (same user = owner) `WRITE_DAC` the broker
+//!   - OWNER RIGHTS = `READ_CONTROL` — suppresses the owner's
+//!     implicit `WRITE_DAC`, which would otherwise let the child
+//!     (same user = owner) `WRITE_DAC` the broker
 //!
 //! `PROTECTED_DACL_SECURITY_INFORMATION` is required: without it
 //! the inherited "user has full access to their own process" ACE
@@ -38,35 +38,55 @@ use windows::Win32::System::Threading::{GetCurrentProcess, PROCESS_ALL_ACCESS};
 
 use crate::sid::LocalPsid;
 
-/// Owner-Rights well-known SID (`S-1-3-4`). An ALLOW ACE with mask 0
-/// on this SID overrides the implicit `READ_CONTROL|WRITE_DAC` that
-/// the object's owner otherwise gets.
+/// Owner-Rights well-known SID (`S-1-3-4`). An ALLOW ACE on this SID
+/// REPLACES the implicit `READ_CONTROL|WRITE_DAC` the object's owner
+/// otherwise gets. Mask is `READ_CONTROL` for consistency with
+/// [`crate::acl::Allow::OWNER_RIGHTS`]; mask-0 would also work here
+/// (this path uses kernel `SetSecurityInfo`, which doesn't drop
+/// mask-0 ACEs the way `SetNamedSecurityInfoW` does), but
+/// `READ_CONTROL` is the project convention.
 const SID_OWNER_RIGHTS: &str = "S-1-3-4";
+const READ_CONTROL: u32 = 0x0002_0000;
 const SID_SYSTEM: &str = "S-1-5-18";
 const SID_BUILTIN_ADMINS: &str = "S-1-5-32-544";
 
 /// Rewrite the current process's DACL to the broker-only pattern.
 /// Idempotent — safe to call once per `srt-win exec` invocation.
-pub fn install_broker_dacl(group_sid: &str) -> Result<()> {
+///
+/// `group_sid = None` is the runner path: the runner runs as the
+/// dedicated sandbox user (not a member of the discriminator group),
+/// so the group ACE is omitted and the DACL is just SYSTEM + Admins +
+/// `OWNER_RIGHTS:READ_CONTROL`. The runner's restricted-token child has Admins
+/// deny-only and lacks SYSTEM, so it cannot open the runner; the
+/// runner reaches itself via the `GetCurrentProcess()` pseudo-handle
+/// (which bypasses the DACL).
+pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
     // RAII over `ConvertStringSidToSidW` → freed via `LocalFree` on
     // drop.
-    let group = LocalPsid::from_string(group_sid)
-        .with_context(|| format!("parse group SID '{group_sid}'"))?;
+    let group = group_sid
+        .map(|s| {
+            LocalPsid::from_string(s)
+                .with_context(|| format!("parse group SID '{s}'"))
+        })
+        .transpose()?;
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
     let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
 
-    // (sid, mask) — first three get full access; OWNER_RIGHTS gets
-    // nothing. CI passes `group_sid == BUILTIN\Administrators`;
-    // dedup so we don't write a redundant ACE.
+    // (sid, mask) — SYSTEM/Admins/group get full access; OWNER_RIGHTS
+    // gets READ_CONTROL only. CI passes `group_sid ==
+    // BUILTIN\Administrators`; dedup so we don't write a redundant ACE.
     let mut aces: Vec<(windows::Win32::Security::PSID, u32)> = vec![
-        (group.as_psid(), PROCESS_ALL_ACCESS.0),
         (system.as_psid(), PROCESS_ALL_ACCESS.0),
     ];
-    if !group_sid.eq_ignore_ascii_case(SID_BUILTIN_ADMINS) {
+    if !matches!(group_sid, Some(s) if s.eq_ignore_ascii_case(SID_BUILTIN_ADMINS))
+    {
         aces.push((admins.as_psid(), PROCESS_ALL_ACCESS.0));
     }
-    aces.push((owner_rights.as_psid(), 0u32));
+    if let Some(g) = &group {
+        aces.push((g.as_psid(), PROCESS_ALL_ACCESS.0));
+    }
+    aces.push((owner_rights.as_psid(), READ_CONTROL));
 
     // ACL size = header + Σ(ACE fixed prefix + SID body). The fixed
     // prefix of an ACCESS_ALLOWED_ACE is 8 bytes (Header 4 + Mask 4);

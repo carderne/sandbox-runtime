@@ -10,9 +10,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   expandGlobPattern,
+  expandTilde,
   globToRegex,
 } from '../../src/sandbox/sandbox-utils.js'
-import { isLinux } from '../helpers/platform.js'
+import {
+  containsGlobCharsWin,
+  expandWindowsFsDenyPaths,
+  stripExtendedPathPrefix,
+} from '../../src/sandbox/windows-sandbox-utils.js'
+import { isLinux, isWindows } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
 
 /**
@@ -144,6 +150,107 @@ describe('expandGlobPattern', () => {
 
     expect(results).toContain(join(TEST_DIR, 'secrets.env'))
     expect(results).not.toContain(join(TEST_DIR, 'token.env'))
+  })
+
+  // Regression: `\` is a valid filename byte on POSIX, so the
+  // shared helper must NOT rewrite it to `/` outside Windows.
+  it.if(!isWindows)(
+    'should preserve literal backslash in POSIX path components',
+    () => {
+      const bsDir = join(RAW_TEST_DIR, 'app\\creds')
+      mkdirSync(bsDir, { recursive: true })
+      writeFileSync(join(bsDir, 'key.pem'), 'k')
+      const realBsDir = realPath(bsDir)
+
+      const results = expandGlobPattern(join(bsDir, '*.pem'))
+      expect(results).toContain(join(realBsDir, 'key.pem'))
+      // The directory `app\creds` must not be confused with `app/creds`.
+      expect(results.some(r => r.includes('/app/creds/'))).toBe(false)
+    },
+  )
+})
+
+// ============================================================================
+// expandTilde — `~\` form is Windows-only
+// ============================================================================
+
+describe('expandTilde', () => {
+  it.if(!isWindows)(
+    'should NOT expand `~\\` on POSIX (literal filename byte)',
+    () => {
+      // `~\foo` is a legal relative filename on Linux/macOS and
+      // must pass through untouched (it is later cwd-resolved).
+      expect(expandTilde('~\\backup')).toBe('~\\backup')
+      // `~/` and bare `~` still expand on every platform.
+      expect(expandTilde('~/x').startsWith('~')).toBe(false)
+      expect(expandTilde('~').startsWith('~')).toBe(false)
+    },
+  )
+
+  it.if(isWindows)('should expand `~\\` on Windows', () => {
+    expect(expandTilde('~\\x').startsWith('~')).toBe(false)
+  })
+})
+
+// ============================================================================
+// stripExtendedPathPrefix — `\\?\` and `\\?\UNC\` shapes
+// ============================================================================
+
+describe('stripExtendedPathPrefix', () => {
+  it('should strip `\\\\?\\` to a drive-letter path', () => {
+    expect(stripExtendedPathPrefix('\\\\?\\C:\\dir\\f.txt')).toBe(
+      'C:\\dir\\f.txt',
+    )
+  })
+
+  it('should strip `\\\\?\\UNC\\` to a `\\\\server\\share` path', () => {
+    expect(stripExtendedPathPrefix('\\\\?\\UNC\\srv\\share\\f.txt')).toBe(
+      '\\\\srv\\share\\f.txt',
+    )
+  })
+
+  it('should leave non-extended paths unchanged', () => {
+    expect(stripExtendedPathPrefix('C:\\dir\\f.txt')).toBe('C:\\dir\\f.txt')
+    expect(stripExtendedPathPrefix('\\\\srv\\share\\f.txt')).toBe(
+      '\\\\srv\\share\\f.txt',
+    )
+  })
+
+  it('should strip `\\\\?\\UNC\\` case-insensitively', () => {
+    // Windows accepts the UNC marker in any casing; a case-sensitive
+    // strip would leave a cwd-relative `unc\srv\…` (fail-open drop).
+    expect(stripExtendedPathPrefix('\\\\?\\unc\\srv\\s\\f')).toBe(
+      '\\\\srv\\s\\f',
+    )
+    expect(stripExtendedPathPrefix('\\\\?\\Unc\\srv\\s\\f')).toBe(
+      '\\\\srv\\s\\f',
+    )
+  })
+})
+
+// ============================================================================
+// containsGlobCharsWin — `[`/`]` are literal on Windows
+// ============================================================================
+
+describe('containsGlobCharsWin', () => {
+  it('treats [ and ] as literal filename characters', () => {
+    expect(containsGlobCharsWin('C:\\app\\[prod].env')).toBe(false)
+  })
+
+  it('still routes * and ? to glob expansion', () => {
+    expect(containsGlobCharsWin('C:\\app\\*.env')).toBe(true)
+    expect(containsGlobCharsWin('C:\\app\\?.env')).toBe(true)
+  })
+})
+
+describe('expandWindowsFsDenyPaths literal branch', () => {
+  it('drops non-existent paths without throwing (single statSync)', () => {
+    // The literal branch uses one statSync({throwIfNoEntry:false})
+    // rather than existsSync→statSync, so a TOCTOU ENOENT cannot
+    // abort initialize().
+    const missing = join(tmpdir(), 'srt-no-such-' + Date.now() + '.txt')
+    expect(() => expandWindowsFsDenyPaths([missing])).not.toThrow()
+    expect(expandWindowsFsDenyPaths([missing])).toEqual([])
   })
 })
 

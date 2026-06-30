@@ -9,6 +9,7 @@
 
 #![cfg(windows)]
 
+pub mod sam;
 pub mod sid;
 pub mod util;
 pub mod wfp;
@@ -20,5 +21,14 @@ pub mod self_protect;
 pub mod launch;
 
 pub mod acl;
+pub mod path_id;
 pub mod fence;
 pub mod state_db;
+
+pub mod dpapi;
+pub mod user;
+pub mod install;
+
+pub mod cert_store;
+pub mod logon;
+pub mod runner;

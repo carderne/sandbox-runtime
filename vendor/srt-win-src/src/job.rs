@@ -19,10 +19,12 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    SetInformationJobObject,
     JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP,
     JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
     JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
@@ -36,7 +38,12 @@ pub struct Job(HANDLE);
 
 impl Job {
     /// Create an unnamed job with kill-on-close + full UI lockdown.
-    pub fn new() -> Result<Self> {
+    /// `breakaway_ok` sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` — `true`
+    /// only on the broker→runner Job (so the runner's child can
+    /// `CREATE_BREAKAWAY_FROM_JOB` past it onto the runner's own
+    /// load-bearing Job); **`false` on the runner→child Job** (a
+    /// child must NOT be able to break away from its containment).
+    pub fn new(breakaway_ok: bool) -> Result<Self> {
         // Wrap the raw handle in `Self` immediately so a `?` from
         // either `SetInformationJobObject` below still closes it.
         let job = unsafe {
@@ -46,6 +53,10 @@ impl Job {
             let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
             ext.BasicLimitInformation.LimitFlags =
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if breakaway_ok {
+                ext.BasicLimitInformation.LimitFlags |=
+                    JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            }
             SetInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,
@@ -84,12 +95,30 @@ impl Job {
         Ok(job)
     }
 
+    /// Raw job handle (for `IsProcessInJob` diagnostics).
+    pub fn raw(&self) -> HANDLE { self.0 }
+
     /// Assign a (suspended) process to the job.
     pub fn assign(&self, proc: HANDLE) -> Result<()> {
         unsafe {
             AssignProcessToJobObject(self.0, proc)
                 .context("AssignProcessToJobObject")
         }
+    }
+}
+
+/// `IsProcessInJob(proc, job)` — `job = None` means "any job".
+///
+/// On API failure returns **`true`** (conservative): the only
+/// non-diagnostic caller gates `CREATE_BREAKAWAY_FROM_JOB` on it, and
+/// breakaway is harmless when the caller is NOT in a job (the kernel
+/// just ignores the flag) but failing to set it when the caller IS in
+/// one breaks the runner→child Job assign.
+pub fn is_process_in_job(proc: HANDLE, job: Option<HANDLE>) -> bool {
+    let mut r = windows::core::BOOL(0);
+    match unsafe { IsProcessInJob(proc, job, &mut r) } {
+        Ok(()) => r.as_bool(),
+        Err(_) => true,
     }
 }
 

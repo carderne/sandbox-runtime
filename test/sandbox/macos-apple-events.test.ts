@@ -44,8 +44,8 @@ describe.if(isMacOS)(
     it('includes Apple Events rules when enabled', () => {
       const wrapped = wrapCommand('echo test', true)
 
-      // The wrapped command is shell-quoted, so quotes inside the profile are
-      // escaped — match the rule fragments rather than the exact profile lines.
+      // The profile is embedded byte-literal inside a single-quoted argument;
+      // matching rule fragments keeps the assertion focused on the rules.
       expect(wrapped).toContain('(allow appleevent-send)')
       expect(wrapped).toContain('com.apple.coreservices.appleevents')
     })

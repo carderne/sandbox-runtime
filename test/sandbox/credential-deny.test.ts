@@ -141,7 +141,6 @@ describe('macOS env -u preamble generation', () => {
       wrapped.startsWith('env -u GH_TOKEN -u AWS_SECRET_ACCESS_KEY '),
     ).toBe(true)
     // The -u flags must precede the VAR=VALUE assignments and sandbox-exec.
-    // Match on the var name only — shellquote escapes '=' in the assignments.
     expect(wrapped.indexOf('-u GH_TOKEN')).toBeLessThan(
       wrapped.indexOf('SANDBOX_RUNTIME'),
     )
@@ -192,13 +191,11 @@ describe.if(isSupportedPlatform)(
     let platformDescriptor: PropertyDescriptor | undefined
 
     const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    // Matches a (deny file-read* (subpath "<path>")) rule; the inner quotes
-    // may be backslash-escaped because the profile is shell-quoted into the
-    // wrapped command.
+    // Matches a (deny file-read* (subpath "<path>")) rule. The profile is
+    // embedded byte-literal inside a single-quoted argument, so the inner
+    // quotes appear exactly as written (never backslash-escaped).
     const denyReadRule = (p: string) =>
-      new RegExp(
-        String.raw`\(deny file-read\*\s+\(subpath \\?"` + escapeRegExp(p),
-      )
+      new RegExp(String.raw`\(deny file-read\*\s+\(subpath "` + escapeRegExp(p))
 
     beforeAll(async () => {
       mkdirSync(TEST_DIR, { recursive: true })

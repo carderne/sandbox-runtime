@@ -1,8 +1,15 @@
 import { describe, it, expect } from 'bun:test'
+import { createServer } from 'node:http'
+import type { Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import {
   generateProxyEnvVars,
   CA_TRUST_VARS,
 } from '../../src/sandbox/sandbox-utils.js'
+import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { spawnAsync } from '../helpers/spawn.js'
+import { isLinux } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -46,5 +53,76 @@ describe('generateProxyEnvVars', () => {
         expect(env.some(e => e.startsWith(`${v}=`))).toBe(false)
       }
     })
+  })
+
+  describe('NO_PROXY', () => {
+    it('does not exclude .local hostnames from the proxy', () => {
+      // Under network restriction the child has no usable resolver, so a
+      // NO_PROXY match on *.local makes clients attempt direct getaddrinfo()
+      // and fail before any request is sent. .local must go through the
+      // proxy so the parent resolves it (e.g. k8s *.svc.cluster.local).
+      const env = generateProxyEnvVars(3128, 1080)
+      for (const name of ['NO_PROXY', 'no_proxy']) {
+        const entry = env.find(e => e.startsWith(`${name}=`))
+        expect(entry).toBeDefined()
+        const tokens = entry!.slice(name.length + 1).split(',')
+        expect(tokens).not.toContain('.local')
+        expect(tokens).not.toContain('*.local')
+      }
+    })
+
+    it.if(isLinux)(
+      'sandboxed curl to a .local hostname reaches the parent proxy',
+      async () => {
+        let proxy: Server | undefined
+        const received: string[] = []
+        try {
+          proxy = createServer((req, res) => {
+            received.push(req.url ?? '')
+            res.writeHead(200)
+            res.end('ok')
+          })
+          proxy.on('connect', (req, sock) => {
+            received.push(req.url ?? '')
+            sock.end('HTTP/1.1 200 OK\r\n\r\n')
+          })
+          const proxyPort = await new Promise<number>((resolve, reject) => {
+            proxy!.on('error', reject)
+            proxy!.listen(0, '127.0.0.1', () =>
+              resolve((proxy!.address() as AddressInfo).port),
+            )
+          })
+
+          const config: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: ['srt-test.local'],
+              deniedDomains: [],
+              httpProxyPort: proxyPort,
+            },
+            filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+          }
+          await SandboxManager.initialize(config)
+          expect(SandboxManager.getProxyPort()).toBe(proxyPort)
+
+          const wrapped = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 5 http://srt-test.local:8080/',
+          )
+          const result = await spawnAsync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(result.status).toBe(0)
+          // Plain HTTP via proxy → absolute-form request line.
+          expect(received).toContain('http://srt-test.local:8080/')
+        } finally {
+          await SandboxManager.reset()
+          if (proxy) {
+            await new Promise<void>(r => proxy!.close(() => r()))
+          }
+        }
+      },
+    )
   })
 })

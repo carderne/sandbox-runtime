@@ -1,32 +1,12 @@
-import { spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { run, setup } from '../build-common.js'
 
-if (process.platform !== 'linux') {
-  console.error('seccomp build: Linux only')
-  process.exit(1)
-}
-
-const HERE = dirname(fileURLToPath(import.meta.url))
-const SRC = join(HERE, '..', 'seccomp-src')
-
-const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
-const arch = nodeArchToDir[process.arch]
-if (!arch) {
-  console.error('seccomp build: unsupported arch ' + process.arch)
-  process.exit(1)
-}
-const OUT = join(HERE, arch)
-
-function run(argv: string[]): void {
-  const [cmd, ...args] = argv
-  const r = spawnSync(cmd, args, { stdio: 'inherit' })
-  if (r.status !== 0) {
-    console.error(argv.join(' ') + ' exited ' + (r.status ?? r.signal))
-    process.exit(1)
-  }
-}
+const { SRC, OUT } = setup({
+  importMetaUrl: import.meta.url,
+  requirePlatform: 'linux',
+  srcDirName: 'seccomp-src',
+})
 
 function toCArray(bytes: Buffer): string {
   const hex = Array.from(bytes, b => '0x' + b.toString(16).padStart(2, '0'))
@@ -36,8 +16,6 @@ function toCArray(bytes: Buffer): string {
   }
   return lines.join('\n')
 }
-
-mkdirSync(OUT, { recursive: true })
 
 const cflags = ['-static', '-O2', '-Wall', '-Wextra']
 

@@ -1,5 +1,4 @@
-import type { Server as NetServer, Socket } from 'net'
-import type { Socks5Server } from '@pondwader/socks5-server'
+import type { Socket } from 'net'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
@@ -30,11 +29,17 @@ export interface SocksProxyServerOptions {
 }
 
 export interface SocksProxyWrapper {
-  server: Socks5Server
-  getPort(): number | undefined
-  listen(port: number, hostname: string): Promise<number>
+  /**
+   * Hand an already-accepted socket to the SOCKS state machine. Used by the
+   * mux front-end after first-byte sniffing. The socket must carry the full
+   * SOCKS greeting starting at byte 0 (i.e. any peeked bytes already
+   * `unshift()`ed back). Replicates the library's own accept path
+   * (`setNoDelay()` + `_handleConnection`) and tracks the socket so
+   * `close()` can force-destroy it.
+   */
+  handleConnection(socket: Socket): void
+  /** Force-destroy all injected connections. */
   close(): Promise<void>
-  unref(): void
 }
 
 export function createSocksProxyServer(
@@ -146,93 +151,23 @@ export function createSocksProxyServer(
       })
   })
 
-  // Track every accepted client socket so close() can tear them down
-  // immediately. `net.Server.close()`'s callback waits for all open
-  // connections to finish, and a SOCKS connection mid-`dialDirect()` (30s
-  // timeout) or mid-relay holds the server open indefinitely. During
-  // SandboxManager.reset() that turns into a hang that can outlive bun's
-  // 5s test/hook timeout, so we destroy connections rather than drain them.
-  const internalServer = (socksServer as unknown as { server?: NetServer })
-    ?.server
+  // Track every injected client socket so close() can tear them down
+  // immediately. A SOCKS connection mid-`dialDirect()` (30s timeout) or
+  // mid-relay would otherwise hold reset() open past bun's test timeout.
+  // The library's internal net.Server is never .listen()ed — the mux owns
+  // accept — so there's no listener to close; we only destroy sockets.
   const openSockets = new Set<Socket>()
-  internalServer?.on('connection', (socket: Socket) => {
-    openSockets.add(socket)
-    socket.once('close', () => openSockets.delete(socket))
-  })
 
   return {
-    server: socksServer,
-    getPort(): number | undefined {
-      // Access the internal server to get the port
-      // We need to use type assertion here as the server property is private
-      try {
-        if (internalServer && typeof internalServer?.address === 'function') {
-          const address = internalServer.address()
-          if (address && typeof address === 'object' && 'port' in address) {
-            return address.port
-          }
-        }
-      } catch (error) {
-        // Server might not be listening yet or property access failed
-        logForDebugging(`Error getting port: ${error}`, { level: 'error' })
-      }
-      return undefined
-    },
-    listen(port: number, hostname: string): Promise<number> {
-      return new Promise((resolve, reject) => {
-        internalServer?.once('error', reject)
-        const listeningCallback = (): void => {
-          internalServer?.removeListener('error', reject)
-          const actualPort = this.getPort()
-          if (actualPort) {
-            logForDebugging(
-              `SOCKS proxy listening on ${hostname}:${actualPort}`,
-            )
-            resolve(actualPort)
-          } else {
-            reject(new Error('Failed to get SOCKS proxy server port'))
-          }
-        }
-        socksServer.listen(port, hostname, listeningCallback)
-      })
+    handleConnection(socket: Socket): void {
+      socket.setNoDelay()
+      openSockets.add(socket)
+      socket.once('close', () => openSockets.delete(socket))
+      socksServer._handleConnection(socket)
     },
     async close(): Promise<void> {
-      return new Promise((resolve, reject) => {
-        socksServer.close(error => {
-          if (error) {
-            // Only reject for actual errors, not for "already closed" states
-            // Check for common "already closed" error patterns
-            const errorMessage = error.message?.toLowerCase() || ''
-            const isAlreadyClosed =
-              errorMessage.includes('not running') ||
-              errorMessage.includes('already closed') ||
-              errorMessage.includes('not listening')
-
-            if (!isAlreadyClosed) {
-              reject(error)
-              return
-            }
-          }
-          resolve()
-        })
-        // Forcibly drop any sockets still open. close() above stopped the
-        // listener; the callback won't fire until these drain on their own,
-        // and a stuck upstream dial means they may never drain.
-        for (const socket of openSockets) {
-          socket.destroy()
-        }
-        openSockets.clear()
-      })
-    },
-    unref(): void {
-      // Access the internal server to call unref
-      try {
-        if (internalServer && typeof internalServer?.unref === 'function') {
-          internalServer.unref()
-        }
-      } catch (error) {
-        logForDebugging(`Error calling unref: ${error}`, { level: 'error' })
-      }
+      for (const socket of openSockets) socket.destroy()
+      openSockets.clear()
     },
   }
 }

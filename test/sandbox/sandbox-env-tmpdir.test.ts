@@ -38,4 +38,17 @@ describe('generateProxyEnvVars: TMPDIR', () => {
   it('falls back to /tmp/claude when neither is set', () => {
     expect(generateProxyEnvVars()).toContain('TMPDIR=/tmp/claude')
   })
+
+  it('omits TMPDIR when skipTmpdir is true', () => {
+    process.env.CLAUDE_CODE_TMPDIR = '/tmp/claude-1001'
+    const vars = generateProxyEnvVars(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    )
+    expect(vars.some(v => v.startsWith('TMPDIR='))).toBe(false)
+    expect(vars).toContain('SANDBOX_RUNTIME=1')
+  })
 })

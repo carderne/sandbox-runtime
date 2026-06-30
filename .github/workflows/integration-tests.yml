@@ -63,13 +63,22 @@ jobs:
         with:
           components: clippy
 
+      - name: Rust build cache (Windows)
+        if: matrix.os == 'windows'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/srt-win-src
+          # Shared with release.yml so tag-ref release builds restore
+          # the cache main pushes warm here.
+          shared-key: srt-win
+
       - name: Install sqlite3 CLI (Windows, for smoke-acl DB-poison tests)
         if: matrix.os == 'windows'
         shell: pwsh
-        # Pinned: an unpinned `choco install` would pull whatever
-        # the community feed serves on the day, which is a
-        # supply-chain vector for the DB-poison security tests.
-        run: choco install sqlite --version=3.50.4 --no-progress -y
+        # The smoke-acl H4/H6/H8/R2 rows only need *a* sqlite3 CLI
+        # to inspect the state DB, not a specific version. Was
+        # pinned to 3.50.4, which the community feed delisted.
+        run: choco install sqlite --no-progress -y
 
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'
@@ -80,31 +89,31 @@ jobs:
           # be masked by `cargo clippy` exiting 0 on the next line.
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build  --release --manifest-path vendor/srt-win/Cargo.toml
-          cargo test   --release --manifest-path vendor/srt-win/Cargo.toml
-          cargo clippy --release --manifest-path vendor/srt-win/Cargo.toml --all-targets -- -D warnings
+          cargo build  --release --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo test   --release --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo clippy --release --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
 
       - name: Smoke-test srt-win group + wfp lifecycle (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/smoke.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
       - name: Smoke-test srt-win exec (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win/ci/smoke-exec.ps1 vendor\srt-win\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/smoke-exec.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
       - name: Smoke-test srt-win acl (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win/ci/smoke-acl.ps1 vendor\srt-win\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/smoke-acl.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         env:
           # winsrt.test.ts resolves the helper binary via this.
-          SRT_WIN_PATH: ${{ github.workspace }}\vendor\srt-win\target\release\srt-win.exe
+          SRT_WIN_PATH: ${{ github.workspace }}\vendor\srt-win-src\target\release\srt-win.exe
           # Husky's prepare hook chokes on Windows runners; skip it.
           HUSKY: '0'
         run: |
@@ -117,7 +126,7 @@ jobs:
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win/ci/cleanup.ps1 vendor\srt-win\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/cleanup.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'linux'
@@ -147,6 +156,10 @@ jobs:
       - name: Install Node dependencies
         if: matrix.os != 'windows'
         run: npm install
+
+      - name: Lint (ESLint)
+        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
+        run: npx eslint .
 
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'

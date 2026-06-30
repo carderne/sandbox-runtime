@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import shellquote from 'shell-quote'
+import { quote } from './utils/shell-quote.js'
 import { Command } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
@@ -247,7 +247,7 @@ async function main(): Promise<void> {
             // executed via `bash -c <command>`, so each arg must be
             // shell-quoted to survive that re-parse — a plain join(' ')
             // splits arguments containing whitespace (#157).
-            command = shellquote.quote(commandArgs)
+            command = quote(commandArgs)
             logForDebugging(`Original command: ${command}`)
           } else {
             console.error(

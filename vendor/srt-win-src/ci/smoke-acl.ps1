@@ -99,11 +99,11 @@ function RunJson {
 # Exec helper.
 function ChildExec {
   param([string[]] $tail)
-  # --skip-wfp-check: this script does NOT install WFP filters
-  # (the network fence is orthogonal to the FS-deny tests; exec
-  # is used here only to obtain a deny-only-group token). The
-  # WFP pre-flight would otherwise refuse every ChildExec.
-  $argv = @('exec', '--group-sid', $GroupSid, '--skip-wfp-check') + $tail
+  # This script does NOT install WFP filters — the network fence is
+  # orthogonal to the FS-deny tests; exec is used here only to
+  # obtain a deny-only-group token. exec has no WFP pre-flight
+  # (BFE enum is admin-gated; the host runs `wfp verify` instead).
+  $argv = @('exec', '--group-sid', $GroupSid) + $tail
   $raw = & $Exe @argv 2>&1 | Out-String
   $exit = $LASTEXITCODE
   $lines = $raw -split "`r?`n"
@@ -587,15 +587,19 @@ try {
   }
   Write-Host 'A6 ok: child denied write to state.db'
 
-  # ── A7: directory in payload → clear error ────────────────────
-  $json7 = @{ denyRead = @($Scratch) } | ConvertTo-Json -Compress
+  # ── A7: directory in payload → volume root rejected ────────────
+  # Directories are accepted (the stamp gets `(OI)(CI)` and inherits
+  # to the subtree — covered by smoke-exec G5). The remaining hard
+  # error for a dir input is a volume root, which would propagate
+  # broker-only across the drive.
+  $json7 = @{ denyRead = @('C:\') } | ConvertTo-Json -Compress
   $out7 = $json7 | & $Exe acl stamp --group-sid $GroupSid `
     --holder-pid $Holder 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) { throw 'A7: directory was accepted' }
-  if ($out7 -notmatch '(?i)requires explicit file paths') {
+  if ($LASTEXITCODE -eq 0) { throw 'A7: volume-root dir was accepted' }
+  if ($out7 -notmatch '(?i)refusing to deny a volume root') {
     throw "A7: wrong error message: $out7"
   }
-  Write-Host 'A7 ok: directory in payload rejected with clear message'
+  Write-Host 'A7 ok: volume-root directory rejected with clear message'
 
   # ── A8: glob in payload → clear error ─────────────────────────
   $json8 = @{ denyRead = @("$Scratch\*.txt") } | ConvertTo-Json -Compress
@@ -992,9 +996,9 @@ try {
     throw "A22 setup: third-party edit produced no SDDL change " +
           "($sddl22Edited)"
   }
-  # Restore. The parent's current DACL no longer equals the
-  # recorded stamped_sd → the parent restore must LEAVE IT
-  # (not blind-write original_sd). The AU:(RX) ACE must survive.
+  # Restore. The parent's DACL now carries our marker + an extra
+  # ACE → classify_sd → StampedUnrecognized → restore must LEAVE
+  # IT (fail-closed). The AU:(RX) ACE must survive.
   $sout22 = & $Exe acl restore --group-sid $GroupSid `
               --holder-pid $Holder --json | Out-String
   if ($LASTEXITCODE -ne 0) {
@@ -1126,6 +1130,222 @@ try {
     Write-Host 'A25 ok: delete via junction to stamped parent denied'
   }
   Run @('acl', 'restore', '--group-sid', $GroupSid, '--holder-pid', $Holder)
+
+  # ── A26: per-exec --deny-read — stamped, denied, restored ─────
+  # `srt-win exec --deny-read $f` stamps $f under the exec
+  # process's OWN PID before spawning, restores after the child
+  # exits. No session-level `acl stamp` involved — the file is
+  # broker-only ONLY for the lifetime of this one exec.
+  $f26 = Join-Path $Scratch 'a26.txt'
+  Set-Content -Path $f26 -Value 'A26-SECRET' -NoNewline
+  if (Get-MarkerHash $f26) {
+    throw "A26 pre: file already carries a marker before per-exec deny"
+  }
+  $r = ChildExec @('--deny-read', $f26, '--', $cmd, '/d', '/s', '/c',
+                   "type `"$f26`"")
+  if ($r.out -match 'A26-SECRET') {
+    throw ("A26: child read the per-exec --deny-read target. " +
+           "raw: $($r.raw)")
+  }
+  if ($r.raw -notmatch 'per-exec deny: holder_pid=\d+') {
+    throw "A26: missing per-exec stamp diag. raw: $($r.raw)"
+  }
+  # Post: file is back to its pre-stamp DACL — broker reads it,
+  # marker is gone, and a fresh child (no --deny-read) reads it.
+  if ((Get-Content -Path $f26 -Raw) -ne 'A26-SECRET') {
+    throw "A26: broker cannot read $f26 after exec — restore failed"
+  }
+  if (Get-MarkerHash $f26) {
+    throw ("A26: file still carries the marker after exec — " +
+           "per-exec restore did not run")
+  }
+  $r2 = ChildExec @('--', $cmd, '/d', '/s', '/c', "type `"$f26`"")
+  if ($r2.out.Trim() -ne 'A26-SECRET') {
+    throw ("A26: child without --deny-read still denied — " +
+           "stamp leaked. raw: $($r2.raw)")
+  }
+  Write-Host 'A26 ok: per-exec --deny-read stamps, denies, restores'
+
+  # ── A27: per-exec refuse-escalation — ReadDeny on a held-WriteDeny ──
+  # Session ($Holder) stamps $f27 at WriteDeny. A per-exec
+  # `--deny-read $f27` would escalate the on-disk mask; the per-exec
+  # restore would then see refcount>0 and leave it ReadDeny for the
+  # rest of the session. `ensure_stamped`'s refuse_escalation gate
+  # (post-canonicalize, holders-table-aware) must reject this — the
+  # exec FAILS, the on-disk mask stays WriteDeny, the session hold
+  # is untouched.
+  $f27 = Join-Path $Scratch 'a27.txt'
+  Set-Content -Path $f27 -Value 'A27-DATA' -NoNewline
+  Stamp @{ denyWrite = @($f27) }
+  $r = ChildExec @('--deny-read', $f27, '--', $cmd, '/d', '/s', '/c',
+                   'exit 0')
+  if ($r.exit -eq 0) {
+    throw ("A27: per-exec --deny-read on a held-WriteDeny path " +
+           "SUCCEEDED — refuse-escalation gate did not fire. " +
+           "raw: $($r.raw)")
+  }
+  if ($r.raw -notmatch 'would escalate .* from WriteDeny to ReadDeny') {
+    throw ("A27: expected refuse-escalation error; got: $($r.raw)")
+  }
+  # Mask not escalated: a child WITHOUT --deny-read can still read
+  # (WriteDeny leaves read open). If escalation had landed, this
+  # would be denied.
+  $rR = ChildExec @('--', $cmd, '/d', '/s', '/c', "type `"$f27`"")
+  if ($rR.out -notmatch 'A27-DATA') {
+    throw ("A27: child cannot read a WriteDeny-only file — mask " +
+           "WAS escalated despite refusal. raw: $($rR.raw)")
+  }
+  # Session WriteDeny stamp survived the failed batch (refusal
+  # bails before add_holder; rollback never touches $Holder's row).
+  if (-not (Get-MarkerHash $f27)) {
+    throw ("A27: session WriteDeny stamp was torn down by the " +
+           "failed per-exec batch")
+  }
+  Run @('acl', 'restore', '--group-sid', $GroupSid, '--holder-pid', $Holder)
+  Write-Host ('A27 ok: per-exec refuse-escalation — ReadDeny on a ' +
+              'held-WriteDeny path refused; mask not escalated')
+
+  # ── A28: per-exec error after stamp → file restored ──────────
+  # Any error between the per-exec stamp committing and exit
+  # (fence-open, launch) must route through the restore block — a
+  # `?` between stamp and restore would leak the stamp under a
+  # now-dead PID. Force `launch::run` to fail (nonexistent exe);
+  # the per-exec stamp on $f28 must be restored regardless.
+  $f28 = Join-Path $Scratch 'a28.txt'
+  Set-Content -Path $f28 -Value 'A28-DATA' -NoNewline
+  if (Get-MarkerHash $f28) {
+    throw "A28 pre: file already carries a marker"
+  }
+  $r = ChildExec @('--deny-read', $f28, '--',
+                   'C:\__srt_win_nonexistent__.exe')
+  if ($r.exit -eq 0) {
+    throw "A28 setup: launch of a nonexistent exe SUCCEEDED?"
+  }
+  if ($r.raw -notmatch 'per-exec deny: holder_pid=\d+') {
+    throw ("A28: per-exec stamp diag missing — stamp did not " +
+           "commit before the launch error. raw: $($r.raw)")
+  }
+  if (Get-MarkerHash $f28) {
+    throw ("A28: per-exec stamp LEAKED — file still carries the " +
+           "marker after a post-stamp error. raw: $($r.raw)")
+  }
+  $rR = ChildExec @('--', $cmd, '/d', '/s', '/c', "type `"$f28`"")
+  if ($rR.out -notmatch 'A28-DATA') {
+    throw ("A28: child without --deny-read still denied — " +
+           "stamp leaked. raw: $($rR.raw)")
+  }
+  Write-Host ('A28 ok: per-exec error after stamp → restore ran ' +
+              '(no leaked stamp)')
+
+  # ── A29: per-exec exec process killed mid-run → crash-recovery reaps ──
+  # The per-exec restore is a Drop guard, so it runs on `?` and on
+  # panic — but a hard kill (Stop-Process -Force / TerminateProcess)
+  # bypasses Drop entirely. The leaked stamp is fail-closed (file
+  # stays broker-only) under the now-dead exec PID; the NEXT
+  # `with_init_lock` op (any holder) must reap it via
+  # crash_recovery. This is the same lifecycle as a session
+  # `acl stamp` whose host crashed.
+  $f29 = Join-Path $Scratch 'a29.txt'
+  Set-Content -Path $f29 -Value 'A29-DATA' -NoNewline
+  $exec29 = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden `
+    -ArgumentList @('exec', '--group-sid', $GroupSid,
+                    '--deny-read', $f29, '--', $cmd, '/d', '/s', '/c',
+                    'ping -n 60 127.0.0.1 >nul')
+  try {
+    # Wait for the stamp to land (poll the on-disk marker, not
+    # stderr — Start-Process can't easily capture it).
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not (Get-MarkerHash $f29)) {
+      if ([DateTime]::UtcNow -gt $deadline -or $exec29.HasExited) {
+        throw ("A29 setup: per-exec stamp never landed " +
+               "(exec exited=$($exec29.HasExited))")
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    # Hard-kill the exec process tree (the child `cmd /c ping`
+    # is in srt-win's job object, so killing the exec terminates
+    # it too). Drop does NOT run.
+    Stop-Process -Id $exec29.Id -Force
+    $exec29.WaitForExit()
+  } finally {
+    if (-not $exec29.HasExited) {
+      Stop-Process -Id $exec29.Id -Force -ErrorAction SilentlyContinue
+    }
+  }
+  if (-not (Get-MarkerHash $f29)) {
+    throw ("A29 setup: stamp gone after kill — Drop ran (kill " +
+           "was not hard enough to bypass it)")
+  }
+  # Any `with_init_lock` op under a DIFFERENT holder reaps the
+  # dead exec PID. `acl recover` is holder-agnostic and runs
+  # crash-recovery only.
+  $rec29 = RunCapture @('acl', 'recover', '--group-sid', $GroupSid)
+  if ($rec29.raw -notmatch 'pruned [1-9]\d* dead broker') {
+    throw ("A29: crash-recovery did not report the dead per-exec " +
+           "holder. raw: $($rec29.raw)")
+  }
+  if (Get-MarkerHash $f29) {
+    throw ("A29: per-exec stamp NOT reaped by crash-recovery " +
+           "after the exec process was killed")
+  }
+  $rR = ChildExec @('--', $cmd, '/d', '/s', '/c', "type `"$f29`"")
+  if ($rR.out -notmatch 'A29-DATA') {
+    throw "A29: child still denied after reap. raw: $($rR.raw)"
+  }
+  Write-Host ('A29 ok: per-exec exec hard-killed → crash-recovery ' +
+              'reaps the dead holder and restores')
+
+  # ── A30: per-exec refuses any multi-link target ────────────────
+  # NTFS hardlinks share one security descriptor across distinct
+  # canonical paths, but holders/snapshots are PATH-keyed. A
+  # per-exec stamp under one alias is invisible to a holder of
+  # another, so its restore would write original_sd back to the
+  # SHARED DACL while the other holder's child is still running
+  # — regardless of mask. `ensure_stamped` therefore refuses
+  # `links != 1` UNCONDITIONALLY when refuse_escalation is set.
+  # (a) Bare hardlinked file, no other holder, same mask the
+  #     session would request → still refused.
+  $d30 = Join-Path $Scratch 'a30'
+  New-Item -ItemType Directory -Path $d30 | Out-Null
+  $f30 = Join-Path $d30 'orig.txt'
+  $f30L = Join-Path $d30 'alias.txt'
+  Set-Content -Path $f30 -Value 'A30-DATA' -NoNewline
+  New-Item -ItemType HardLink -Path $f30L -Target $f30 | Out-Null
+  $r = ChildExec @('--deny-read', $f30L, '--', $cmd, '/d', '/s', '/c',
+                   'exit 0')
+  if ($r.exit -eq 0) {
+    throw ("A30(a): per-exec --deny-read on a hardlinked file " +
+           "SUCCEEDED — unconditional links!=1 gate did not fire. " +
+           "raw: $($r.raw)")
+  }
+  if ($r.raw -notmatch 'per-exec deny refused: .* has 2 hardlink') {
+    throw ("A30(a): expected unconditional hardlink refuse; " +
+           "got: $($r.raw)")
+  }
+  if (Get-MarkerHash $f30L) {
+    throw "A30(a): hardlinked file was stamped despite refuse"
+  }
+  # (b) Session holds the original at WriteDeny; per-exec on the
+  #     alias is refused at the hardlink gate (before
+  #     `other_holders`). On-disk mask stays WriteDeny.
+  Stamp @{ denyWrite = @($f30) }
+  $r = ChildExec @('--deny-read', $f30L, '--', $cmd, '/d', '/s', '/c',
+                   'exit 0')
+  if ($r.exit -eq 0) {
+    throw ("A30(b): per-exec --deny-read on a hardlink alias of a " +
+           "held-WriteDeny path SUCCEEDED. raw: $($r.raw)")
+  }
+  if ($r.raw -notmatch 'per-exec deny refused: .* has 2 hardlink') {
+    throw "A30(b): expected hardlink refuse; got: $($r.raw)"
+  }
+  $rR = ChildExec @('--', $cmd, '/d', '/s', '/c', "type `"$f30`"")
+  if ($rR.out -notmatch 'A30-DATA') {
+    throw ("A30(b): child cannot read a WriteDeny-only file — mask " +
+           "WAS escalated via the alias. raw: $($rR.raw)")
+  }
+  Run @('acl', 'restore', '--group-sid', $GroupSid, '--holder-pid', $Holder)
+  Write-Host ('A30 ok: per-exec deny refuses any multi-link target ' +
+              '(unconditional, before other_holders)')
 
   # ── H4: original_sd_tampered → fail-closed ─────────────────────
   # Stamp F, then poison the DB row's original_sd. Restore must

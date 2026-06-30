@@ -1,4 +1,4 @@
-import shellquote from 'shell-quote'
+import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -517,6 +517,8 @@ export async function initializeLinuxNetworkBridge(
   const socat = socatPath ?? 'socat'
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
+  // Only allocated when ports differ; in the mux case the SOCKS side
+  // reuses httpSocketPath.
   const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
 
   // Start HTTP bridge
@@ -551,40 +553,55 @@ export async function initializeLinuxNetworkBridge(
     throw new Error('Failed to start HTTP bridge process')
   }
 
-  // Start SOCKS bridge
-  const socksSocatArgs = [
-    `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
+  // SOCKS bridge: when the host serves both protocols on one port (the mux),
+  // a second socat to the same TCP target is redundant — reuse the HTTP
+  // bridge's process and socket path. Downstream consumers
+  // (LinuxNetworkBridgeContext, in-sandbox socat, cleanup) treat duplicate
+  // refs idempotently. A separate bridge is only spawned when the ports
+  // differ (external proxy override).
+  let socksBridgeProcess: ChildProcess
+  let socksSockPath: string
+  if (socksProxyPort === httpProxyPort) {
+    socksBridgeProcess = httpBridgeProcess
+    socksSockPath = httpSocketPath
+  } else {
+    socksSockPath = socksSocketPath
+    const socksSocatArgs = [
+      `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
+      `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
+    ]
 
-  logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`)
-
-  const socksBridgeProcess = spawn(socat, socksSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  // Add error and exit handlers to monitor bridge health — registered
-  // before the !pid check for the same reason as the HTTP bridge above.
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
     logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
+      `Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`,
     )
-  })
 
-  if (!socksBridgeProcess.pid) {
-    // Clean up HTTP bridge
-    if (httpBridgeProcess.pid) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-      } catch {
-        // Ignore errors
+    socksBridgeProcess = spawn(socat, socksSocatArgs, {
+      stdio: 'ignore',
+    })
+
+    // Add error and exit handlers to monitor bridge health — registered
+    // before the !pid check for the same reason as the HTTP bridge above.
+    socksBridgeProcess.on('error', err => {
+      logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
+    })
+    socksBridgeProcess.on('exit', (code, signal) => {
+      logForDebugging(
+        `SOCKS bridge process exited with code ${code}, signal ${signal}`,
+        { level: code === 0 ? 'info' : 'error' },
+      )
+    })
+
+    if (!socksBridgeProcess.pid) {
+      // Clean up HTTP bridge
+      if (httpBridgeProcess.pid) {
+        try {
+          process.kill(httpBridgeProcess.pid, 'SIGTERM')
+        } catch {
+          // Ignore errors
+        }
       }
+      throw new Error('Failed to start SOCKS bridge process')
     }
-    throw new Error('Failed to start SOCKS bridge process')
   }
 
   // Wait for both sockets to be ready
@@ -601,7 +618,7 @@ export async function initializeLinuxNetworkBridge(
 
     try {
       // fs already imported
-      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSocketPath)) {
+      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSockPath)) {
         logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
         break
       }
@@ -637,7 +654,7 @@ export async function initializeLinuxNetworkBridge(
 
   return {
     httpSocketPath,
-    socksSocketPath,
+    socksSocketPath: socksSockPath,
     httpBridgeProcess,
     socksBridgeProcess,
     httpProxyPort,
@@ -650,7 +667,7 @@ export async function initializeLinuxNetworkBridge(
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
  * Returns a shell-ready string ending in a trailing space — callers append
- * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
+ * quote([shell, '-c', cmd]). Returns undefined when seccomp is
  * unavailable (no argv0, no binary found).
  *
  * When argv0 is set, applyPath is used verbatim (no existence check); the
@@ -664,10 +681,10 @@ function resolveApplySeccompPrefix(
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+    return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${shellquote.quote([binary])} ` : undefined
+  return binary ? `${quote([binary])} ` : undefined
 }
 
 /**
@@ -686,7 +703,7 @@ function buildSandboxCommand(
   const shellPath = shell || 'bash'
   // Host filesystem is bind-mounted into the sandbox, so an explicit
   // socatPath resolves to the same binary inside bwrap.
-  const socat = shellquote.quote([socatPath ?? 'socat'])
+  const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
@@ -696,15 +713,14 @@ function buildSandboxCommand(
   // apply-seccomp runs after socat so socat can still create Unix sockets.
   if (applySeccompPrefix) {
     const applySeccompCmd =
-      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
+      applySeccompPrefix + quote([shellPath, '-c', userCommand])
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    return `${shellPath} -c ${quote([innerScript])}`
   } else {
-    const innerScript = [
-      ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
-    ].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    const innerScript = [...socatCommands, `eval ${quote([userCommand])}`].join(
+      '\n',
+    )
+    return `${shellPath} -c ${quote([innerScript])}`
   }
 }
 
@@ -1032,7 +1048,10 @@ async function generateFilesystemArgs(
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
-  if (fs.existsSync('/etc/ssh/ssh_config.d')) {
+  //
+  // Skipped when readConfig is undefined (filesystem.disabled): no read
+  // policy means no implicit read denies either.
+  if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
 
@@ -1357,7 +1376,12 @@ export async function wrapCommandWithSandboxLinux(
 
         // Bind both sockets into the sandbox
         bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        // When the mux serves both protocols, socksSocketPath is the same
+        // file as httpSocketPath; bwrap rejects a duplicate --bind of the
+        // same source→target.
+        if (socksSocketPath !== httpSocketPath) {
+          bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        }
 
         // Add proxy environment variables
         // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
@@ -1367,6 +1391,7 @@ export async function wrapCommandWithSandboxLinux(
           1080, // Internal SOCKS listener port
           caCertPath,
           proxyAuthToken,
+          writeConfig === undefined,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
@@ -1466,17 +1491,13 @@ export async function wrapCommandWithSandboxLinux(
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
-      const applySeccompCmd =
-        applySeccompPrefix + shellquote.quote([shell, '-c', command])
+      const applySeccompCmd = applySeccompPrefix + quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = shellquote.quote([
-      bwrapPath ?? 'bwrap',
-      ...bwrapArgs,
-    ])
+    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

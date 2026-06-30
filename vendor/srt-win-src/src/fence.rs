@@ -143,8 +143,8 @@ pub fn open_delete_fence(canonical_paths: &[String]) -> Result<DeleteFence> {
 /// is still protected by its broker-only DACL; what's lost is
 /// the rename guard on the directory ITSELF (path substitution
 /// becomes possible, which is the documented residual). For the
-/// state-DB dir, the next session's verify-before-accept on the
-/// existing-row path catches a poisoned DB regardless.
+/// state-DB dir, the next session's disk-first `ensure_stamped`
+/// + marker-hash corroboration catches a poisoned row regardless.
 pub fn open_best_effort(paths: &[String], kind: &str) -> DeleteFence {
     let mut handles = Vec::with_capacity(paths.len());
     for p in paths {

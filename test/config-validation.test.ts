@@ -1069,5 +1069,151 @@ describe('Config Validation', () => {
       })
       expect(result.success).toBe(false)
     })
+
+    describe('excludeDomains', () => {
+      test('accepts exact and wildcard patterns', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.mtls.example.com', 'pinned.example.com'],
+            deniedDomains: [],
+            tlsTerminate: {
+              excludeDomains: ['*.mtls.example.com', 'pinned.example.com'],
+            },
+          },
+        })
+        expect(result.success).toBe(true)
+      })
+
+      test('rejects invalid domain patterns', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: { excludeDomains: ['https://example.com'] },
+          },
+        })
+        expect(result.success).toBe(false)
+      })
+
+      test('rejects a bare "*" (would silently disable termination)', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: { excludeDomains: ['*'] },
+          },
+        })
+        expect(result.success).toBe(false)
+      })
+
+      test('rejects a masked credential whose explicit injectHosts entry is fully covered by excludeDomains', () => {
+        // Injection only happens on the terminated path, so an injectHost
+        // that can never be terminated can never receive the credential —
+        // the upstream would get the placeholder.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.example.com'],
+            deniedDomains: [],
+            tlsTerminate: { excludeDomains: ['*.internal.example.com'] },
+          },
+          credentials: {
+            envVars: [
+              {
+                name: 'TOKEN',
+                mode: 'mask',
+                injectHosts: ['api.internal.example.com'],
+              },
+            ],
+          },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          const issue = result.error.issues.find(i =>
+            i.path.join('.').startsWith('credentials.envVars.0.injectHosts'),
+          )
+          expect(issue?.message).toContain('excludeDomains')
+          expect(issue?.message).toContain('api.internal.example.com')
+        }
+      })
+
+      test('accepts an explicit wildcard injectHosts that merely overlaps excludeDomains', () => {
+        // Only mtls.example.com is opaque-tunnelled; every other
+        // *.example.com host still gets the credential. Not a
+        // contradiction — must not be rejected.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.example.com'],
+            deniedDomains: [],
+            tlsTerminate: { excludeDomains: ['mtls.example.com'] },
+          },
+          credentials: {
+            envVars: [
+              { name: 'TOKEN', mode: 'mask', injectHosts: ['*.example.com'] },
+            ],
+          },
+        })
+        expect(result.success).toBe(true)
+      })
+
+      test('rejects a masked credential with default injectHosts when excludeDomains covers every allowed domain', () => {
+        // Effective injectHosts = allowedDomains, all of which are excluded
+        // from termination: the credential could never be injected anywhere.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.example.com', 'pinned.example.net'],
+            deniedDomains: [],
+            tlsTerminate: {
+              excludeDomains: ['*.example.com', 'pinned.example.net'],
+            },
+          },
+          credentials: {
+            envVars: [{ name: 'TOKEN', mode: 'mask' }],
+          },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          const messages = result.error.issues.map(i => i.message).join('\n')
+          expect(messages).toContain('never be injected')
+        }
+      })
+
+      test('a masked credential with default (absent) injectHosts coexists with a partial excludeDomains', () => {
+        // Default injectHosts = allowedDomains. Excluded hosts simply do not
+        // get the credential; that is not an error.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.example.com'],
+            deniedDomains: [],
+            tlsTerminate: { excludeDomains: ['mtls.example.com'] },
+          },
+          credentials: {
+            envVars: [{ name: 'TOKEN', mode: 'mask' }],
+          },
+        })
+        expect(result.success).toBe(true)
+      })
+
+      test('explicit injectHosts disjoint from excludeDomains is accepted', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['*.example.com'],
+            deniedDomains: [],
+            tlsTerminate: { excludeDomains: ['mtls.example.com'] },
+          },
+          credentials: {
+            envVars: [
+              { name: 'TOKEN', mode: 'mask', injectHosts: ['api.example.com'] },
+            ],
+          },
+        })
+        expect(result.success).toBe(true)
+      })
+    })
   })
 })

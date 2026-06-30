@@ -287,6 +287,24 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
+**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
+
+- `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
+  - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
+  - **Certificate-pinning clients** - clients that verify the upstream's identity themselves (custom CAs, SAN pinning) and reject the MITM certificate.
+
+```json
+{
+  "network": {
+    "allowedDomains": ["*.example.com", "internal-mtls.example.net"],
+    "deniedDomains": [],
+    "tlsTerminate": {
+      "excludeDomains": ["internal-mtls.example.net"]
+    }
+  }
+}
+```
+
 **Unix Socket Settings** (platform-specific behavior):
 
 | Setting                        | macOS                     | Linux                                    |
@@ -422,7 +440,7 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
 - **Linux**: Uses `bubblewrap` (bwrap) for containerization
-- **Windows**: Not yet supported
+- **Windows**: Alpha — see [Windows (alpha)](#windows-alpha) below for the threat model and known limitations
 
 ### Platform-Specific Dependencies
 
@@ -464,6 +482,29 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
 - `ripgrep` - Fast search tool for deny path detection
   - Install via Homebrew: `brew install ripgrep`
   - Or download from: https://github.com/BurntSushi/ripgrep/releases
+
+## Windows (alpha)
+
+Windows support is **alpha and the design is in flux**. The current implementation provides network egress filtering (via the Windows Filtering Platform) and file read/write denial (via ACL stamping), but it is **not a security boundary against a deliberately adversarial sandboxed process** — see [Threat model](#threat-model) below. The mechanism will be substantially revised (the sandboxed process will run under a separate sandbox user account) in a future version.
+
+### Setup
+
+Run `npx @anthropic-ai/sandbox-runtime windows-install` once per machine (requires admin; creates the `sandbox-runtime-net` local group and installs the WFP egress filters). **Log out and log back in** for group membership to take effect on your token. After that, `SandboxManager.initialize()` and the `srt` CLI work as on other platforms.
+
+### Threat model
+
+**Important:** the Windows sandbox runs the child as the **same user** as the host, with a restricted token (the discriminator group is flipped to deny-only). This protects against **accidental** access by well-behaved tools, and against **deliberate in-token** access by the sandboxed process itself — code running under the restricted token cannot open denied files or make direct outbound connections.
+
+It does **not** protect against a sandboxed process that deliberately escapes via system-service brokering. Task Scheduler, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (re-parenting onto an unrestricted process such as `explorer.exe`), BITS, and certain COM out-of-process servers will spawn a process under the user's full, unrestricted interactive token. That process can then read or write any "denied" file and make unrestricted network connections. There is no same-user fix for this class of escape; the structural answer is running the sandboxed process under a **separate sandbox user account**, which is the planned next revision.
+
+Until that revision lands, treat the Windows sandbox as **best-effort defense against accidental access and well-behaved tooling**, not as containment for an adversarial process.
+
+### Known limitations
+
+- **Not a security boundary against a deliberate child** — see [Threat model](#threat-model) above.
+- `filesystem.allowWrite` (write allow-list) and `filesystem.allowRead` (re-allow within denyRead) are **not supported** on Windows — `initialize()` rejects a config that sets either. Only `denyRead` / `denyWrite` are applied.
+- `network.tlsTerminate` is not yet supported on Windows.
+- Directory targets in `filesystem.denyRead` / `filesystem.denyWrite` are not yet supported (individual files only).
 
 ## Development
 

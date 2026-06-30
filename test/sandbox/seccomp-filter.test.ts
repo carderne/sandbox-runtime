@@ -107,7 +107,14 @@ describe.if(isLinux)('Sandbox Integration', () => {
       seccompConfig: { argv0: 'x; rm -rf /', applyPath: '/path with space' },
     })
 
-    expect(wrappedCommand).toContain("ARGV0='x; rm -rf /' '/path with space' ")
+    // Assert the values flow into the prefix, not the quoter's exact
+    // serialization: the inner prefix is later quoted AGAIN into the outer
+    // bwrap argv string, which re-escapes the inner quotes. The child's
+    // argv is what matters and is covered by the round-trip tests in
+    // test/utils/shell-quote.test.ts.
+    expect(wrappedCommand).toContain('ARGV0=')
+    expect(wrappedCommand).toContain('x; rm -rf /')
+    expect(wrappedCommand).toContain('/path with space')
   })
 
   it('argv0 mode: rejects argv0 without applyPath', () => {

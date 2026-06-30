@@ -49,12 +49,13 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
     },
     { name: 'extKeyUsage', serverAuth: true },
     { name: 'subjectAltName', altNames: [sanFor(hostname)] },
-    // No authorityKeyIdentifier: node-forge stores SKI as a hex string for
-    // in-memory certs (e.g. the ephemeral CA) but as raw bytes for certs
-    // parsed from PEM (e.g. a user-supplied CA). Passing the hex string as
-    // keyIdentifier produces an AKI that doesn't match the CA's SKI and
-    // chain verification fails. AKI is optional — issuer/subject DN match
-    // is sufficient — so omit it.
+    { name: 'subjectKeyIdentifier' },
+    // Python ≥3.13 enables ssl.VERIFY_X509_STRICT by default, which enforces
+    // RFC 5280's "AKI MUST be present on non-self-signed certs". curl/Go/Node
+    // don't enforce this, but requests/urllib3/httpx/google-auth all reject
+    // a leaf without AKI under 3.13. See caSubjectKeyId() for why we can't
+    // just pass the CA's stored SKI value through.
+    { name: 'authorityKeyIdentifier', keyIdentifier: caSubjectKeyId(ca.cert) },
   ])
   cert.sign(ca.key, md.sha256.create())
 
@@ -79,6 +80,26 @@ export function secureContextFor(ca: MitmCA, hostname: string): SecureContext {
   const ctx = createSecureContext({ cert: certPem, key: keyPem })
   ca.secureContexts.set(hostname, ctx)
   return ctx
+}
+
+/**
+ * Return the CA's Subject Key Identifier as raw bytes for use as the leaf's
+ * authorityKeyIdentifier.keyIdentifier.
+ *
+ * node-forge stores a cert's subjectKeyIdentifier extension value as a *hex
+ * string* (both for in-memory certs and certs parsed from PEM), but expects
+ * AKI's keyIdentifier as *raw bytes* — passing the hex through verbatim
+ * encodes the ASCII hex chars as the key id and the chain fails to verify.
+ * If the CA has no SKI extension (e.g. a v1 user-supplied CA), derive the
+ * RFC 5280 method-1 value from its public key.
+ */
+function caSubjectKeyId(caCert: forge.pki.Certificate): string {
+  const ext = caCert.getExtension('subjectKeyIdentifier') as
+    | { subjectKeyIdentifier?: string }
+    | undefined
+  return ext?.subjectKeyIdentifier
+    ? util.hexToBytes(ext.subjectKeyIdentifier)
+    : caCert.generateSubjectKeyIdentifier().getBytes()
 }
 
 function sanFor(hostname: string): {

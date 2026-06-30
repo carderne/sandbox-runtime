@@ -32,6 +32,34 @@ describe('mitm-leaf: mintLeafCert', () => {
     expect(x.issuer).toContain('CN=srt-test-ca DO NOT TRUST')
   })
 
+  test('carries SKI and an AKI matching the CA SKI', async () => {
+    // Python ≥3.13 enables ssl.VERIFY_X509_STRICT by default, which rejects
+    // non-self-signed certs that lack authorityKeyIdentifier (RFC 5280
+    // §4.2.1.1). Minted leaves must carry both, and the AKI keyid must equal
+    // the CA's SKI byte-for-byte — not the hex-string form node-forge stores
+    // internally. The `openssl verify -x509_strict` test below is the
+    // end-to-end check; this asserts the extensions directly so a regression
+    // is obvious even where openssl is unavailable.
+    const { pki } = forge
+    const ephemeral = createMitmCA({})
+    for (const c of [ca, ephemeral]) {
+      const leaf = pki.certificateFromPem(
+        firstPemBlock(mintLeafCert(c, 'ski.example').certPem),
+      )
+      expect(leaf.getExtension('subjectKeyIdentifier')).toBeTruthy()
+      const aki = leaf.getExtension('authorityKeyIdentifier') as {
+        value: string
+      }
+      expect(aki).toBeTruthy()
+      // AKI's DER value is SEQUENCE { [0] keyid }. Hex-encode the whole thing
+      // and check the CA's SKI hex appears as a suffix — proves we wrote raw
+      // SKI bytes, not their ASCII-hex encoding.
+      const caSki = c.cert.generateSubjectKeyIdentifier().toHex()
+      expect(forge.util.bytesToHex(aki.value)).toMatch(new RegExp(`${caSki}$`))
+    }
+    await disposeMitmCA(ephemeral)
+  })
+
   test('uses an IP SAN for IP-literal hostnames', () => {
     const leaf = mintLeafCert(ca, '127.0.0.1')
     const x = new X509Certificate(firstPemBlock(leaf.certPem))
@@ -110,9 +138,11 @@ describe('mitm-leaf: mintLeafCert', () => {
           const leaf = mintLeafCert(c, 'verify.example')
           const leafPath = join(dir, 'leaf.crt')
           writeFileSync(leafPath, firstPemBlock(leaf.certPem))
+          // -x509_strict mirrors Python 3.13's ssl.VERIFY_X509_STRICT default
+          // and rejects leaves missing AKI/SKI.
           const out = execFileSync(
             'openssl',
-            ['verify', '-CAfile', c.certPath, leafPath],
+            ['verify', '-x509_strict', '-CAfile', c.certPath, leafPath],
             { encoding: 'utf8' },
           )
           expect(out.trim()).toMatch(/: OK$/)

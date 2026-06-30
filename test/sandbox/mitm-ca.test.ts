@@ -115,6 +115,32 @@ describe('mitm-ca: ephemeral generation', () => {
     expect(existsSync(certPath)).toBe(true)
   })
 
+  test('writes a trust bundle: MITM CA first, then the host root store', async () => {
+    // The child's trust env vars (SSL_CERT_FILE etc.) REPLACE the tool's
+    // root store, so the bundle must contain the system roots too or hosts
+    // exempted from termination (tlsTerminate.excludeDomains) could never
+    // be verified by the in-sandbox client.
+    const ca = createMitmCA({})
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      expect(bundle.startsWith(ca.certPem.trim())).toBe(true)
+      const certCount = bundle.match(/-----BEGIN CERTIFICATE-----/g)!.length
+      expect(certCount).toBeGreaterThan(1)
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('disposeMitmCA removes the trust-bundle dir of a user-supplied CA', async () => {
+    const user = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+    const bundleDir = dirname(user.trustBundlePath)
+    expect(bundleDir).not.toBe(dirname(certPath))
+    expect(existsSync(user.trustBundlePath)).toBe(true)
+    await disposeMitmCA(user)
+    expect(existsSync(bundleDir)).toBe(false)
+    expect(existsSync(certPath)).toBe(true) // fixture untouched
+  })
+
   test('throws when only one of caCertPath/caKeyPath is provided', () => {
     expect(() => createMitmCA({ caCertPath: certPath })).toThrow(
       /must be provided together/,

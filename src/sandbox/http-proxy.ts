@@ -52,6 +52,24 @@ export interface HttpProxyServerOptions {
   mitmCA?: MitmCA
 
   /**
+   * Per-host opt-out of TLS termination; consulted only when `mitmCA` is
+   * set. Return false to leave that CONNECT as an opaque byte tunnel
+   * (still hostname-allowlisted via `filter`, but not content-inspected —
+   * the same posture as the non-tlsTerminate path), so the sandboxed
+   * client performs its own TLS handshake end-to-end with the upstream.
+   *
+   * Use for upstreams the proxy must not re-originate: mTLS services
+   * (only the in-sandbox client holds the client certificate) and
+   * certificate-pinning clients that reject the MITM CA. Note that
+   * `filterRequest` and `mutateHeaders` never see the HTTPS traffic to
+   * these hosts; plain-HTTP proxy requests to them are unaffected (those
+   * are readable without termination and keep the normal request pipeline).
+   *
+   * Absent, or returning true, means today's behaviour: terminate.
+   */
+  shouldTerminateTLS?(hostname: string, port: number): boolean
+
+  /**
    * Per-request filter; runs on plain-HTTP proxy requests and on terminated
    * HTTPS requests. See request-filter.ts.
    */
@@ -161,7 +179,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // (tlsTerminate and mitmProxy are mutually exclusive at the config
       // layer, so the first two never both apply.)
       let wrote200 = false
-      if (options.mitmCA) {
+      if (
+        options.mitmCA &&
+        (options.shouldTerminateTLS?.(hostname, port) ?? true)
+      ) {
         if (clientGone) return
         // We can only terminate TLS. CONNECT also carries non-TLS streams —
         // notably SSH on Linux, where the sandbox's own GIT_SSH_COMMAND
@@ -189,6 +210,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; opaque-tunnelling`,
         )
         head = peeked.head
+      } else if (options.mitmCA) {
+        // Per-host termination opt-out: the policy exempts this host (mTLS
+        // upstream, cert-pinning client), so skip the MITM entirely and
+        // take the opaque tunnel below, exactly as if mitmCA were unset.
+        logForDebugging(
+          `[tls-terminate] policy exempts ${hostname}:${port}; opaque-tunnelling`,
+        )
       }
 
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)

@@ -138,8 +138,8 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       expect(socksProxyPort).toBeGreaterThan(0)
       expect(socksProxyPort).toBeLessThan(65536)
 
-      // Should be different ports
-      expect(httpProxyPort).not.toBe(socksProxyPort)
+      // Both protocols are now served by the mux on a single port.
+      expect(httpProxyPort).toBe(socksProxyPort)
 
       await SandboxManager.reset()
     })
