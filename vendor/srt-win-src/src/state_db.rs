@@ -335,9 +335,8 @@ impl InitMutex {
     /// Create-or-open and acquire the init mutex. The mutex carries
     /// a broker-only DACL so a sandbox child cannot open it (and
     /// therefore cannot stall stamps by sitting on the lock).
-    fn acquire(group_sid: &str) -> Result<Self> {
-        let sa =
-            acl::build_init_mutex_sa(group_sid).context("build init-mutex SECURITY_ATTRIBUTES")?;
+    fn acquire() -> Result<Self> {
+        let sa = acl::build_init_mutex_sa().context("build init-mutex SECURITY_ATTRIBUTES")?;
         let name = wstr(MUTEX_NAME);
         // Don't request CREATE_MUTEX_INITIAL_OWNER — if another
         // broker already created the mutex this call opens it,
@@ -384,7 +383,7 @@ impl InitMutex {
 
 /// Open (creating if needed) the state DB at the default location.
 /// Stamps the parent directory broker-only on EVERY open.
-pub fn open_db(group_sid: &str) -> Result<Connection> {
+pub fn open_db() -> Result<Connection> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
     // Stamp the directory `(OI)(CI)` broker-only so the sandbox
@@ -438,7 +437,7 @@ pub fn open_db(group_sid: &str) -> Result<Connection> {
             }
         }
     };
-    if let Err(e) = acl::stamp_dir_inheriting(dir_str, group_sid, deny_sid.as_deref()) {
+    if let Err(e) = acl::stamp_dir_inheriting(dir_str, deny_sid.as_deref()) {
         eprintln!(
             "srt-win: WARNING: failed to stamp state-DB dir {} \
              broker-only: {e:#}",
@@ -871,15 +870,18 @@ fn state_dir_from(local_app_data: Option<std::ffi::OsString>) -> Result<PathBuf>
 ///
 /// See module doc for the no-enclosing-tx and ordering rationale.
 pub fn with_init_lock<R>(
-    group_sid: &str,
     holder_pid: HolderPid,
-    dacls: Option<&PrebuiltDacls>,
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
-    let _mutex = InitMutex::acquire(group_sid)?;
-    let conn = open_db(group_sid)?;
-    let report = crash_recovery(&conn, dacls, force_recover)?;
+    let _mutex = InitMutex::acquire()?;
+    let conn = open_db()?;
+    // `dacls: None` — the PROTECTED-stamp restore path in
+    // `crash_recovery` is dead (no callers create PROTECTED
+    // stamps after the same-user removal); the additive-ACE
+    // sweep runs regardless. The follow-up PR removes the
+    // `dacls` param entirely.
+    let report = crash_recovery(&conn, None, force_recover)?;
     let mut locked = Locked {
         conn,
         holder_pid,
@@ -949,7 +951,7 @@ impl Locked {
     ) -> Result<StampWitness> {
         // 1. Disk first.
         let cur = acl::capture_sd(canon).with_context(|| format!("capture SD for '{canon}'"))?;
-        let (cur_id, links) = path_id::capture_id_and_links(canon)
+        let (cur_id, links, _) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
         let parent = path_id::canonical_parent_of(canon);
 
@@ -1676,16 +1678,28 @@ impl Locked {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
             let mut failed = 0usize;
-            let mut one = |canon: &str, ace: SbAce| match db.ensure_ace(canon, ace, sandbox_sid) {
-                Ok(w) => witnesses.push(w),
-                Err(e) => {
-                    eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
-                    failed += 1;
+            let mut one = |canon: &str, ace: SbAce| -> bool {
+                match db.ensure_ace(canon, ace, sandbox_sid) {
+                    Ok(w) => {
+                        witnesses.push(w);
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
+                        failed += 1;
+                        false
+                    }
                 }
             };
             for (canon, ace) in targets {
-                one(canon, *ace);
-                if matches!(ace, SbAce::Deny(_))
+                // Skip the parent-FDC ACE when the file's own
+                // Deny failed (e.g. hardlink refuse) — the batch
+                // is going to roll back anyway (`failed > 0`),
+                // and stamping the parent first just to release
+                // it in the same pass wastes a SetSecurityInfo
+                // round-trip and clutters the failure output.
+                if one(canon, *ace)
+                    && matches!(ace, SbAce::Deny(_))
                     && let Some(p) = path_id::canonical_parent_of(canon)
                 {
                     one(&p, SbAce::DenyFdc);
@@ -1700,8 +1714,24 @@ impl Locked {
     /// crash between leaves a row whose ACE hasn't been written —
     /// the next call re-derives and reapplies.
     fn ensure_ace(&self, canon: &str, want: SbAce, sandbox_sid: &str) -> Result<AceWitness> {
-        let cur_id = path_id::capture_file_id(canon)
-            .with_context(|| format!("capture file_id '{canon}'"))?;
+        let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
+            .with_context(|| format!("capture file_id+links '{canon}'"))?;
+        // Hardlink guard: NTFS hardlinks share one SD across
+        // distinct canonical paths, but `ace_holders` is
+        // PATH-keyed. A Deny on one alias is invisible to a holder
+        // of another — `release_one_ace` on the alias sees
+        // remaining=0 and recomposes the SHARED DACL without the
+        // deny while the other holder's child is still running.
+        // Refuse Deny on multi-link files; Grant is fail-open so
+        // an early release is safe, and `DenyFdc` only targets
+        // directories.
+        if matches!(want, SbAce::Deny(_)) && !is_dir && links > 1 {
+            bail!(
+                "deny refused: '{canon}' has {links} hardlink(s); \
+                 ace_holders rows are path-keyed, so releasing an \
+                 alias would prematurely strip the shared deny ACE"
+            );
+        }
         let prior: Option<Vec<u8>> = self
             .conn
             .prepare_cached(

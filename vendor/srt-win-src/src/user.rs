@@ -2,29 +2,24 @@
 //!
 //! `srt-win install` provisions a dedicated local user
 //! ([`SANDBOX_USER`]) and a local group ([`SANDBOX_GROUP`]) that
-//! holds it. The sandboxed child will eventually run **as that
-//! user** (via `CreateProcessWithLogonW` from a non-elevated
-//! broker), so its token carries a different user SID, a fresh
-//! logon session, and is NOT a member of the discriminator group —
+//! holds it. The sandboxed child runs **as that user** (via
+//! `CreateProcessWithLogonW` from a non-elevated broker), so its
+//! token carries a different user SID and a fresh logon session —
 //! which structurally closes the surrogate-spawn class (schtasks,
 //! `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS, RunAs="Interactive
-//! User" COM) that a same-user deny-only-group token cannot.
+//! User" COM) that a same-user restricted token cannot.
 //!
 //! This module is the **provisioning** half only: create/delete the
 //! account, set/rotate its password, hide it from the logon UI, and
 //! report status. The runner that actually launches the child under
-//! this account is a separate, later piece.
+//! this account lives in [`crate::runner`] / [`crate::logon`].
 //!
 //! ## Why a group AND a user
 //!
-//! [`SANDBOX_GROUP`] is the trustee for the credential-file DENY ACE
-//! and (later) the working-tree grant. Keying those on the *group*
-//! rather than the user SID means a future multi-account design
-//! (e.g. per-session sandbox users) only adds members; the DACLs
-//! and WFP filters don't change. It is **distinct** from the
-//! discriminator group (`sandbox-runtime-net`) — the real user is a
-//! member of *that* one, the sandbox user is a member of *this* one,
-//! and never both.
+//! [`SANDBOX_GROUP`] is the trustee for the credential-file DENY
+//! ACE. Keying that on the *group* rather than the user SID means a
+//! future multi-account design (e.g. per-session sandbox users)
+//! only adds members; the DACLs don't change.
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -50,8 +45,7 @@ use crate::{sam, sid};
 pub const SANDBOX_USER: &str = "srt-sandbox";
 
 /// Local group that holds [`SANDBOX_USER`]. Trustee for the
-/// credential-file DENY ACE — distinct from the discriminator
-/// group `sandbox-runtime-net` (which holds the *real* user).
+/// credential-file DENY ACE.
 pub const SANDBOX_GROUP: &str = "sandbox-runtime-users";
 
 /// Result of [`provision`] — the password is returned in clear so

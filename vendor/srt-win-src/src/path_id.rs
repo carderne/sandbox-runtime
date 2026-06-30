@@ -234,13 +234,14 @@ fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
     })
 }
 
-/// `(file_id, NumberOfLinks)` from ONE metadata open (both are
-/// `GetFileInformationByHandleEx` queries on the same handle).
-/// `links > 1` means an alternate hardlink name exists, possibly
-/// under an unstamped parent directory — so the parent allow-list
-/// alone cannot fence delete/rename via that other name; callers
-/// route such files to the per-exec handle fence.
-pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32)> {
+/// `(file_id, NumberOfLinks, is_dir)` from ONE metadata open.
+/// `links > 1` on a non-directory means an alternate hardlink
+/// name exists; the additive-ACE refcount in `state_db` is
+/// PATH-keyed, so releasing one alias would strip the SHARED
+/// DACL while another alias's holder still expects it denied.
+/// Directory `NumberOfLinks` counts subdirs (NTFS has no dir
+/// hardlinks), so callers gate the check on `!is_dir`.
+pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)> {
     use windows::Win32::Storage::FileSystem::{
         FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
     };
@@ -262,7 +263,7 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32)> {
              '{canonical_path}'"
         )
     })?;
-    Ok((id, std_info.NumberOfLinks))
+    Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
 /// `FILE_ID_INFO` of `canonical_path`. Opens with no data access

@@ -1,5 +1,5 @@
 //! Broker-side `CreateProcessWithLogonW` wrapper for the
-//! `--as-sandbox-user` two-hop launch.
+//! broker→runner two-hop launch.
 //!
 //! Spawns `srt-win.exe runner` under the `srt-sandbox` account
 //! (via the Secondary Logon service — no
@@ -125,13 +125,7 @@ pub fn spawn_runner(
     // open until the runner exits so the kernel object survives the
     // whole two-hop chain. See `winsta.rs` module doc.
     let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    let mut desk = IsolatedDesk::new(Some(sb_sid)).context("broker IsolatedDesk")?;
-    if dbg {
-        eprintln!(
-            "srt-win: spawn_runner: desk={}",
-            String::from_utf16_lossy(desk.desktop_name_ptr_slice()),
-        );
-    }
+    let mut desk = IsolatedDesk::new(sb_sid).context("broker IsolatedDesk")?;
 
     let exe = std::env::current_exe().context("current_exe")?;
     let exe_s = exe
@@ -341,7 +335,6 @@ pub fn spawn_runner(
         GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess(runner)")?;
     }
     drop(job);
-    drop(desk);
     Ok(code)
 }
 
