@@ -397,6 +397,19 @@ export const NetworkConfigSchema = z.object({
             'the MITM CA. Hosts still need to be reachable via ' +
             'allowedDomains; this list only changes how they are tunnelled.',
         ),
+      extraCaCertPaths: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          'Paths to PEM CA certificate files appended to the trust bundle ' +
+            'the sandboxed child is pointed at, after the MITM CA and the ' +
+            "host's regular roots. Use for site-local roots (e.g. an " +
+            'internal mTLS CA) presented by excluded/passthrough hosts, so ' +
+            'the child can verify them itself. Only the CERTIFICATE blocks ' +
+            'of each file are copied; files that are missing, unreadable, ' +
+            'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
+            'log), so paths that exist on only some hosts are safe to list.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',

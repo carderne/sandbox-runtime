@@ -1162,5 +1162,50 @@ describe('Config Validation', () => {
         expect(result.success).toBe(true)
       })
     })
+
+    describe('extraCaCertPaths', () => {
+      test('accepts a list of paths and round-trips it', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: {
+              extraCaCertPaths: ['/etc/site-local-roots.pem', '/etc/extra.pem'],
+            },
+          },
+        })
+        expect(result.success).toBe(true)
+        if (result.success) {
+          expect(result.data.network.tlsTerminate?.extraCaCertPaths).toEqual([
+            '/etc/site-local-roots.pem',
+            '/etc/extra.pem',
+          ])
+        }
+      })
+
+      test('is optional', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: { ...base.network, tlsTerminate: {} },
+        })
+        expect(result.success).toBe(true)
+        if (result.success) {
+          expect(
+            result.data.network.tlsTerminate?.extraCaCertPaths,
+          ).toBeUndefined()
+        }
+      })
+
+      test('rejects an empty path', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: { extraCaCertPaths: [''] },
+          },
+        })
+        expect(result.success).toBe(false)
+      })
+    })
   })
 })

@@ -443,6 +443,114 @@ describe('tls-terminate-proxy: per-host termination opt-out (mTLS upstream)', ()
   })
 })
 
+describe('tls-terminate-proxy: extraCaCertPaths lets the client verify an excluded host with a site-local root', () => {
+  // The "site-local" PKI: the fixture CA plays the role of an internal root
+  // (e.g. an internal mTLS CA) that is in no public root store. The
+  // upstream's leaf chains to it.
+  const realCA = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+
+  let upstream: Server
+  let upstreamPort: number
+
+  beforeAll(async () => {
+    const upCert = mintLeafCert(realCA, '127.0.0.1')
+    const upLeafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    upstream = createHttpsServer(
+      { cert: upLeafOnly, key: upCert.keyPem },
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('site-local ok')
+      },
+    )
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', r))
+    upstreamPort = (upstream.address() as AddressInfo).port
+  })
+
+  afterAll(async () => {
+    await new Promise<void>(r => upstream.close(() => r()))
+    await disposeMitmCA(realCA)
+  })
+
+  const url = () => `https://127.0.0.1:${upstreamPort}/extra-ca`
+
+  // This is the regression the field exists for: SRT points the sandboxed
+  // child's trust env vars (GIT_SSL_CAINFO, SSL_CERT_FILE, ...) at the trust
+  // bundle, REPLACING the tool's own CA config. For an excluded
+  // (passthrough) host the child does its own handshake against the real
+  // certificate, so unless the site-local root is *in the bundle* the host
+  // can never be verified from inside the sandbox.
+  test('without extraCaCertPaths the bundle cannot verify the upstream (negative control)', async () => {
+    const mitmCA = createMitmCA({})
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      shouldTerminateTLS: () => false,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).not.toBe(0)
+      expect(r.stderr).toMatch(/certificate|issuer/i)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+
+  test('with extraCaCertPaths the bundle verifies the real upstream through the opaque tunnel', async () => {
+    const mitmCA = createMitmCA({ extraCaCertPaths: [CA_CERT] })
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      shouldTerminateTLS: () => false,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(r.body).toBe('site-local ok')
+      // curl saw the upstream's REAL certificate, not a MITM leaf.
+      expect(r.stderr).toMatch(/issuer:.*srt-test-ca/)
+      expect(r.stderr).not.toMatch(/sandbox-runtime ephemeral CA/)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+
+  test('terminated hosts still verify against the same bundle (MITM CA is first)', async () => {
+    const mitmCA = createMitmCA({ extraCaCertPaths: [CA_CERT] })
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      // On the terminated path curl saw the proxy-minted leaf.
+      expect(r.stderr).toMatch(/sandbox-runtime ephemeral CA/)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+})
+
 /**
  * Mint a clientAuth leaf signed by `ca` for the mTLS tests. Test-only:
  * the production minter (mintLeafCert) is for server-side MITM leaves and

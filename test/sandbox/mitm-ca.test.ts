@@ -150,3 +150,90 @@ describe('mitm-ca: ephemeral generation', () => {
     )
   })
 })
+
+describe('mitm-ca: extraCaCertPaths', () => {
+  // A site-local root (e.g. an internal mTLS CA) that excluded/passthrough
+  // hosts present. Reuse the committed fixture CA as a structurally real PEM.
+  const scratch = mkdtempSync(join(tmpdir(), 'srt-extra-ca-'))
+  const extraRootPath = join(scratch, 'extra-root.pem')
+  writeFileSync(extraRootPath, certPem)
+  const notACert = join(scratch, 'not-a-cert.pem')
+  writeFileSync(
+    notACert,
+    '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n',
+  )
+  // Combined cert+key PEM — a common layout for "the CA file". Only the
+  // CERTIFICATE block may reach the (world-readable) trust bundle.
+  const combined = join(scratch, 'combined.pem')
+  writeFileSync(combined, certPem + keyPem)
+
+  afterAll(() => {
+    rmSync(scratch, { recursive: true, force: true })
+  })
+
+  test('appends the PEM to the trust bundle (ephemeral CA path)', async () => {
+    const ca = createMitmCA({ extraCaCertPaths: [extraRootPath] })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // MITM CA still first; the extra root rides along at the end.
+      expect(bundle.startsWith(ca.certPem.trim())).toBe(true)
+      expect(bundle).toContain(certPem.trim())
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('appends the PEM on the user-supplied CA path too (loadCA)', async () => {
+    const ca = createMitmCA({
+      caCertPath: certPath,
+      caKeyPath: keyPath,
+      extraCaCertPaths: [extraRootPath],
+    })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // The fixture CA is both the MITM CA and the "extra" root here, so it
+      // must appear twice: once as the bundle head, once appended.
+      const occurrences = bundle.split(certPem.trim()).length - 1
+      expect(occurrences).toBe(2)
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('skips missing paths without throwing', async () => {
+    const ca = createMitmCA({
+      extraCaCertPaths: [join(scratch, 'nope.pem'), extraRootPath],
+    })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // The missing path is skipped; later entries are still appended.
+      expect(bundle).toContain(certPem.trim())
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('skips files with no PEM CERTIFICATE block', async () => {
+    const ca = createMitmCA({ extraCaCertPaths: [notACert] })
+    try {
+      expect(readFileSync(ca.trustBundlePath, 'utf8')).not.toContain(
+        'PRIVATE KEY',
+      )
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('copies only the CERTIFICATE blocks of a combined cert+key file', async () => {
+    // The trust bundle is world-readable and handed to the sandboxed child:
+    // a private key sitting next to the cert must never reach it.
+    const ca = createMitmCA({ extraCaCertPaths: [combined] })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      expect(bundle).toContain(certPem.trim())
+      expect(bundle).not.toContain('PRIVATE KEY')
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+})
