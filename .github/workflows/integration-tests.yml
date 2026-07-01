@@ -112,8 +112,6 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         env:
-          # winsrt.test.ts resolves the helper binary via this.
-          SRT_WIN_PATH: ${{ github.workspace }}\vendor\srt-win-src\target\release\srt-win.exe
           # Husky's prepare hook chokes on Windows runners; skip it.
           HUSKY: '0'
         run: |

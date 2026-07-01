@@ -24,6 +24,8 @@ import {
   verifyWindowsWfpEgress,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
+  resolveSrtWin,
+  SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -74,7 +76,7 @@ function createTestConfig(
       denyWrite: [],
     },
     windows: {
-      wfpSublayerGuid: TEST_SUBLAYER,
+      sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
     },
   }
@@ -226,47 +228,62 @@ async function bindOutOfRange(): Promise<BoundListener> {
   )
 }
 
-// Pure-JS object test — runs on all platforms. SRT_WIN_PATH is
-// pointed at any existing file so getSrtWinPath() doesn't throw on
-// non-Windows hosts.
+// Pure-JS object test — runs on all platforms. `srtWin.path` is
+// pointed at the test runner's own executable so binary resolution
+// passes its existence check on non-Windows hosts.
 describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
-  it('argv shape: --env overlay before --', () => {
-    const prev = process.env.SRT_WIN_PATH
-    process.env.SRT_WIN_PATH = process.execPath
-    try {
-      const on = wrapCommandWithSandboxWindows({
-        command: 'exit 0',
-        httpProxyPort: 60080,
-      })
-      // Two-hop overlay rides on --env: PATH + the single-sourced
-      // proxy set. Values follow each --env as KEY=VALUE.
-      const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
-      expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
-      expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
-      // CA-bundle vars are NOT forwarded — the bundle lives in
-      // broker %TEMP%, unreadable by srt-sandbox.
-      expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(
-        false,
-      )
-      // Every --env must precede `--` (clap stops parsing after it).
-      expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
-      // --as-sandbox-user is still passed while srt-win has
-      // LaunchMode::SameUser as the default; the Rust same-user-
-      // removal PR drops both the flag and this assertion.
-      expect(on.argv).toContain('--as-sandbox-user')
-      // Obsolete discriminator-group flags must NOT appear.
-      for (const dead of [
-        '--group-sid',
-        '--name',
-        '--holder-pid',
-        '--skip-group-check',
-      ]) {
-        expect(on.argv).not.toContain(dead)
-      }
-    } finally {
-      if (prev === undefined) delete process.env.SRT_WIN_PATH
-      else process.env.SRT_WIN_PATH = prev
+  it('argv shape: srtWin.path → [path, --srt-win, exec, …]; --env overlay before --', () => {
+    // Mirrors real usage: SandboxManager.initialize() resolves once
+    // and threads the SrtWinSpawn handle to every spawn site.
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const on = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      srtWin,
+    })
+    // `path` verbatim at argv[0]; the multicall sentinel at argv[1]
+    // is what an embedder's dispatcher routes on. `run_from_args`
+    // strips it, so the standalone binary accepts it harmlessly.
+    expect(on.argv[0]).toBe(process.execPath)
+    expect(on.argv[1]).toBe(SRT_WIN_DISPATCH_ARG1)
+    expect(on.argv[2]).toBe('exec')
+    // Two-hop overlay rides on --env: PATH + the single-sourced
+    // proxy set. Values follow each --env as KEY=VALUE.
+    const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
+    expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+    expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
+    // CA-bundle vars are NOT forwarded — the bundle lives in
+    // broker %TEMP%, unreadable by srt-sandbox.
+    expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(false)
+    // Every --env must precede `--` (clap stops parsing after it).
+    expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
+    // --as-sandbox-user is still passed while srt-win has
+    // LaunchMode::SameUser as the default; the Rust same-user-
+    // removal PR drops both the flag and this assertion.
+    expect(on.argv).toContain('--as-sandbox-user')
+    // Obsolete discriminator-group flags must NOT appear.
+    for (const dead of [
+      '--group-sid',
+      '--name',
+      '--holder-pid',
+      '--skip-group-check',
+    ]) {
+      expect(on.argv).not.toContain(dead)
     }
+  })
+
+  it('resolveSrtWin: explicit path → sentinel prepend; unset → packaged binary, no sentinel', () => {
+    const set = resolveSrtWin({ path: process.execPath })
+    expect(set.exe).toBe(process.execPath)
+    expect(set.prependArgs).toEqual([SRT_WIN_DISPATCH_ARG1])
+    // The TS const must mirror the Rust `srt_win::SRT_WIN_DISPATCH_ARG1`.
+    expect(SRT_WIN_DISPATCH_ARG1).toBe('--srt-win')
+  })
+
+  it('resolveSrtWin: missing explicit path is named (no fallback)', () => {
+    expect(() => resolveSrtWin({ path: '/nonexistent/srt-win.exe' })).toThrow(
+      /windows\.srtWin\.path is set to '.+' but the file does not exist/,
+    )
   })
 })
 

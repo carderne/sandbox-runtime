@@ -18,6 +18,7 @@ export {
   stripExtendedPathPrefix,
 } from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
+import type { SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -252,6 +253,12 @@ export interface WindowsSandboxParams {
    */
   caCertPath?: string
   /**
+   * Resolved `srt-win` spawn descriptor — from
+   * {@link resolveSrtWin}. Omit to resolve the packaged vendor
+   * binary at call time.
+   */
+  srtWin?: SrtWinSpawn
+  /**
    * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
    * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
    * `"…"`/`'…'` quotes exactly as written. The security boundary is at
@@ -276,18 +283,20 @@ function repoRoot(): string {
 const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
 
 /**
- * Locate `srt-win.exe`. Resolution order:
- *   1. `SRT_WIN_PATH` env var (CI sets this to the freshly-built binary).
- *   2. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
+ * Locate the packaged `srt-win.exe`. Resolution order:
+ *   1. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
  *      package, or after `npm run build:srt-win` locally).
- *   3. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
+ *   2. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
  *      `cargo build --release` fallback for development).
- *   4. `<root>/vendor/srt-win/target/release/srt-win.exe` (transitional:
- *      stale local build from before the srt-win-src rename).
  *
  * `<root>` is {@link repoRoot} — `__dirname/../..`, which resolves to the
  * repo root from `src/sandbox/` and `dist/sandbox/` alike, and to the
  * package root when installed under `node_modules`.
+ *
+ * Callers that ship their own binary (or a multicall binary that
+ * routes on `argv[1] == `{@link SRT_WIN_DISPATCH_ARG1}) pass
+ * `windows.srtWin` instead of relying on this lookup — see
+ * {@link resolveSrtWin}.
  *
  * Resolution via the optional `@anthropic-ai/sandbox-runtime-win32-*`
  * platform packages is added separately.
@@ -295,10 +304,6 @@ const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
  * @throws if none exist.
  */
 export function getSrtWinPath(): string {
-  const envPath = process.env.SRT_WIN_PATH
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath
-  }
   const root = repoRoot()
   const arch = nodeArchToDir[process.arch]
   const candidates: string[] = []
@@ -314,17 +319,58 @@ export function getSrtWinPath(): string {
       'release',
       'srt-win.exe',
     ),
-    // transitional: stale local build from before the srt-win-src rename
-    path.join(root, 'vendor', 'srt-win', 'target', 'release', 'srt-win.exe'),
   )
   for (const c of candidates) {
     if (fs.existsSync(c)) return c
   }
   throw new Error(
-    `srt-win.exe not found. Set SRT_WIN_PATH or build with ` +
+    `srt-win.exe not found. Set windows.srtWin.path or build with ` +
       `\`cargo build --release --manifest-path vendor/srt-win-src/Cargo.toml\`. ` +
-      `Looked in: ${[envPath, ...candidates].filter(Boolean).join(', ')}`,
+      `Looked in: ${candidates.join(', ')}`,
   )
+}
+
+/**
+ * `argv[1]` sentinel a multicall embedder's dispatcher matches
+ * against to route into `srt_win::run_from_args`. Mirrors the Rust
+ * `srt_win::SRT_WIN_DISPATCH_ARG1`; the two MUST stay in sync.
+ * `run_from_args` strips it before clap, so the standalone binary
+ * accepts it harmlessly.
+ */
+export const SRT_WIN_DISPATCH_ARG1 = '--srt-win'
+
+/**
+ * Resolved `srt-win` spawn descriptor — the executable to load plus
+ * the leading arguments that carry the dispatch sentinel. Threaded
+ * to every spawn site so {@link resolveSrtWin} runs once (at
+ * `initialize()`) instead of re-`stat`ing on every helper call.
+ */
+export type SrtWinSpawn = Readonly<{
+  exe: string
+  prependArgs: readonly string[]
+}>
+
+/**
+ * Resolve the `srt-win` spawn target from config. When `cfg.path` is
+ * set it is used verbatim (no fallback to the packaged binary — an
+ * explicit override is a directive, not a hint) and
+ * {@link SRT_WIN_DISPATCH_ARG1} is prepended so a multicall
+ * dispatcher routes on `argv[1]`. When unset, falls back to
+ * {@link getSrtWinPath} with no sentinel (the packaged binary
+ * doesn't need it; `run_from_args` would strip it anyway).
+ */
+export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
+  if (cfg?.path !== undefined) {
+    if (!fs.existsSync(cfg.path)) {
+      throw new Error(
+        `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
+          `not exist; remove srtWin.path to fall back to the packaged ` +
+          `binary`,
+      )
+    }
+    return { exe: cfg.path, prependArgs: [SRT_WIN_DISPATCH_ARG1] }
+  }
+  return { exe: getSrtWinPath(), prependArgs: [] }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -338,16 +384,22 @@ interface RunResult {
   stderr: string
 }
 
-function runSrtWin(
-  args: string[],
-  timeoutMs = 15_000,
-  stdin?: string,
-): RunResult {
-  const exe = getSrtWinPath()
-  const r = spawnSync(exe, args, {
+interface RunOpts {
+  timeoutMs?: number
+  stdin?: string
+  srtWin?: SrtWinSpawn
+}
+
+function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
+  // Direct callers of the exported helpers may omit `srtWin`
+  // (backward-compat) — fall back to the packaged-binary lookup.
+  // `SandboxManager` resolves once at `initialize()` and threads the
+  // handle, so this per-call resolve is only hit outside a session.
+  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
-    timeout: timeoutMs,
-    ...(stdin !== undefined ? { input: stdin } : {}),
+    timeout: opts.timeoutMs ?? 15_000,
+    ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
   if (r.error) {
     throw new Error(`srt-win ${args[0]}: spawn failed: ${r.error.message}`)
@@ -360,8 +412,8 @@ function runSrtWin(
   }
 }
 
-function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
-  const r = runSrtWin(args, opts?.timeoutMs)
+function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
+  const r = runSrtWin(args, opts)
   if (r.status !== 0) {
     throw new Error(
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
@@ -385,9 +437,9 @@ function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
  */
 function runSrtWinJsonAllowFail<T>(
   args: string[],
-  timeoutMs: number,
+  opts: RunOpts,
 ): { ok: boolean; json: T; stderr: string } {
-  const r = runSrtWin(args, timeoutMs)
+  const r = runSrtWin(args, opts)
   let json: T
   try {
     json = JSON.parse(r.stdout) as T
@@ -416,7 +468,7 @@ function runSrtWinJsonAllowFail<T>(
  * non-elevated readiness check is {@link verifyWindowsWfpEgress}.
  */
 export function getWindowsWfpStatus(
-  opts: { sublayerGuid?: string } = {},
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
 ): WindowsWfpStatusResult {
   const args = ['wfp', 'status']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
@@ -426,7 +478,7 @@ export function getWindowsWfpStatus(
     port_range?: [number, number]
     user_sid?: string
     hint?: string
-  }>(args)
+  }>(args, { srtWin: opts.srtWin })
   return {
     state: raw.state,
     filters: raw.filters,
@@ -464,6 +516,7 @@ export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
   let target = opts.target
@@ -498,7 +551,10 @@ export async function verifyWindowsWfpEgress(
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
     // same budget as windowsTrustCa, plus the runner's own 2s
     // connect timeout.
-    const r = runSrtWin(['wfp', 'verify', '--target', target], 30_000)
+    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+      timeoutMs: 30_000,
+      srtWin: opts.srtWin,
+    })
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
@@ -544,7 +600,9 @@ export async function verifyWindowsWfpEgress(
  * user exists but credential file missing) is distinguishable.
  * Does not require elevation.
  */
-export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
+export function getWindowsSandboxUserStatus(
+  opts: { srtWin?: SrtWinSpawn } = {},
+): WindowsSandboxUserStatus {
   const raw = runSrtWinJson<{
     user: {
       exists: boolean
@@ -560,7 +618,7 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     real_user_sid: string
     ca_cert_thumb?: string | null
     ca_cert_pem?: string | null
-  }>(['user', 'status'])
+  }>(['user', 'status'], { srtWin: opts.srtWin })
   return {
     provisioned: raw.user.exists,
     ...(raw.user.sid && { sid: raw.user.sid }),
@@ -597,8 +655,9 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
  */
 export function getWindowsSandboxCaCert(
   status?: WindowsSandboxUserStatus,
+  opts: { srtWin?: SrtWinSpawn } = {},
 ): { pem: string; thumb: string } | null {
-  const u = status ?? getWindowsSandboxUserStatus()
+  const u = status ?? getWindowsSandboxUserStatus(opts)
   if (!u.caCertThumb || !u.caCertPem) return null
   return { pem: u.caCertPem, thumb: u.caCertThumb }
 }
@@ -619,10 +678,16 @@ export function getWindowsSandboxCaCert(
  *   parseable X.509 certificate, or the registry write into the
  *   sandbox user's hive fails.
  */
-export function windowsTrustCa(caCertPath: string): void {
+export function windowsTrustCa(
+  caCertPath: string,
+  opts: { srtWin?: SrtWinSpawn } = {},
+): void {
   // 60s: first call may create the sandbox user's profile
   // (LOGON_WITH_PROFILE) via the one-shot CreateProcessWithLogonW.
-  const r = runSrtWin(['user', 'trust-ca', caCertPath], 60_000)
+  const r = runSrtWin(['user', 'trust-ca', caCertPath], {
+    timeoutMs: 60_000,
+    srtWin: opts.srtWin,
+  })
   logForDebugging(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -650,6 +715,8 @@ export interface WindowsInstallOptions {
    * rather than silently overwriting.
    */
   force?: boolean
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 export interface WindowsInstallResult {
@@ -687,6 +754,7 @@ export interface WindowsInstallResult {
 export function installWindowsSandbox(
   opts: WindowsInstallOptions = {},
 ): WindowsInstallResult {
+  const srtWin = opts.srtWin ?? resolveSrtWin()
   const args = ['install']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.proxyPortRange) {
@@ -697,7 +765,7 @@ export function installWindowsSandbox(
   }
   if (opts.force) args.push('--force')
 
-  const r = runSrtWin(args, 60_000)
+  const r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -710,15 +778,15 @@ export function installWindowsSandbox(
   //   14 sandbox-user provisioning failed
   //   1  other error (stderr has detail)
   const out = r.stderr || r.stdout
+  const readBack = () => ({
+    wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
+    user: getWindowsSandboxUserStatus({ srtWin }),
+  })
   switch (r.status) {
     case 0:
-      break
+      return readBack()
     case 10:
-      return {
-        wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
-        user: getWindowsSandboxUserStatus(),
-        cancelled: true,
-      }
+      return { ...readBack(), cancelled: true }
     case 12:
       throw new Error(`srt-win install: WFP filter install failed: ${out}`)
     case 14:
@@ -734,11 +802,6 @@ export function installWindowsSandbox(
     default:
       throw new Error(`srt-win install failed (exit ${r.status}): ${out}`)
   }
-
-  return {
-    wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
-    user: getWindowsSandboxUserStatus(),
-  }
 }
 
 /**
@@ -749,14 +812,18 @@ export function installWindowsSandbox(
  * @returns `{cancelled: true}` if the user dismissed UAC.
  */
 export function uninstallWindowsSandbox(
-  opts: { sublayerGuid?: string; keepUser?: boolean } = {},
+  opts: {
+    sublayerGuid?: string
+    keepUser?: boolean
+    srtWin?: SrtWinSpawn
+  } = {},
 ): {
   cancelled?: true
 } {
   const args = ['uninstall']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.keepUser) args.push('--keep-user')
-  const r = runSrtWin(args)
+  const r = runSrtWin(args, { srtWin: opts.srtWin })
   logForDebugging(
     `[Sandbox Windows] uninstall exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -805,6 +872,8 @@ export interface WindowsAclStampOptions {
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 /**
@@ -838,8 +907,7 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
       '--sandbox-user-sid',
       opts.sandboxUserSid,
     ],
-    60_000,
-    stdin,
+    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
   logForDebugging(
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -876,6 +944,7 @@ export interface WindowsAclAceOutcome {
 export function restoreWindowsAcl(opts: {
   sandboxUserSid: string
   holderPid?: number
+  srtWin?: SrtWinSpawn
 }): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
   // Don't let a teardown helper throw — the caller's reset() must
@@ -897,7 +966,7 @@ export function restoreWindowsAcl(opts: {
         opts.sandboxUserSid,
         '--json',
       ],
-      60_000,
+      { timeoutMs: 60_000, srtWin: opts.srtWin },
     )
     if (!r.ok) {
       logForDebugging(
@@ -929,6 +998,8 @@ export interface WindowsAclGrantOptions {
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 /**
@@ -954,8 +1025,7 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
       '--sandbox-user-sid',
       opts.sandboxUserSid,
     ],
-    60_000,
-    stdin,
+    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
   logForDebugging(
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -975,6 +1045,7 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 export function revokeWindowsAcl(opts: {
   sandboxUserSid: string
   holderPid?: number
+  srtWin?: SrtWinSpawn
 }): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
   try {
@@ -988,7 +1059,7 @@ export function revokeWindowsAcl(opts: {
         opts.sandboxUserSid,
         '--json',
       ],
-      60_000,
+      { timeoutMs: 60_000, srtWin: opts.srtWin },
     )
     if (!r.ok) {
       logForDebugging(
@@ -1031,7 +1102,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
 } {
-  const exe = getSrtWinPath()
+  const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
   // Generated proxy + CA-trust env. Single-sourced here so the
   // same object feeds (a) the spawn env merge below and (b) the
   // explicit `--env` overlay for the runner.
@@ -1063,7 +1134,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
 
-  const argv: string[] = [exe, 'exec']
+  const argv: string[] = [exe, ...prependArgs, 'exec']
   // Required while srt-win still has LaunchMode::SameUser as
   // default; dropped in the Rust same-user-removal PR. `--env`
   // on main carries `requires = "as_sandbox_user"`, so this
@@ -1197,24 +1268,27 @@ export function windowsInstallInstructions(
  * `initialize()`; warnings are informational.
  */
 export function checkWindowsDependencies(
-  sublayerGuid?: string,
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
 ): SandboxDependencyCheck {
+  const { sublayerGuid } = opts
   const errors: string[] = []
   const warnings: string[] = []
 
-  // 1. Binary present.
-  let exe: string
+  // 1. Binary present (`resolveSrtWin` throws on a missing
+  // override, `getSrtWinPath` on a missing packaged binary). Resolve
+  // once and reuse for the status calls below.
+  let srtWin: SrtWinSpawn
   try {
-    exe = getSrtWinPath()
+    srtWin = opts.srtWin ?? resolveSrtWin()
   } catch (e) {
     return { errors: [(e as Error).message], warnings }
   }
-  logForDebugging(`[Sandbox Windows] using srt-win at ${exe}`)
+  logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
 
   // 2. Sandbox user provisioned + credential readable.
   let us: WindowsSandboxUserStatus
   try {
-    us = getWindowsSandboxUserStatus()
+    us = getWindowsSandboxUserStatus({ srtWin })
   } catch (e) {
     errors.push(`srt-win user status failed: ${(e as Error).message}`)
     return { errors, warnings }
@@ -1233,7 +1307,7 @@ export function checkWindowsDependencies(
   // `initialize()` and is what actually fails closed.
   let ws: WindowsWfpStatusResult
   try {
-    ws = getWindowsWfpStatus({ sublayerGuid })
+    ws = getWindowsWfpStatus({ sublayerGuid, srtWin })
   } catch (e) {
     errors.push(`srt-win wfp status failed: ${(e as Error).message}`)
     return { errors, warnings }

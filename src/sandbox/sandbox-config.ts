@@ -539,12 +539,42 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Configuration for locating/invoking the `srt-win` helper (Windows
+ * only). An embedder that links `srt-win`'s CLI into its own
+ * multicall binary points `path` at that binary; spawns then pass
+ * `--srt-win` as `argv[1]` (see `SRT_WIN_DISPATCH_ARG1` in
+ * `windows-sandbox-utils.ts` / `srt_win::SRT_WIN_DISPATCH_ARG1`) so
+ * the embedder's dispatcher can route to `srt_win::run_from_args`.
+ * Windows cannot reliably preserve a spoofed `argv[0]` across
+ * `CreateProcessWithLogonW` / `ShellExecuteExW(runas)`, so dispatch
+ * keys on `argv[1]`, not on `argv[0]` like
+ * {@link SeccompConfigSchema} does on Linux.
+ */
+export const SrtWinConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
+        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
+        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
+        "multicall dispatcher can route to srt-win's CLI.",
+    ),
+})
+
+/**
  * Windows-specific configuration schema. See
  * `windows-sandbox-utils.ts` for the install flow these settings
  * must agree with.
+ *
+ * Canonical: `sublayerGuid`; the `wfpSublayerGuid` alias is resolved
+ * at read sites (`sublayerGuid ?? wfpSublayerGuid`) rather than via
+ * `.transform()` so this stays a plain `ZodObject` for consumers that
+ * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
-  wfpSublayerGuid: z
+  sublayerGuid: z
     .string()
     .uuid()
     .optional()
@@ -553,6 +583,11 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
+  wfpSublayerGuid: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Deprecated alias for sublayerGuid.'),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
@@ -565,6 +600,11 @@ export const WindowsConfigSchema = z.object({
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
+  srtWin: SrtWinConfigSchema.optional().describe(
+    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
+      'packaged vendor binary; set when embedding srt-win into a multicall ' +
+      'binary.',
+  ),
 })
 
 /**
@@ -815,5 +855,6 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

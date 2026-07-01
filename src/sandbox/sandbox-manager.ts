@@ -50,6 +50,8 @@ import {
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
   verifyWindowsWfpEgress,
+  resolveSrtWin,
+  type SrtWinSpawn,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
@@ -115,6 +117,11 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
 let windowsWfpVerified = false
+// Resolved once at initialize() (`resolveSrtWin` stats the disk).
+// Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
+// and so reset()'s revoke/restore addresses the SAME binary the
+// grants/stamps were applied with even if `config` mutated between.
+let srtWinSpawn: SrtWinSpawn | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -419,7 +426,10 @@ async function initialize(
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
-    const u = getWindowsSandboxUserStatus()
+    // Resolve once (stats disk); captured module-level for wrap/reset.
+    srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
+    const srtWin = srtWinSpawn
+    const u = getWindowsSandboxUserStatus({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new Error(
@@ -441,6 +451,7 @@ async function initialize(
       try {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          srtWin,
         })
       } catch (e) {
         config = undefined
@@ -505,6 +516,7 @@ async function initialize(
           sandboxUserSid: sb,
           read: acc.grantRead,
           write: acc.grantWrite,
+          srtWin,
         })
       }
       if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
@@ -512,6 +524,7 @@ async function initialize(
           sandboxUserSid: sb,
           denyRead: acc.denyRead,
           denyWrite: acc.denyWrite,
+          srtWin,
         })
       }
       // Only record when something was actually applied — gates
@@ -540,8 +553,8 @@ async function initialize(
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid })
+        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -670,7 +683,18 @@ function checkDependencies(ripgrepConfig?: {
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
-    const winDeps = checkWindowsDependencies(config?.windows?.wfpSublayerGuid)
+    let srtWin: SrtWinSpawn | undefined
+    try {
+      srtWin = resolveSrtWin(config?.windows?.srtWin)
+    } catch (e) {
+      errors.push((e as Error).message)
+      return { errors, warnings }
+    }
+    const winDeps = checkWindowsDependencies({
+      sublayerGuid:
+        config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+      srtWin,
+    })
     errors.push(...winDeps.errors)
     warnings.push(...winDeps.warnings)
   }
@@ -1398,6 +1422,9 @@ async function wrapWithSandboxArgv(
       denyWrite: perExecDenyWrite,
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
+      srtWin: customConfig?.windows?.srtWin
+        ? resolveSrtWin(customConfig.windows.srtWin)
+        : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
     })
   }
 
@@ -1601,6 +1628,9 @@ async function reset(): Promise<void> {
   // `srt-win acl recover` (which sweeps by trustee SID).
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
+    // Captured at initialize() — the SAME binary the grants/stamps
+    // were applied with, immune to `config` mutation between.
+    const srtWin = srtWinSpawn
     // 'restored'/'alreadyOriginal' are the pre- same-user-removal
     // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
     // post-. Either is non-anomalous.
@@ -1615,16 +1645,17 @@ async function reset(): Promise<void> {
         )
       }
     }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb }) ?? []) {
+    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
       log('grant revoke', e)
     }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb }) ?? []) {
+    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
       log('deny restore', e)
     }
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
