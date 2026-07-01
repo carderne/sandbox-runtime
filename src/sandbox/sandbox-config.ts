@@ -210,6 +210,16 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  *   non-matching `extract` (default `"warn"`: stderr warning, file left
  *   readable as-is).
  *
+ * `maskDuplicates: true` (only meaningful with `extract` or `decode`)
+ * additionally replaces every verbatim occurrence of each masked value
+ * *outside* the regex-matched spans — for a secret repeated where the
+ * regex does not reach (e.g. pasted into a comment). The scan is raw
+ * substring matching, so a short or common captured value may also hit
+ * unrelated content that happens to contain it; intended for long,
+ * high-entropy secrets. Composed with `decode`, only captures that passed
+ * verification are scanned — a duplicate is the same value and reuses the
+ * verified capture's fake without re-verification.
+ *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
  * unreadable inside the sandbox).
@@ -269,6 +279,21 @@ export const CredentialFileConfigSchema = z.object({
         'keeps working. If no candidate verifies, behaviour is governed by ' +
         'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
         '"mask"; accepted but ignored for "deny".',
+    ),
+  maskDuplicates: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, verbatim occurrences of each captured credential value ' +
+        'outside the regex-matched spans are also replaced with the ' +
+        'corresponding sentinel — for a secret repeated where the regex ' +
+        'does not reach (e.g. in a comment). Matches raw substrings: short ' +
+        'or common credential values may corrupt unrelated content, so ' +
+        'this is intended for long, high-entropy secrets. With decode, ' +
+        'only values that passed verification are scanned; duplicates ' +
+        "reuse the verified value's fake without re-verification. " +
+        'Defaults to false. Only meaningful with mode "mask" and extract ' +
+        'or decode set; accepted but ignored otherwise.',
     ),
   injectHosts: z
     .array(domainPatternSchema)

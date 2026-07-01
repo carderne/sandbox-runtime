@@ -19,7 +19,7 @@
 //! explicit DENY for `sandbox-runtime-users`, so the runner cannot
 //! open it.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
@@ -126,7 +126,9 @@ pub fn run() -> Result<u32> {
             launch::run_lockdown(
                 &exe,
                 &spec.argv[1..],
-                &LaunchMode::SandboxUser { env_overlay: &spec.env_overlay },
+                &LaunchMode::SandboxUser {
+                    env_overlay: &spec.env_overlay,
+                },
             )
         }
         RunnerCmd::InstallCa { der } => {
@@ -147,9 +149,9 @@ pub fn run() -> Result<u32> {
             // something OTHER than the WFP fence — falls through
             // to `unreachable`.
             const WSAEACCES: i32 = 10013;
-            let addr: SocketAddr = target.parse().with_context(|| {
-                format!("runner: ProbeEgress target '{target}'")
-            })?;
+            let addr: SocketAddr = target
+                .parse()
+                .with_context(|| format!("runner: ProbeEgress target '{target}'"))?;
             // stderr (not stdout): `spawn_runner` pumps the
             // runner's stdout straight to the broker's stdout, and
             // the broker writes its own JSON there. The exit code
@@ -174,7 +176,8 @@ pub fn run() -> Result<u32> {
                     eprintln!(
                         "srt-win: runner: egress probe {target}: \
                          UNREACHABLE: {e} (kind={:?}, os={:?})",
-                        e.kind(), e.raw_os_error(),
+                        e.kind(),
+                        e.raw_os_error(),
                     );
                     Ok(2)
                 }
@@ -198,8 +201,7 @@ mod tests {
             u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
             bytes.len() - 4
         );
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         match back {
             RunnerCmd::Exec(r) => {
                 assert_eq!(r.argv, ["cmd.exe", "/c", "echo hi"]);
@@ -211,8 +213,7 @@ mod tests {
             der: crate::cert_store::CertDer::raw(vec![0x30, 0x82]),
         };
         let bytes = encode_cmd(&ca).unwrap();
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back, RunnerCmd::InstallCa { der } if der.as_bytes() == [0x30, 0x82]
         ));
@@ -220,8 +221,7 @@ mod tests {
             target: "127.0.0.1:49999".into(),
         };
         let bytes = encode_cmd(&probe).unwrap();
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back, RunnerCmd::ProbeEgress { target } if target == "127.0.0.1:49999"
         ));

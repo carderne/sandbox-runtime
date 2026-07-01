@@ -6,22 +6,17 @@
 //! built by `AllocateAndInitializeSid`. The `LocalPsid` RAII wrapper
 //! enforces that.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSidToSidW,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows::Win32::Security::{
-    EqualSid, GetLengthSid, GetTokenInformation, LookupAccountNameW,
-    LookupAccountSidW, PSID, SID_NAME_USE, TokenGroups, TokenUser,
-    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    EqualSid, GetLengthSid, GetTokenInformation, LookupAccountNameW, LookupAccountSidW, PSID,
+    SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
 };
-use windows::Win32::System::SystemServices::{
-    SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY,
-};
+use windows::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::core::PWSTR;
 
 use crate::util::{from_pwstr, local_free, pcwstr, wstr};
 
@@ -35,9 +30,8 @@ impl LocalPsid {
         let mut sid = PSID::default();
         let w = wstr(sid_str);
         unsafe {
-            ConvertStringSidToSidW(pcwstr(&w), &mut sid).map_err(|e| {
-                anyhow!("ConvertStringSidToSidW({sid_str}): {e}")
-            })?;
+            ConvertStringSidToSidW(pcwstr(&w), &mut sid)
+                .map_err(|e| anyhow!("ConvertStringSidToSidW({sid_str}): {e}"))?;
         }
         Ok(Self(sid))
     }
@@ -50,15 +44,15 @@ impl LocalPsid {
     /// Borrow lives as long as `self`.
     pub fn as_bytes(&self) -> &[u8] {
         let len = unsafe { GetLengthSid(self.0) } as usize;
-        unsafe { std::slice::from_raw_parts(self.0 .0 as *const u8, len) }
+        unsafe { std::slice::from_raw_parts(self.0.0 as *const u8, len) }
     }
 }
 
 impl Drop for LocalPsid {
     fn drop(&mut self) {
-        if !self.0 .0.is_null() {
+        if !self.0.0.is_null() {
             unsafe {
-                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
             }
         }
     }
@@ -75,8 +69,7 @@ pub fn sid_bytes(sid_str: &str) -> Result<Vec<u8>> {
 pub fn psid_to_string(sid: PSID) -> Result<String> {
     let mut p = PWSTR::null();
     unsafe {
-        ConvertSidToStringSidW(sid, &mut p)
-            .map_err(|e| anyhow!("ConvertSidToStringSidW: {e}"))?;
+        ConvertSidToStringSidW(sid, &mut p).map_err(|e| anyhow!("ConvertSidToStringSidW: {e}"))?;
     }
     let s = from_pwstr(p);
     local_free(p.0 as *mut c_void);
@@ -101,9 +94,7 @@ pub enum SidExistence {
 /// Used by `group status --group-sid` so a typo'd SID is reported as
 /// `absent` rather than `created-not-on-token`.
 pub fn sid_account_exists(sid_str: &str) -> Result<SidExistence> {
-    use windows::Win32::Foundation::{
-        GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED,
-    };
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GetLastError};
     let psid = LocalPsid::from_string(sid_str)?;
     unsafe {
         let mut cch_name: u32 = 0;
@@ -154,9 +145,7 @@ pub fn lookup_account_sid(name: &str) -> Result<String> {
             &mut use_,
         );
         if cb_sid == 0 {
-            return Err(anyhow!(
-                "LookupAccountNameW({name}): account not found"
-            ));
+            return Err(anyhow!("LookupAccountNameW({name}): account not found"));
         }
         let mut sid_buf = vec![0u8; cb_sid as usize];
         let mut dom_buf = vec![0u16; cch_dom.max(1) as usize];
@@ -195,9 +184,7 @@ pub fn lookup_account_name(sid_str: &str) -> Result<String> {
         );
     }
     if cch_name == 0 {
-        return Err(anyhow!(
-            "LookupAccountSidW({sid_str}): sizing returned 0"
-        ));
+        return Err(anyhow!("LookupAccountSidW({sid_str}): sizing returned 0"));
     }
     let mut name = vec![0u16; cch_name as usize];
     let mut dom = vec![0u16; cch_dom.max(1) as usize];
@@ -220,8 +207,7 @@ pub fn lookup_account_name(sid_str: &str) -> Result<String> {
 pub fn current_user_sid() -> Result<String> {
     unsafe {
         let mut tok = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok)
-            .context("OpenProcessToken")?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).context("OpenProcessToken")?;
         let mut len = 0u32;
         let _ = GetTokenInformation(tok, TokenUser, None, 0, &mut len);
         let mut buf = vec![0u8; len as usize];
@@ -262,8 +248,7 @@ pub fn group_state_for_self(target_sid: &str) -> Result<GroupState> {
     let target = LocalPsid::from_string(target_sid)?;
     unsafe {
         let mut tok = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok)
-            .context("OpenProcessToken")?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).context("OpenProcessToken")?;
         let mut len = 0u32;
         let _ = GetTokenInformation(tok, TokenGroups, None, 0, &mut len);
         let mut buf = vec![0u8; len as usize];
@@ -277,10 +262,7 @@ pub fn group_state_for_self(target_sid: &str) -> Result<GroupState> {
         let _ = CloseHandle(tok);
         r.context("GetTokenInformation(TokenGroups)")?;
         let tg = &*(buf.as_ptr() as *const TOKEN_GROUPS);
-        let arr = std::slice::from_raw_parts(
-            tg.Groups.as_ptr(),
-            tg.GroupCount as usize,
-        );
+        let arr = std::slice::from_raw_parts(tg.Groups.as_ptr(), tg.GroupCount as usize);
         for g in arr {
             if EqualSid(target.as_psid(), g.Sid).is_ok() {
                 let attrs = g.Attributes as i32;

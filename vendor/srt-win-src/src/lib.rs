@@ -14,20 +14,20 @@ pub mod sid;
 pub mod util;
 pub mod wfp;
 
-pub mod token;
 pub mod job;
-pub mod winsta;
-pub mod self_protect;
 pub mod launch;
+pub mod self_protect;
+pub mod token;
+pub mod winsta;
 
 pub mod acl;
-pub mod path_id;
 pub mod fence;
+pub mod path_id;
 pub mod state_db;
 
 pub mod dpapi;
-pub mod user;
 pub mod install;
+pub mod user;
 
 pub mod cert_store;
 pub mod logon;

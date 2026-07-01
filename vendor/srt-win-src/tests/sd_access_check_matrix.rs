@@ -30,22 +30,21 @@
 #![cfg(windows)]
 
 use std::mem::size_of;
-use windows::core::BOOL;
 use windows::Win32::Foundation::{
-    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
-    HANDLE,
-};
-use windows::Win32::Security::{
-    AccessCheck, CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation,
-    TokenImpersonation, GENERIC_MAPPING, PRIVILEGE_SET, PSECURITY_DESCRIPTOR,
-    SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
+    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows::Win32::Security::{
+    AccessCheck, CreateRestrictedToken, DuplicateTokenEx, GENERIC_MAPPING, PRIVILEGE_SET,
+    PSECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SecurityImpersonation, TOKEN_ALL_ACCESS,
+    TOKEN_DUPLICATE, TOKEN_QUERY, TokenImpersonation,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::core::BOOL;
 
 use srt_win::sid::LocalPsid;
 use srt_win::util::wstr;
-use srt_win::wfp::{sddl_group, sddl_nonmember, SDDL_EVERYONE};
+use srt_win::wfp::{SDDL_EVERYONE, sddl_group, sddl_nonmember};
 
 /// `BUILTIN\Administrators`. Reliably present-and-enabled on the
 /// GitHub-hosted Windows runner's token. If this test runs on a
@@ -94,12 +93,8 @@ fn deny_only_token(group_sid: &str) -> HANDLE {
     let psid = LocalPsid::from_string(group_sid).expect("group sid");
     unsafe {
         let mut primary = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ALL_ACCESS,
-            &mut primary,
-        )
-        .expect("OpenProcessToken");
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &mut primary)
+            .expect("OpenProcessToken");
         let disable = [SID_AND_ATTRIBUTES {
             Sid: psid.as_psid(),
             Attributes: 0,
@@ -171,9 +166,8 @@ fn check(token: HANDLE, sddl: &str) -> bool {
         )
     };
     unsafe {
-        let _ = windows::Win32::Foundation::LocalFree(Some(
-            windows::Win32::Foundation::HLOCAL(psd.0),
-        ));
+        let _ =
+            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(psd.0)));
     }
     r.expect("AccessCheck");
     status.as_bool()

@@ -26,25 +26,22 @@
 //! member of *that* one, the sandbox user is a member of *this* one,
 //! and never both.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::ffi::c_void;
-use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::NetworkManagement::NetManagement::{
-    NetApiBufferFree, NetUserAdd, NetUserDel, NetUserGetInfo,
-    NetUserSetInfo, NERR_UserExists, NERR_UserNotFound,
-    UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003,
-    USER_INFO_1008, USER_PRIV_USER,
+    NERR_UserExists, NERR_UserNotFound, NetApiBufferFree, NetUserAdd, NetUserDel, NetUserGetInfo,
+    NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_INFO_1003, USER_INFO_1008,
+    USER_PRIV_USER,
 };
-use windows::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, HKEY,
-    HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD, RegCloseKey, RegDeleteValueW,
+    RegOpenKeyExW, RegQueryValueExW,
 };
 use windows::Win32::UI::Shell::DeleteProfileW;
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::util::{pcwstr, wstr};
 use crate::{sam, sid};
@@ -91,7 +88,8 @@ pub struct UserStatus {
     pub hidden_from_logon: bool,
 }
 
-const WINLOGON_USERLIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
+const WINLOGON_USERLIST: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
 
 /// `BUILTIN\Users` — well-known SID that's stable across locales,
 /// unlike the *name* "Users" / "Benutzer" / "Utilisateurs".
@@ -106,30 +104,26 @@ const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
 pub fn provision() -> Result<ProvisionedUser> {
     let password = gen_password().context("generate sandbox password")?;
 
-    sam::ensure_local_group(
-        SANDBOX_GROUP, "sandbox-runtime sandbox-user group",
-    )?;
+    sam::ensure_local_group(SANDBOX_GROUP, "sandbox-runtime sandbox-user group")?;
     ensure_user(SANDBOX_USER, &password)?;
 
     // Resolve the freshly-created user's SID so group membership is
     // added by PSID — see [`sam::add_member`].
-    let sid = sid::lookup_account_sid(SANDBOX_USER)
-        .context("resolve sandbox user SID")?;
+    let sid = sid::lookup_account_sid(SANDBOX_USER).context("resolve sandbox user SID")?;
     let user_psid = sid::LocalPsid::from_string(&sid)?;
 
     // BUILTIN\Users membership is required for the account to hold
     // the interactive-logon right that `CreateProcessWithLogonW`
     // depends on. Resolve the **localised** group name from the
     // well-known SID so this works on non-English Windows.
-    let builtin_users = sid::lookup_account_name(SID_BUILTIN_USERS)
-        .context("resolve BUILTIN\\Users name")?;
+    let builtin_users =
+        sid::lookup_account_name(SID_BUILTIN_USERS).context("resolve BUILTIN\\Users name")?;
     sam::add_member(&builtin_users, &user_psid)?;
     sam::add_member(SANDBOX_GROUP, &user_psid)?;
 
     set_logon_ui_hidden(SANDBOX_USER, true)?;
 
-    let group_sid = sid::lookup_account_sid(SANDBOX_GROUP)
-        .context("resolve sandbox group SID")?;
+    let group_sid = sid::lookup_account_sid(SANDBOX_GROUP).context("resolve sandbox group SID")?;
     Ok(ProvisionedUser {
         username: SANDBOX_USER.into(),
         sid,
@@ -151,11 +145,7 @@ pub fn deprovision() -> Result<()> {
         // `LOGON_WITH_PROFILE` yet), or may be locked by a stuck
         // child. Either way the account delete below still works.
         unsafe {
-            let _ = DeleteProfileW(
-                pcwstr(&sid_w),
-                PCWSTR::null(),
-                PCWSTR::null(),
-            );
+            let _ = DeleteProfileW(pcwstr(&sid_w), PCWSTR::null(), PCWSTR::null());
         }
     }
     let user_w = wstr(SANDBOX_USER);
@@ -210,9 +200,7 @@ fn gen_password() -> Result<String> {
     const N: usize = 32;
     const { assert!(ALPHA.len() == 85) };
     let mut raw = [0u8; N];
-    let st = unsafe {
-        BCryptGenRandom(None, &mut raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-    };
+    let st = unsafe { BCryptGenRandom(None, &mut raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
     if st.0 != 0 {
         return Err(anyhow!("BCryptGenRandom: NTSTATUS=0x{:08x}", st.0));
     }
@@ -224,16 +212,9 @@ fn gen_password() -> Result<String> {
     let mut i = 0usize;
     while out.len() < N {
         if i == raw.len() {
-            let st = unsafe {
-                BCryptGenRandom(
-                    None, &mut raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-                )
-            };
+            let st = unsafe { BCryptGenRandom(None, &mut raw, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
             if st.0 != 0 {
-                return Err(anyhow!(
-                    "BCryptGenRandom (refill): NTSTATUS=0x{:08x}",
-                    st.0
-                ));
+                return Err(anyhow!("BCryptGenRandom (refill): NTSTATUS=0x{:08x}", st.0));
             }
             i = 0;
         }
@@ -269,11 +250,7 @@ fn ensure_user(name: &str, password: &str) -> Result<()> {
         usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
         usri1_script_path: PWSTR::null(),
     };
-    let rc = unsafe {
-        NetUserAdd(
-            PCWSTR::null(), 1, &info as *const _ as *const u8, None,
-        )
-    };
+    let rc = unsafe { NetUserAdd(PCWSTR::null(), 1, &info as *const _ as *const u8, None) };
     if rc == 0 {
         return Ok(());
     }
@@ -303,9 +280,7 @@ fn ensure_user(name: &str, password: &str) -> Result<()> {
     // write back via level-1008 (flags only — level-1 SetInfo would
     // overwrite priv/home_dir/comment).
     let mut buf: *mut u8 = std::ptr::null_mut();
-    let rc = unsafe {
-        NetUserGetInfo(PCWSTR::null(), pcwstr(&name_w), 1, &mut buf)
-    };
+    let rc = unsafe { NetUserGetInfo(PCWSTR::null(), pcwstr(&name_w), 1, &mut buf) };
     if rc != 0 {
         return Err(anyhow!("NetUserGetInfo({name}, level=1): {rc}"));
     }
@@ -326,9 +301,7 @@ fn ensure_user(name: &str, password: &str) -> Result<()> {
         )
     };
     if rc != 0 {
-        return Err(anyhow!(
-            "NetUserSetInfo({name}, level=1008 flags): {rc}"
-        ));
+        return Err(anyhow!("NetUserSetInfo({name}, level=1008 flags): {rc}"));
     }
     Ok(())
 }
@@ -405,10 +378,7 @@ fn is_logon_ui_hidden(user: &str) -> bool {
     }
     // Hidden iff the value exists AND is 0 (a value of 1 explicitly
     // shows the account; absence = default = shown).
-    r != ERROR_FILE_NOT_FOUND
-        && r.is_ok()
-        && cb == 4
-        && u32::from_ne_bytes(data) == 0
+    r != ERROR_FILE_NOT_FOUND && r.is_ok() && cb == 4 && u32::from_ne_bytes(data) == 0
 }
 
 #[cfg(test)]
@@ -432,8 +402,7 @@ mod tests {
     fn builtin_users_name_resolves() {
         // The exact name is locale-dependent; just check it's
         // non-empty and round-trips back to the well-known SID.
-        let name =
-            sid::lookup_account_name(SID_BUILTIN_USERS).expect("name");
+        let name = sid::lookup_account_name(SID_BUILTIN_USERS).expect("name");
         assert!(!name.is_empty());
         let back = sid::lookup_account_sid(&name).expect("sid");
         assert_eq!(back, SID_BUILTIN_USERS);

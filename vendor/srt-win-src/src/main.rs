@@ -196,11 +196,7 @@ enum Cmd {
         /// environment for proxy/CA vars; the caller (whose
         /// `generateProxyEnvVars` is the single source) passes them
         /// here explicitly.
-        #[arg(
-            long = "env",
-            value_name = "KEY=VALUE",
-            requires = "as_sandbox_user",
-        )]
+        #[arg(long = "env", value_name = "KEY=VALUE", requires = "as_sandbox_user")]
         env: Vec<String>,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
@@ -458,26 +454,14 @@ fn restore_entry(
 ) -> RestoreEntry {
     use srt_win::state_db::RestoreOutcome;
     let (status, moved_to, left_stamped) = match out {
-        RestoreOutcome::Restored | RestoreOutcome::AlreadyOriginal => {
-            ("restored", None, None)
-        }
-        RestoreOutcome::Relocated { moved_to } => {
-            ("relocated", Some(moved_to.clone()), Some(true))
-        }
+        RestoreOutcome::Restored | RestoreOutcome::AlreadyOriginal => ("restored", None, None),
+        RestoreOutcome::Relocated { moved_to } => ("relocated", Some(moved_to.clone()), Some(true)),
         RestoreOutcome::Missing => ("missing", None, Some(true)),
         RestoreOutcome::LeftChanged => ("leftChanged", None, Some(true)),
-        RestoreOutcome::LeftUnreadable => {
-            ("leftUnreadable", None, Some(true))
-        }
-        RestoreOutcome::Tampered => {
-            ("originalSdTampered", None, Some(true))
-        }
-        RestoreOutcome::OriginalLost => {
-            ("originalSdLost", None, Some(true))
-        }
-        RestoreOutcome::StampedUnrecognized => {
-            ("stampedUnrecognized", None, Some(true))
-        }
+        RestoreOutcome::LeftUnreadable => ("leftUnreadable", None, Some(true)),
+        RestoreOutcome::Tampered => ("originalSdTampered", None, Some(true)),
+        RestoreOutcome::OriginalLost => ("originalSdLost", None, Some(true)),
+        RestoreOutcome::StampedUnrecognized => ("stampedUnrecognized", None, Some(true)),
     };
     RestoreEntry {
         path: snap.canonical_path.clone(),
@@ -566,9 +550,7 @@ fn canonicalize_deny_targets(
         for p in list {
             match path_id::canonicalize_path(p) {
                 Ok((canon, is_dir)) => {
-                    if is_dir
-                        && path_id::canonical_parent_of(&canon).is_none()
-                    {
+                    if is_dir && path_id::canonical_parent_of(&canon).is_none() {
                         return Err(anyhow!(
                             "refusing to deny a volume root: '{p}' \
                              (canonical '{canon}') — the (OI)(CI) \
@@ -602,10 +584,7 @@ fn canonicalize_deny_targets(
 fn canonicalize_ace_targets(
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
-) -> anyhow::Result<(
-    Vec<(String, srt_win::acl::SbAce)>,
-    Vec<(String, String)>,
-)> {
+) -> anyhow::Result<(Vec<(String, srt_win::acl::SbAce)>, Vec<(String, String)>)> {
     use anyhow::anyhow;
     use srt_win::path_id;
     let mut targets = Vec::new();
@@ -637,8 +616,7 @@ fn canonicalize_ace_targets(
 fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
     use anyhow::Context;
     srt_win::cert_store::CertDer::from_pem_or_der(
-        &std::fs::read(path)
-            .with_context(|| format!("read CA cert '{path}'"))?,
+        &std::fs::read(path).with_context(|| format!("read CA cert '{path}'"))?,
     )
     .with_context(|| format!("decode CA cert '{path}'"))
 }
@@ -676,8 +654,7 @@ enum PerExecRestore {
 impl PerExecRestore {
     fn holder(&self) -> srt_win::state_db::HolderPid {
         match self {
-            Self::SameUser { holder, .. }
-            | Self::SandboxUser { holder, .. } => *holder,
+            Self::SameUser { holder, .. } | Self::SandboxUser { holder, .. } => *holder,
         }
     }
 }
@@ -687,22 +664,25 @@ impl Drop for PerExecRestore {
     fn drop(&mut self) {
         use srt_win::state_db;
         let (failed, err) = match self {
-            Self::SameUser { gsid, holder, dacls } => {
-                match state_db::with_init_lock(
-                    gsid, *holder, Some(dacls), false,
-                    |db| db.restore_all(dacls),
-                ) {
+            Self::SameUser {
+                gsid,
+                holder,
+                dacls,
+            } => {
+                match state_db::with_init_lock(gsid, *holder, Some(dacls), false, |db| {
+                    db.restore_all(dacls)
+                }) {
                     Ok((out, _)) => (out.failed, None),
                     Err(e) => (0, Some(e)),
                 }
             }
-            Self::SandboxUser { holder, sandbox_sid } => {
-                match state_db::with_init_lock(
-                    sandbox_sid, *holder, None, false,
-                    |db| {
-                        db.release_aces(sandbox_sid, state_db::KIND_DENY)
-                    },
-                ) {
+            Self::SandboxUser {
+                holder,
+                sandbox_sid,
+            } => {
+                match state_db::with_init_lock(sandbox_sid, *holder, None, false, |db| {
+                    db.release_aces(sandbox_sid, state_db::KIND_DENY)
+                }) {
                     Ok(((_, failed), _)) => (failed, None),
                     Err(e) => (0, Some(e)),
                 }
@@ -755,10 +735,7 @@ impl Drop for PerExecRestore {
 fn open_holder_fences(
     holder: srt_win::state_db::HolderPid,
     label: &str,
-) -> anyhow::Result<(
-    srt_win::fence::DeleteFence,
-    srt_win::fence::DeleteFence,
-)> {
+) -> anyhow::Result<(srt_win::fence::DeleteFence, srt_win::fence::DeleteFence)> {
     use anyhow::Context;
     use srt_win::{fence, state_db};
     let plan = state_db::fence_plan_for_holder(holder)
@@ -891,7 +868,7 @@ fn main() {
 
 #[cfg(windows)]
 fn run() -> anyhow::Result<()> {
-    use anyhow::{anyhow, Context};
+    use anyhow::{Context, anyhow};
     use serde_json::json;
     use srt_win::{sid, wfp};
 
@@ -905,19 +882,16 @@ fn run() -> anyhow::Result<()> {
     // single comparable representation; downstream
     // `eq_ignore_ascii_case("S-1-5-32-544")` dedup checks rely on
     // that.
-    let canonicalize_sid =
-        |flag: &str, s: &str| -> anyhow::Result<String> {
-            let p = sid::LocalPsid::from_string(s)
-                .with_context(|| format!("invalid --{flag} '{s}'"))?;
-            sid::psid_to_string(p.as_psid())
-                .with_context(|| format!("canonicalize --{flag} '{s}'"))
-        };
+    let canonicalize_sid = |flag: &str, s: &str| -> anyhow::Result<String> {
+        let p =
+            sid::LocalPsid::from_string(s).with_context(|| format!("invalid --{flag} '{s}'"))?;
+        sid::psid_to_string(p.as_psid()).with_context(|| format!("canonicalize --{flag} '{s}'"))
+    };
     let resolve_group_sid = |g: &GroupRef| -> anyhow::Result<String> {
         if let Some(s) = &g.group_sid {
             return canonicalize_sid("group-sid", s);
         }
-        sid::lookup_account_sid(&g.name)
-            .with_context(|| format!("resolve group '{}'", g.name))
+        sid::lookup_account_sid(&g.name).with_context(|| format!("resolve group '{}'", g.name))
     };
     let resolve_sublayer = |s: &Option<String>| -> anyhow::Result<windows::core::GUID> {
         match s {
@@ -1014,8 +988,7 @@ fn run() -> anyhow::Result<()> {
                 } else {
                     let user = match &user_sid {
                         Some(s) => canonicalize_sid("user-sid", s)?,
-                        None => sid::current_user_sid()
-                            .context("resolve current user")?,
+                        None => sid::current_user_sid().context("resolve current user")?,
                     };
                     wfp::ensure_group(&group.name, &user)?;
                     let g = sid::lookup_account_sid(&group.name)?;
@@ -1042,11 +1015,9 @@ fn run() -> anyhow::Result<()> {
             // 11/12 codes.
             let user_step = || -> anyhow::Result<srt_win::user::ProvisionedUser> {
                 use srt_win::{install, user};
-                let pu = user::provision()
-                    .context("provision sandbox user")?;
-                install::write_setup(&pu, &gsid).context(
-                    "write sandbox credential + setup marker to state DB",
-                )?;
+                let pu = user::provision().context("provision sandbox user")?;
+                install::write_setup(&pu, &gsid)
+                    .context("write sandbox credential + setup marker to state DB")?;
                 wfp::install_user_filters(&sl, &pu.sid, range)
                     .context("install user-SID WFP filters")?;
                 Ok(pu)
@@ -1061,14 +1032,18 @@ fn run() -> anyhow::Result<()> {
             eprintln!(
                 "srt-win: installed (group={label} sid={gsid}, sublayer={sl:?}, \
                  proxy_port_range={}-{}, filters={}+{})",
-                range.0, range.1,
-                wfp::GROUP_FILTER_COUNT, wfp::USER_FILTER_COUNT,
+                range.0,
+                range.1,
+                wfp::GROUP_FILTER_COUNT,
+                wfp::USER_FILTER_COUNT,
             );
             eprintln!(
                 "srt-win: sandbox user '{}' provisioned (sid={}, \
                  group={} sid={})",
-                pu.username, pu.sid,
-                srt_win::user::SANDBOX_GROUP, pu.group_sid,
+                pu.username,
+                pu.sid,
+                srt_win::user::SANDBOX_GROUP,
+                pu.group_sid,
             );
             eprintln!(
                 "srt-win: NOTE — log out and back in before running \
@@ -1076,7 +1051,10 @@ fn run() -> anyhow::Result<()> {
                  logon; your network is unaffected meanwhile)."
             );
         }
-        Cmd::Uninstall { sublayer_guid, keep_user } => {
+        Cmd::Uninstall {
+            sublayer_guid,
+            keep_user,
+        } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
@@ -1086,8 +1064,7 @@ fn run() -> anyhow::Result<()> {
                 "Sandbox user kept (--keep-user)."
             } else {
                 use srt_win::{install, user};
-                install::clear_setup()
-                    .context("clear credential + setup marker")?;
+                install::clear_setup().context("clear credential + setup marker")?;
                 user::deprovision().context("deprovision sandbox user")?;
                 "Sandbox user, credential, and setup marker removed."
             };
@@ -1099,7 +1076,9 @@ fn run() -> anyhow::Result<()> {
         }
 
         // ─── user ──────────────────────────────────────────────────
-        Cmd::User { sub: UserCmd::Status } => {
+        Cmd::User {
+            sub: UserCmd::Status,
+        } => {
             use srt_win::{install, user};
             let st = user::status()?;
             let setup = install::read_setup().ok().flatten();
@@ -1121,13 +1100,17 @@ fn run() -> anyhow::Result<()> {
                 })
             );
         }
-        Cmd::User { sub: UserCmd::ReadCred } => {
+        Cmd::User {
+            sub: UserCmd::ReadCred,
+        } => {
             let cred = srt_win::install::read_cred()?;
             // Password only, no trailing whitespace, so a caller
             // can capture stdout verbatim.
             print!("{}", cred.pw);
         }
-        Cmd::User { sub: UserCmd::TrustCa { path } } => {
+        Cmd::User {
+            sub: UserCmd::TrustCa { path },
+        } => {
             use srt_win::install;
             let der = read_ca_der(&path)?;
             let cred = install::read_cred()?;
@@ -1143,7 +1126,9 @@ fn run() -> anyhow::Result<()> {
         }
 
         // ─── group ─────────────────────────────────────────────────
-        Cmd::Group { sub: GroupCmd::Create { group, user_sid } } => {
+        Cmd::Group {
+            sub: GroupCmd::Create { group, user_sid },
+        } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
@@ -1155,8 +1140,7 @@ fn run() -> anyhow::Result<()> {
             }
             let user = match &user_sid {
                 Some(s) => canonicalize_sid("user-sid", s)?,
-                None => sid::current_user_sid()
-                    .context("resolve current user")?,
+                None => sid::current_user_sid().context("resolve current user")?,
             };
             wfp::ensure_group(&group.name, &user)?;
             let gsid = sid::lookup_account_sid(&group.name)?;
@@ -1169,7 +1153,9 @@ fn run() -> anyhow::Result<()> {
                  Log out and back in before running `srt-win exec`."
             );
         }
-        Cmd::Group { sub: GroupCmd::Status { group } } => {
+        Cmd::Group {
+            sub: GroupCmd::Status { group },
+        } => {
             // Resolve SID first; if that fails the group is absent.
             let gsid = match &group.group_sid {
                 Some(s) => {
@@ -1187,10 +1173,7 @@ fn run() -> anyhow::Result<()> {
                         Ok(_) => {}
                         Err(e) => {
                             // Malformed SID string.
-                            println!(
-                                "{}",
-                                json!({"state": "absent", "error": e.to_string()})
-                            );
+                            println!("{}", json!({"state": "absent", "error": e.to_string()}));
                             return Ok(());
                         }
                     }
@@ -1226,14 +1209,14 @@ fn run() -> anyhow::Result<()> {
             };
             println!("{out}");
         }
-        Cmd::Group { sub: GroupCmd::Delete { group } } => {
+        Cmd::Group {
+            sub: GroupCmd::Delete { group },
+        } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
             if group.group_sid.is_some() {
-                return Err(anyhow!(
-                    "`group delete` needs --name; cannot delete by SID"
-                ));
+                return Err(anyhow!("`group delete` needs --name; cannot delete by SID"));
             }
             wfp::delete_group(&group.name)?;
             eprintln!("srt-win: group '{}' deleted (if it existed)", group.name);
@@ -1265,12 +1248,16 @@ fn run() -> anyhow::Result<()> {
                 range.0, range.1,
             );
         }
-        Cmd::Wfp { sub: WfpCmd::Status { sublayer_guid } } => {
+        Cmd::Wfp {
+            sub: WfpCmd::Status { sublayer_guid },
+        } => {
             let sl = resolve_sublayer(&sublayer_guid)?;
             let st = wfp::filter_status(&sl)?;
             println!("{}", serde_json::to_string(&st)?);
         }
-        Cmd::Wfp { sub: WfpCmd::Verify { target } } => {
+        Cmd::Wfp {
+            sub: WfpCmd::Verify { target },
+        } => {
             use srt_win::{install, logon, runner};
             // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
             // packet leaves, so an active fence gives WSAEACCES
@@ -1280,9 +1267,8 @@ fn run() -> anyhow::Result<()> {
             // fence-missing is distinguishable from fence-active
             // without depending on any external host.
             let r = install::read_cred().and_then(|c| {
-                let s = install::read_setup()?.ok_or_else(|| {
-                    anyhow!("sandbox user not provisioned")
-                })?;
+                let s = install::read_setup()?
+                    .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
                 Ok((s.sandbox_user_sid, c))
             });
             let (sb_sid, cred) = match r {
@@ -1293,8 +1279,13 @@ fn run() -> anyhow::Result<()> {
                 }
             };
             let code = logon::spawn_runner(
-                &cred.user, &cred.pw, &sb_sid, None,
-                &runner::RunnerCmd::ProbeEgress { target: target.clone() },
+                &cred.user,
+                &cred.pw,
+                &sb_sid,
+                None,
+                &runner::RunnerCmd::ProbeEgress {
+                    target: target.clone(),
+                },
             )
             .context("spawn runner for egress probe")?;
             let probe = match code {
@@ -1321,7 +1312,9 @@ fn run() -> anyhow::Result<()> {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             std::process::exit(code as i32);
         }
-        Cmd::Wfp { sub: WfpCmd::Uninstall { sublayer_guid } } => {
+        Cmd::Wfp {
+            sub: WfpCmd::Uninstall { sublayer_guid },
+        } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
@@ -1332,11 +1325,12 @@ fn run() -> anyhow::Result<()> {
 
         // ─── acl ───────────────────────────────────────────────────
         Cmd::Acl {
-            sub: AclCmd::Stamp {
-                group,
-                holder_pid,
-                sandbox_user_sid: Some(sb),
-            },
+            sub:
+                AclCmd::Stamp {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid: Some(sb),
+                },
         } => {
             // Separate-user model: deny is an additive DENY ACE
             // for the sandbox user (plus parent-FDC DENY) — same
@@ -1345,25 +1339,26 @@ fn run() -> anyhow::Result<()> {
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                .context("read stdin")?;
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             let input: AclStampInput = serde_json::from_str(&buf)
                 .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
             let (targets, bad_inputs) = canonicalize_ace_targets(
                 "deny",
                 &[
                     (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
-                    (&input.deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
+                    (
+                        &input.deny_write,
+                        acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                    ),
                 ],
             )?;
             for (p, e) in &bad_inputs {
                 eprintln!("srt-win: skipped: '{p}': {e}");
             }
             let ((witnesses, failed), report) =
-                state_db::with_init_lock(
-                    &gsid, holder, None, false,
-                    |db| db.apply_aces(&sb, &targets),
-                )?;
+                state_db::with_init_lock(&gsid, holder, None, false, |db| {
+                    db.apply_aces(&sb, &targets)
+                })?;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl stamp (deny-ace) — {} target(s) → {} \
@@ -1374,10 +1369,14 @@ fn run() -> anyhow::Result<()> {
                 fresh,
                 if !bad_inputs.is_empty() {
                     format!(", {} skipped", bad_inputs.len())
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 if failed > 0 {
                     format!(", {failed} FAILED — rolled back")
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 report.dead_brokers,
                 report.aces_revoked,
             );
@@ -1398,18 +1397,18 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Stamp {
-                group,
-                holder_pid,
-                sandbox_user_sid: None,
-            },
+            sub:
+                AclCmd::Stamp {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid: None,
+                },
         } => {
             use srt_win::state_db;
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                .context("read stdin")?;
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             let input: AclStampInput = serde_json::from_str(&buf)
                 .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
             // Canonicalize and reject globs BEFORE taking the mutex
@@ -1417,20 +1416,18 @@ fn run() -> anyhow::Result<()> {
             // canonicalize failures are collected per-path and the
             // batch continues — but exit is non-zero so the host
             // never treats a partial stamp as success.
-            let (targets, bad_inputs) = canonicalize_deny_targets(
-                &input.deny_read, &input.deny_write,
-            )?;
+            let (targets, bad_inputs) =
+                canonicalize_deny_targets(&input.deny_read, &input.deny_write)?;
             for (p, e) in &bad_inputs {
                 eprintln!("srt-win: skipped: '{p}': {e}");
             }
-            let dacls =
-                srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
+            let dacls = srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
             // Session-level: cross-broker escalation is intentional
             // → refuse_escalation = false.
-            let ((witnesses, failed), report) = state_db::with_init_lock(
-                &gsid, holder, Some(&dacls), false,
-                |db| db.stamp_targets(&targets, &dacls, false),
-            )?;
+            let ((witnesses, failed), report) =
+                state_db::with_init_lock(&gsid, holder, Some(&dacls), false, |db| {
+                    db.stamp_targets(&targets, &dacls, false)
+                })?;
             // Summary (incl. crash-recovery report) printed on
             // success AND on per-path failure — the report is
             // diagnostic signal that distinguishes "stamp failed
@@ -1448,13 +1445,19 @@ fn run() -> anyhow::Result<()> {
                 tally.fence,
                 if tally.lost > 0 {
                     format!(", {} original_sd_lost", tally.lost)
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 if !bad_inputs.is_empty() {
                     format!(", {} skipped", bad_inputs.len())
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 if failed > 0 {
                     format!(", {failed} FAILED — rolled back")
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 report.dead_brokers,
                 report.restored,
             );
@@ -1482,20 +1485,20 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Grant {
-                group,
-                holder_pid,
-                sandbox_user_sid,
-            },
+            sub:
+                AclCmd::Grant {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid,
+                },
         } => {
             use srt_win::{acl, state_db};
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                .context("read stdin")?;
-            let input: AclGrantInput = serde_json::from_str(&buf)
-                .context("parse stdin JSON {read:[…], write:[…]}")?;
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
+            let input: AclGrantInput =
+                serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
             let (targets, bad_inputs) = canonicalize_ace_targets(
                 "grant",
                 &[
@@ -1507,12 +1510,10 @@ fn run() -> anyhow::Result<()> {
                 eprintln!("srt-win: skipped: '{p}': {e}");
             }
             let ((witnesses, failed), report) =
-                state_db::with_init_lock(
-                    &gsid, holder, None, false,
-                    |db| db.apply_aces(&sandbox_user_sid, &targets),
-                )?;
-            let fresh =
-                witnesses.iter().filter(|w| !w.already).count();
+                state_db::with_init_lock(&gsid, holder, None, false, |db| {
+                    db.apply_aces(&sandbox_user_sid, &targets)
+                })?;
+            let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
                  already held{}{}); recovery pruned {} dead \
@@ -1522,10 +1523,14 @@ fn run() -> anyhow::Result<()> {
                 witnesses.len() - fresh,
                 if !bad_inputs.is_empty() {
                     format!(", {} skipped", bad_inputs.len())
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 if failed > 0 {
                     format!(", {failed} FAILED — rolled back")
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 report.dead_brokers,
                 report.aces_revoked,
             );
@@ -1546,33 +1551,30 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Revoke {
-                group,
-                holder_pid,
-                sandbox_user_sid,
-                json,
-            },
+            sub:
+                AclCmd::Revoke {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid,
+                    json,
+                },
         } => {
             use srt_win::state_db;
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
             let ((entries, failed), report) =
-                state_db::with_init_lock(
-                    &gsid, holder, None, false,
-                    |db| {
-                        db.release_aces(
-                            &sandbox_user_sid,
-                            state_db::KIND_GRANT,
-                        )
-                    },
-                )?;
+                state_db::with_init_lock(&gsid, holder, None, false, |db| {
+                    db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
+                })?;
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
                  revoked {} orphan grant(s)",
                 entries.len(),
                 if failed > 0 {
                     format!(", {failed} FAILED (ACE left in place)")
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 report.aces_revoked,
             );
             if json {
@@ -1588,18 +1590,17 @@ fn run() -> anyhow::Result<()> {
                 println!();
             }
             if failed > 0 {
-                return Err(anyhow!(
-                    "acl revoke: {failed} path(s) could not be revoked"
-                ));
+                return Err(anyhow!("acl revoke: {failed} path(s) could not be revoked"));
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Restore {
-                group,
-                holder_pid,
-                sandbox_user_sid: Some(sb),
-                json,
-            },
+            sub:
+                AclCmd::Restore {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid: Some(sb),
+                    json,
+                },
         } => {
             // Separate-user model: restore = release the holder's
             // DENY ACEs (target + parent-FDC) via REVOKE_ACCESS.
@@ -1607,17 +1608,18 @@ fn run() -> anyhow::Result<()> {
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
             let ((entries, failed), report) =
-                state_db::with_init_lock(
-                    &gsid, holder, None, false,
-                    |db| db.release_aces(&sb, state_db::KIND_DENY),
-                )?;
+                state_db::with_init_lock(&gsid, holder, None, false, |db| {
+                    db.release_aces(&sb, state_db::KIND_DENY)
+                })?;
             eprintln!(
                 "srt-win: acl restore (deny-ace) — {} ACE(s){}; \
                  recovery revoked {} orphan ACE(s)",
                 entries.len(),
                 if failed > 0 {
                     format!(", {failed} FAILED (ACE left in place)")
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 report.aces_revoked,
             );
             if json {
@@ -1629,7 +1631,9 @@ fn run() -> anyhow::Result<()> {
                     })
                     .collect();
                 let result = RestoreResult {
-                    paths: vec![], parents: vec![], aces: out,
+                    paths: vec![],
+                    parents: vec![],
+                    aces: out,
                 };
                 serde_json::to_writer(std::io::stdout(), &result)
                     .context("write --json restore result")?;
@@ -1643,33 +1647,30 @@ fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Acl {
-            sub: AclCmd::Restore {
-                group,
-                holder_pid,
-                sandbox_user_sid: None,
-                json,
-            },
+            sub:
+                AclCmd::Restore {
+                    group,
+                    holder_pid,
+                    sandbox_user_sid: None,
+                    json,
+                },
         } => {
             use srt_win::state_db;
             let gsid = resolve_group_sid(&group)?;
             let holder = state_db::HolderPid(holder_pid);
-            let dacls =
-                srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
-            let (out, report) = state_db::with_init_lock(
-                &gsid, holder, Some(&dacls), false,
-                |db| db.restore_all(&dacls),
-            )?;
+            let dacls = srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
+            let (out, report) =
+                state_db::with_init_lock(&gsid, holder, Some(&dacls), false, |db| {
+                    db.restore_all(&dacls)
+                })?;
             let state_db::RestoreAllOutcomes {
                 entries: file_outs,
                 parent_outs,
                 failed,
             } = out;
-            let entries: Vec<RestoreEntry> = file_outs
-                .iter()
-                .map(|(s, o)| restore_entry(s, o))
-                .collect();
-            let restored =
-                entries.iter().filter(|e| e.status == "restored").count();
+            let entries: Vec<RestoreEntry> =
+                file_outs.iter().map(|(s, o)| restore_entry(s, o)).collect();
+            let restored = entries.iter().filter(|e| e.status == "restored").count();
             let left = entries.len() - restored;
             // Parent left-stamped count is the union of
             // crash-recovery's pass and THIS restore's parent
@@ -1698,7 +1699,9 @@ fn run() -> anyhow::Result<()> {
                         "; {failed} FAILED (left stamped, fail-closed \
                          — see WARNING(s) above)"
                     )
-                } else { String::new() },
+                } else {
+                    String::new()
+                },
                 if parents_left > 0 {
                     format!("; {} parent dir(s) left stamped", parents_left)
                 } else {
@@ -1734,8 +1737,7 @@ fn run() -> anyhow::Result<()> {
         } => {
             use srt_win::state_db;
             let gsid = resolve_group_sid(&group)?;
-            let dacls =
-                srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
+            let dacls = srt_win::acl::PrebuiltDacls::for_current_user(&gsid)?;
             // recover only runs crash-recovery (holder-agnostic); the
             // holder PID is irrelevant, pass our own.
             let ((), report) = state_db::with_init_lock(
@@ -1818,14 +1820,10 @@ fn run() -> anyhow::Result<()> {
             // directly.
             let delete_fence = match holder_pid {
                 None => {
-                    eprintln!(
-                        "srt-win: handle fence: skipped (no --holder-pid)"
-                    );
+                    eprintln!("srt-win: handle fence: skipped (no --holder-pid)");
                     None
                 }
-                Some(pid) => Some(open_holder_fences(
-                    state_db::HolderPid(pid), "dir",
-                )?),
+                Some(pid) => Some(open_holder_fences(state_db::HolderPid(pid), "dir")?),
             };
 
             // Credential read happens BEFORE the per-exec stamp so
@@ -1836,17 +1834,14 @@ fn run() -> anyhow::Result<()> {
             let sandbox_cred = if as_sandbox_user {
                 use srt_win::install;
                 let r = install::read_cred().and_then(|c| {
-                    let s = install::read_setup()?.ok_or_else(|| {
-                        anyhow!("sandbox user not provisioned")
-                    })?;
+                    let s = install::read_setup()?
+                        .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
                     Ok((s.sandbox_user_sid, c))
                 });
                 match r {
                     Ok(v) => Some(v),
                     Err(e) => {
-                        eprintln!(
-                            "srt-win: error: --as-sandbox-user: {e:#}"
-                        );
+                        eprintln!("srt-win: error: --as-sandbox-user: {e:#}");
                         std::process::exit(15);
                     }
                 }
@@ -1868,9 +1863,7 @@ fn run() -> anyhow::Result<()> {
             // canon-fail, classify, tampered, refuse-escalation)
             // FAILS the exec rather than running the child with an
             // incomplete deny set.
-            let per_exec_guard = if deny_read.is_empty()
-                && deny_write.is_empty()
-            {
+            let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
                 None
             } else if let Some((sb_sid, _)) = &sandbox_cred {
                 // Separate-user model: per-exec deny is the same
@@ -1891,15 +1884,12 @@ fn run() -> anyhow::Result<()> {
                 )
                 .context("per-exec --deny-*")?;
                 if let Some((p, e)) = bad.first() {
-                    return Err(anyhow!(
-                        "per-exec --deny-*: '{p}': {e}"
-                    ));
+                    return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                 }
                 let n = targets.len();
-                let ((_w, failed), _r) = state_db::with_init_lock(
-                    &sb, own, None, false,
-                    |db| db.apply_aces(&sb, &targets),
-                )
+                let ((_w, failed), _r) = state_db::with_init_lock(&sb, own, None, false, |db| {
+                    db.apply_aces(&sb, &targets)
+                })
                 .context("per-exec deny-ace")?;
                 if failed > 0 {
                     return Err(anyhow!(
@@ -1936,13 +1926,10 @@ fn run() -> anyhow::Result<()> {
                 // missing/typo'd path is a caller error the exec
                 // must surface, not silently drop and run the
                 // child with the file readable.
-                let (targets, bad) =
-                    canonicalize_deny_targets(&deny_read, &deny_write)
-                        .context("per-exec --deny-*")?;
+                let (targets, bad) = canonicalize_deny_targets(&deny_read, &deny_write)
+                    .context("per-exec --deny-*")?;
                 if let Some((p, e)) = bad.first() {
-                    return Err(anyhow!(
-                        "per-exec --deny-*: '{p}': {e}"
-                    ));
+                    return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                 }
                 let n = targets.len();
                 // refuse_escalation = true: a per-exec stamp must
@@ -1951,10 +1938,9 @@ fn run() -> anyhow::Result<()> {
                 // restore would see refcount>0 and leave the
                 // stricter mask in place past this exec.
                 let ((_witnesses, failed), _r) =
-                    state_db::with_init_lock(
-                        &gsid, own, Some(&dacls), false,
-                        |db| db.stamp_targets(&targets, &dacls, true),
-                    )
+                    state_db::with_init_lock(&gsid, own, Some(&dacls), false, |db| {
+                        db.stamp_targets(&targets, &dacls, true)
+                    })
                     .context("per-exec stamp")?;
                 if failed > 0 {
                     // `stamp_targets` rolled back this batch.
@@ -2010,12 +1996,8 @@ fn run() -> anyhow::Result<()> {
                 // runner self-protects too; this covers the
                 // broker→child hop. Best-effort.
                 let real_user = srt_win::sid::current_user_sid()?;
-                if let Err(e) =
-                    srt_win::self_protect::install_broker_dacl(Some(&real_user))
-                {
-                    eprintln!(
-                        "srt-win: WARNING: install_broker_dacl: {e:#}"
-                    );
+                if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user)) {
+                    eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
                 }
                 // env_overlay = exactly what the caller passed via
                 // `--env`. The broker does not enumerate its own
@@ -2045,7 +2027,10 @@ fn run() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|p| p.to_str().map(String::from));
                 logon::spawn_runner(
-                    &cred.user, &cred.pw, &sb_sid, cwd.as_deref(),
+                    &cred.user,
+                    &cred.pw,
+                    &sb_sid,
+                    cwd.as_deref(),
                     &runner::RunnerCmd::Exec(runner::RunnerSpec {
                         argv: target.clone(),
                         env_overlay,
@@ -2085,15 +2070,12 @@ fn is_elevated() -> anyhow::Result<bool> {
     use std::mem::size_of;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
-    use windows::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcessToken,
-    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut tok = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok)
-            .context("OpenProcessToken")?;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).context("OpenProcessToken")?;
         let mut elev = TOKEN_ELEVATION::default();
         let mut ret = 0u32;
         let r = GetTokenInformation(
@@ -2149,18 +2131,13 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
     use anyhow::Context;
     use srt_win::launch::quote_arg;
     use srt_win::util::wstr;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{
-        CloseHandle, ERROR_CANCELLED, GetLastError,
-    };
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, WaitForSingleObject, INFINITE,
-    };
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
     use windows::Win32::UI::Shell::{
-        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NO_CONSOLE,
-        SHELLEXECUTEINFOW,
+        SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
 
     if is_elevated()? {
         return Ok(None);
@@ -2219,15 +2196,16 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
     let wait = unsafe { WaitForSingleObject(h, INFINITE) };
     if wait == windows::Win32::Foundation::WAIT_FAILED {
         let err = std::io::Error::last_os_error();
-        unsafe { let _ = CloseHandle(h); }
+        unsafe {
+            let _ = CloseHandle(h);
+        }
         return Err(anyhow::anyhow!(
             "WaitForSingleObject(elevated child): {err}"
         ));
     }
     let mut code: u32 = 1;
     unsafe {
-        GetExitCodeProcess(h, &mut code)
-            .context("GetExitCodeProcess(elevated child)")?;
+        GetExitCodeProcess(h, &mut code).context("GetExitCodeProcess(elevated child)")?;
         let _ = CloseHandle(h);
     }
     // 259 (STILL_ACTIVE) after a successful wait is a real exit

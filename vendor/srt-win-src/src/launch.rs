@@ -9,39 +9,33 @@
 //! JS-side proxies (whose ports the caller passes) via the WFP
 //! loopback permit installed by `srt-win wfp install`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::path::Path;
-use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
-    WAIT_OBJECT_0,
+    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessAsUserW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows::core::{PCWSTR, PWSTR};
 
-use crate::job::{is_process_in_job, Job};
+use crate::job::{Job, is_process_in_job};
 use crate::self_protect;
 use crate::sid::{self, GroupState};
 use crate::token::{self, open_self_token, to_primary};
 use crate::util::{pcwstr, wstr};
-use crate::winsta::{
-    current_desktop_name, current_winsta_name, on_default_desktop,
-    IsolatedDesk,
-};
+use crate::winsta::{IsolatedDesk, current_desktop_name, current_winsta_name, on_default_desktop};
 
 // ─── RAII handle wrappers ───────────────────────────────────────────
 
@@ -61,12 +55,18 @@ impl SpawnedChild {
     pub(crate) fn new(pi: PROCESS_INFORMATION) -> Self {
         Self { pi, armed: true }
     }
-    pub(crate) fn process(&self) -> HANDLE { self.pi.hProcess }
-    pub(crate) fn thread(&self) -> HANDLE { self.pi.hThread }
+    pub(crate) fn process(&self) -> HANDLE {
+        self.pi.hProcess
+    }
+    pub(crate) fn thread(&self) -> HANDLE {
+        self.pi.hThread
+    }
     /// Disarm the terminate-on-drop. Call after the child has been
     /// assigned to the job AND resumed — past that point
     /// `KILL_ON_JOB_CLOSE` covers cleanup.
-    pub(crate) fn defuse(&mut self) { self.armed = false; }
+    pub(crate) fn defuse(&mut self) {
+        self.armed = false;
+    }
 }
 impl Drop for SpawnedChild {
     fn drop(&mut self) {
@@ -191,7 +191,11 @@ pub fn run_lockdown(
     //    be enabled in the caller's token. `Absent` means the user
     //    hasn't logged out + back in since `group create`. `DenyOnly`
     //    means we're already inside a sandbox child — refuse.
-    if let LaunchMode::SameUser { group_sid, skip_group_check } = mode {
+    if let LaunchMode::SameUser {
+        group_sid,
+        skip_group_check,
+    } = mode
+    {
         match sid::group_state_for_self(group_sid)? {
             GroupState::Enabled => {}
             GroupState::Absent if *skip_group_check => {
@@ -234,9 +238,7 @@ pub fn run_lockdown(
         token::make_sandbox_token(self_tok.raw(), mode.flip_group())
             .context("make_sandbox_token")?,
     );
-    let primary = OwnedHandle(
-        to_primary(restricted.raw()).context("to_primary")?,
-    );
+    let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
 
     // 4) Job. `breakaway_ok = false` — this is the load-bearing
     //    containment Job; the child must NOT be able to break away.
@@ -246,10 +248,8 @@ pub fn run_lockdown(
     // breakaway flag is gated separately on the launch mode. Computed
     // (and logged) BEFORE step 5 so the diagnostic identifies which
     // desktop the caller landed on.
-    let on_default = on_default_desktop()
-        .context("read current desktop name (isolation gate)")?;
-    let caller_in_job =
-        is_process_in_job(unsafe { GetCurrentProcess() }, None);
+    let on_default = on_default_desktop().context("read current desktop name (isolation gate)")?;
+    let caller_in_job = is_process_in_job(unsafe { GetCurrentProcess() }, None);
     // Breakaway: on `SandboxUser` the caller is in seclogon's job
     // (and the broker→runner job, both `BREAKAWAY_OK`); without
     // breakaway the child inherits them and `AssignProcessToJobObject`
@@ -326,8 +326,11 @@ pub fn run_lockdown(
         | MITIGATION_IMAGE_LOAD_NO_REMOTE
         | MITIGATION_IMAGE_LOAD_NO_LOW_LABEL;
     let std_handles = collect_inheritable_std_handles();
-    let mut handle_list: Vec<HANDLE> =
-        std_handles.iter().copied().filter(|h| !h.0.is_null()).collect();
+    let mut handle_list: Vec<HANDLE> = std_handles
+        .iter()
+        .copied()
+        .filter(|h| !h.0.is_null())
+        .collect();
     if handle_list.is_empty() {
         return Err(anyhow!(
             "no std handle is inheritable; refusing to spawn. \
@@ -403,9 +406,7 @@ pub fn run_lockdown(
             &six.StartupInfo as *const STARTUPINFOW,
             &mut pi,
         )
-        .with_context(|| {
-            format!("CreateProcessAsUserW({})", target_exe.display())
-        })?;
+        .with_context(|| format!("CreateProcessAsUserW({})", target_exe.display()))?;
     }
 
     // The child exists, suspended, NOT yet in the job. Wrap it
@@ -435,10 +436,7 @@ pub fn run_lockdown(
     }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {
-        return Err(anyhow!(
-            "ResumeThread: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(anyhow!("ResumeThread: {}", std::io::Error::last_os_error()));
     }
     // From here the job owns lifetime; disarm terminate-on-drop.
     child.defuse();
@@ -461,8 +459,7 @@ pub fn run_lockdown(
     }
     let mut code: u32 = 0;
     unsafe {
-        GetExitCodeProcess(child.process(), &mut code)
-            .context("GetExitCodeProcess")?;
+        GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess")?;
     }
     // `child` (closes hProcess/hThread), `primary`/`restricted`/
     // `self_tok` (CloseHandle) all drop here.
@@ -519,20 +516,21 @@ fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     // unpaired surrogate from a profile path). Build from
     // `vars_os()` and encode each via `encode_wide` so nothing is
     // dropped and nothing panics.
-    let overlay_upper: std::collections::HashSet<String> =
-        overlay.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
-    let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> =
-        std::env::vars_os()
-            .filter(|(k, _)| {
-                // Drop base entries the overlay replaces. The
-                // overlay keys are ASCII (PATH, *_PROXY, …); a base
-                // key that doesn't round-trip as UTF-8 cannot match
-                // one and is kept.
-                k.to_str()
-                    .map(|s| !overlay_upper.contains(&s.to_ascii_uppercase()))
-                    .unwrap_or(true)
-            })
-            .collect();
+    let overlay_upper: std::collections::HashSet<String> = overlay
+        .iter()
+        .map(|(k, _)| k.to_ascii_uppercase())
+        .collect();
+    let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| {
+            // Drop base entries the overlay replaces. The
+            // overlay keys are ASCII (PATH, *_PROXY, …); a base
+            // key that doesn't round-trip as UTF-8 cannot match
+            // one and is kept.
+            k.to_str()
+                .map(|s| !overlay_upper.contains(&s.to_ascii_uppercase()))
+                .unwrap_or(true)
+        })
+        .collect();
     for (k, v) in overlay {
         entries.push((k.into(), v.into()));
     }
@@ -546,9 +544,7 @@ fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     // gets its lowercase twin too.
     let mut twin_view: Vec<(String, String)> = entries
         .iter()
-        .filter_map(|(k, v)| {
-            Some((k.to_str()?.to_owned(), v.to_string_lossy().into_owned()))
-        })
+        .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_string_lossy().into_owned())))
         .collect();
     let before = twin_view.len();
     add_proxy_case_twins(&mut twin_view);
@@ -560,9 +556,7 @@ fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     // through verbatim. No dedup — case-variant duplicates are
     // preserved. The sort key uses `to_string_lossy` only for
     // ordering; the encoded bytes use `encode_wide` losslessly.
-    entries.sort_by_cached_key(|(k, _)| {
-        k.to_string_lossy().to_ascii_uppercase()
-    });
+    entries.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_ascii_uppercase());
 
     // Encode: `KEY=VALUE\0`… `\0`.
     let mut out: Vec<u16> = Vec::new();
@@ -608,11 +602,7 @@ fn add_proxy_case_twins(entries: &mut Vec<(String, String)>) {
 /// Public so `main.rs`'s self-elevate path can rebuild
 /// `lpParameters` from `std::env::args()`.
 pub fn quote_arg(a: &str) -> String {
-    if !a.is_empty()
-        && !a
-            .chars()
-            .any(|c| matches!(c, ' ' | '\t' | '"' | '\\'))
-    {
+    if !a.is_empty() && !a.chars().any(|c| matches!(c, ' ' | '\t' | '"' | '\\')) {
         return a.to_string();
     }
     let mut out = String::with_capacity(a.len() + 2);
@@ -699,9 +689,8 @@ fn target_is_cmd(exe: &Path) -> bool {
 /// mis-parsed payloads containing `&` and was reverted.
 pub fn build_cmdline(exe: &Path, args: &[String]) -> String {
     let cmd_split = if target_is_cmd(exe) {
-        args.iter().position(|a| {
-            matches!(a.to_ascii_lowercase().as_str(), "/c" | "/k" | "/r")
-        })
+        args.iter()
+            .position(|a| matches!(a.to_ascii_lowercase().as_str(), "/c" | "/k" | "/r"))
     } else {
         None
     };
@@ -744,9 +733,7 @@ impl ProcThreadAttrs {
         // Sizing call — expected to fail with
         // ERROR_INSUFFICIENT_BUFFER and write the required size.
         unsafe {
-            let _ = InitializeProcThreadAttributeList(
-                None, count, None, &mut size,
-            );
+            let _ = InitializeProcThreadAttributeList(None, count, None, &mut size);
         }
         if size == 0 {
             return Err(anyhow!(
@@ -757,7 +744,7 @@ impl ProcThreadAttrs {
         unsafe {
             InitializeProcThreadAttributeList(
                 Some(LPPROC_THREAD_ATTRIBUTE_LIST(
-                    storage.as_mut_ptr() as *mut c_void,
+                    storage.as_mut_ptr() as *mut c_void
                 )),
                 count,
                 None,
@@ -829,10 +816,9 @@ impl Drop for ProcThreadAttrs {
 /// kernel never duplicated).
 fn collect_inheritable_std_handles() -> [HANDLE; 3] {
     let mut out = [HANDLE::default(); 3];
-    for (i, which) in
-        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
-            .into_iter()
-            .enumerate()
+    for (i, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
     {
         let h = match unsafe { GetStdHandle(which) } {
             Ok(h) => h,
@@ -843,9 +829,7 @@ fn collect_inheritable_std_handles() -> [HANDLE; 3] {
         }
         // Best-effort: a detached caller may have non-inheritable
         // (or pseudo) handles here; skip rather than fail.
-        let r = unsafe {
-            SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
-        };
+        let r = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) };
         if r.is_ok() {
             out[i] = h;
         }
@@ -880,8 +864,12 @@ mod tests {
         // inner quotes and metachars are NOT touched.
         let line = build_cmdline(
             exe,
-            &["/d".into(), "/s".into(), "/c".into(),
-              r#"echo "x & y""#.into()],
+            &[
+                "/d".into(),
+                "/s".into(),
+                "/c".into(),
+                r#"echo "x & y""#.into(),
+            ],
         );
         assert_eq!(
             line,
@@ -890,8 +878,14 @@ mod tests {
         // Multiple post-/c argv elements are joined with a space.
         let line2 = build_cmdline(
             exe,
-            &["/c".into(), "echo".into(), "a".into(), "&".into(),
-              "echo".into(), "b".into()],
+            &[
+                "/c".into(),
+                "echo".into(),
+                "a".into(),
+                "&".into(),
+                "echo".into(),
+                "b".into(),
+            ],
         );
         assert_eq!(
             line2,
@@ -924,7 +918,10 @@ mod tests {
                 "socks5h://localhost:60081".to_string(),
             ),
             // Mixed-case input → BOTH canonical forms appended.
-            ("Http_Proxy".to_string(), "http://localhost:60080".to_string()),
+            (
+                "Http_Proxy".to_string(),
+                "http://localhost:60080".to_string(),
+            ),
             // Names that merely contain or extend the suffix are not.
             ("FOO_PROXYX".to_string(), "x".to_string()),
             ("PATH".to_string(), r"C:\Windows".to_string()),

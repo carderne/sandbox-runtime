@@ -45,24 +45,18 @@
 //! ([`acl::classify_sd`]), so the next `ensure_stamped` re-derives
 //! `original_sd = cur` and the upsert overwrites correctly.
 
-use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, anyhow, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateMutexExW, GetCurrentProcess, GetProcessTimes, OpenProcess,
-    ReleaseMutex, WaitForSingleObject, INFINITE, MUTEX_ALL_ACCESS,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexExW, GetCurrentProcess, GetProcessTimes, INFINITE, MUTEX_ALL_ACCESS, OpenProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, WaitForSingleObject,
 };
 
-use crate::acl::{
-    self, AclMask, CapturedSd, MarkerHash, PrebuiltDacls, SbAce,
-    StampClass,
-};
+use crate::acl::{self, AclMask, CapturedSd, MarkerHash, PrebuiltDacls, SbAce, StampClass};
 use crate::path_id;
 use crate::util::{pcwstr, wstr};
 
@@ -342,8 +336,8 @@ impl InitMutex {
     /// a broker-only DACL so a sandbox child cannot open it (and
     /// therefore cannot stall stamps by sitting on the lock).
     fn acquire(group_sid: &str) -> Result<Self> {
-        let sa = acl::build_init_mutex_sa(group_sid)
-            .context("build init-mutex SECURITY_ATTRIBUTES")?;
+        let sa =
+            acl::build_init_mutex_sa(group_sid).context("build init-mutex SECURITY_ATTRIBUTES")?;
         let name = wstr(MUTEX_NAME);
         // Don't request CREATE_MUTEX_INITIAL_OWNER — if another
         // broker already created the mutex this call opens it,
@@ -375,7 +369,9 @@ impl InitMutex {
             }
             other => {
                 let err = std::io::Error::last_os_error();
-                unsafe { let _ = CloseHandle(h); }
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
                 bail!(
                     "WaitForSingleObject({MUTEX_NAME}): unexpected {other:?} \
                      ({err})"
@@ -390,8 +386,7 @@ impl InitMutex {
 /// Stamps the parent directory broker-only on EVERY open.
 pub fn open_db(group_sid: &str) -> Result<Connection> {
     let dir = state_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create_dir_all {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
     // Stamp the directory `(OI)(CI)` broker-only so the sandbox
     // child cannot tamper with state.db / -wal / -shm. Done on
     // EVERY open, not just first creation: if the dir already
@@ -421,9 +416,7 @@ pub fn open_db(group_sid: &str) -> Result<Connection> {
     // → DENY skipped, broker-only allow set still excludes the
     // sandbox user) from a transient SAM/LSA failure — the latter
     // is surfaced rather than silently dropping a security ACE.
-    let deny_sid = match crate::sid::lookup_account_sid(
-        crate::user::SANDBOX_GROUP,
-    ) {
+    let deny_sid = match crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP) {
         Ok(s) => Some(s),
         Err(e) => {
             match crate::sid::sid_account_exists("S-1-5-32-545") {
@@ -445,9 +438,7 @@ pub fn open_db(group_sid: &str) -> Result<Connection> {
             }
         }
     };
-    if let Err(e) =
-        acl::stamp_dir_inheriting(dir_str, group_sid, deny_sid.as_deref())
-    {
+    if let Err(e) = acl::stamp_dir_inheriting(dir_str, group_sid, deny_sid.as_deref()) {
         eprintln!(
             "srt-win: WARNING: failed to stamp state-DB dir {} \
              broker-only: {e:#}",
@@ -486,9 +477,7 @@ pub struct FencePlan {
     pub parents: Vec<String>,
 }
 
-pub fn fence_plan_for_holder(
-    holder_pid: HolderPid,
-) -> Result<Option<FencePlan>> {
+pub fn fence_plan_for_holder(holder_pid: HolderPid) -> Result<Option<FencePlan>> {
     let Some(conn) = open_db_ro()? else {
         return Ok(None);
     };
@@ -500,10 +489,7 @@ pub const KIND_DENY: &[&str] = &["deny", "deny_fdc"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
-fn fence_plan_on(
-    conn: &Connection,
-    holder_pid: HolderPid,
-) -> Result<FencePlan> {
+fn fence_plan_on(conn: &Connection, holder_pid: HolderPid) -> Result<FencePlan> {
     // Explicit read txn = single WAL snapshot for both SELECTs.
     // `BEGIN` on a read-only connection takes a read lock that
     // pins the WAL frame until `COMMIT`.
@@ -535,7 +521,8 @@ fn fence_plan_on(
             )?,
         })
     })();
-    conn.execute_batch("COMMIT").context("commit fence-plan tx")?;
+    conn.execute_batch("COMMIT")
+        .context("commit fence-plan tx")?;
     r
 }
 
@@ -548,8 +535,12 @@ fn query_vec<T, P: rusqlite::Params>(
     p: P,
     row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 ) -> Result<Vec<T>> {
-    let mut s = conn.prepare(sql).with_context(|| format!("prepare: {sql}"))?;
-    let it = s.query_map(p, row).with_context(|| format!("query: {sql}"))?;
+    let mut s = conn
+        .prepare(sql)
+        .with_context(|| format!("prepare: {sql}"))?;
+    let it = s
+        .query_map(p, row)
+        .with_context(|| format!("query: {sql}"))?;
     let mut v = Vec::new();
     for r in it {
         v.push(r.with_context(|| format!("row: {sql}"))?);
@@ -572,11 +563,8 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
             path.display()
         ),
     }
-    let conn = Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("sqlite open RO {}", path.display()))?;
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("sqlite open RO {}", path.display()))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // open_db_at can crash between Connection::open (which creates
     // the file) and execute_batch(SCHEMA_SQL), leaving a valid
@@ -640,19 +628,16 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     // direct callers (`clear_setup`, `trust_ca`) don't silently
     // bump `user_version` on a stale DB.
     if path.exists() {
-        let probe = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        );
+        let probe = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         if let Ok(c) = probe {
             let ver: i64 = c
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap_or(0);
             drop(c);
             if ver != 0 && ver != SCHEMA_VERSION {
-                let dir = path.parent().ok_or_else(|| {
-                    anyhow!("state DB path '{}' has no parent", path.display())
-                })?;
+                let dir = path
+                    .parent()
+                    .ok_or_else(|| anyhow!("state DB path '{}' has no parent", path.display()))?;
                 let stem = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -685,8 +670,7 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
                 // only journal pages of it).
                 for ext in ["-wal", "-shm"] {
                     let p = dir.join(format!("{stem}{ext}"));
-                    let to =
-                        dir.join(format!("{stem}.v{ver}.{ts}.bak{ext}"));
+                    let to = dir.join(format!("{stem}.v{ver}.{ts}.bak{ext}"));
                     let _ = std::fs::rename(&p, &to);
                 }
                 eprintln!(
@@ -701,8 +685,7 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
             }
         }
     }
-    let conn = Connection::open(path)
-        .with_context(|| format!("sqlite open {}", path.display()))?;
+    let conn = Connection::open(path).with_context(|| format!("sqlite open {}", path.display()))?;
     // WAL = concurrent readers + single writer + crash safety.
     // `synchronous=NORMAL` is the recommended companion for WAL and
     // is durable across power loss. busy_timeout is belt-and-braces
@@ -727,10 +710,8 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
         .optional()?
         .is_some();
     if !has_ca {
-        conn.execute(
-            "ALTER TABLE sandbox_user ADD COLUMN ca_cert BLOB", [],
-        )
-        .context("ALTER sandbox_user.ca_cert")?;
+        conn.execute("ALTER TABLE sandbox_user ADD COLUMN ca_cert BLOB", [])
+            .context("ALTER sandbox_user.ca_cert")?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(conn)
@@ -816,13 +797,9 @@ pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
 /// Read just the `ca_cert` column from the (single) row. `Ok(None)`
 /// when no install has run, no CA was recorded, or the table/column
 /// is absent.
-pub fn read_ca_cert(
-    conn: &Connection,
-) -> Result<Option<crate::cert_store::CertDer>> {
+pub fn read_ca_cert(conn: &Connection) -> Result<Option<crate::cert_store::CertDer>> {
     match conn
-        .query_row("SELECT ca_cert FROM sandbox_user LIMIT 1", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT ca_cert FROM sandbox_user LIMIT 1", [], |r| r.get(0))
         .optional()
     {
         Ok(v) => Ok(v.flatten()),
@@ -834,17 +811,12 @@ pub fn read_ca_cert(
 /// Overwrite just the `ca_cert` column on the (single) existing
 /// row. `srt-win user trust-ca` uses this to record a CA without
 /// re-provisioning. Fails when no install has run yet.
-pub fn set_ca_cert(
-    conn: &Connection,
-    der: &crate::cert_store::CertDer,
-) -> Result<()> {
+pub fn set_ca_cert(conn: &Connection, der: &crate::cert_store::CertDer) -> Result<()> {
     let n = conn
         .execute("UPDATE sandbox_user SET ca_cert = ?1", params![der])
         .context("UPDATE sandbox_user.ca_cert")?;
     if n == 0 {
-        bail!(
-            "no sandbox-user row to attach CA to — run `srt-win install`"
-        );
+        bail!("no sandbox-user row to attach CA to — run `srt-win install`");
     }
     Ok(())
 }
@@ -976,8 +948,7 @@ impl Locked {
         refuse_escalation: bool,
     ) -> Result<StampWitness> {
         // 1. Disk first.
-        let cur = acl::capture_sd(canon)
-            .with_context(|| format!("capture SD for '{canon}'"))?;
+        let cur = acl::capture_sd(canon).with_context(|| format!("capture SD for '{canon}'"))?;
         let (cur_id, links) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
         let parent = path_id::canonical_parent_of(canon);
@@ -1019,10 +990,7 @@ impl Locked {
             }
             Some((m, h)) => match prior.as_ref() {
                 Some(p) if p.file_id == cur_id => match &p.original_sd {
-                    Some(orig)
-                        if acl::compute_marker_hash(orig, &p.file_id)
-                            == h =>
-                    {
+                    Some(orig) if acl::compute_marker_hash(orig, &p.file_id) == h => {
                         (Some(orig.clone()), want_mask.max(m), Some(m), h)
                     }
                     Some(_) => bail!(
@@ -1107,9 +1075,7 @@ impl Locked {
             StampAction::AlreadyStamped
         } else {
             acl::stamp_target_apply(canon, dacls, eff, is_dir, &marker)
-                .with_context(|| {
-                    format!("stamp '{canon}' ({eff:?}, marker)")
-                })?;
+                .with_context(|| format!("stamp '{canon}' ({eff:?}, marker)"))?;
             if on_disk_mask.is_some() {
                 StampAction::ReStamped
             } else {
@@ -1122,8 +1088,7 @@ impl Locked {
         //    through `apply_aces` (DENY ACE on the file +
         //    `(D;OICI;FDC)` on the parent) instead of the PROTECTED
         //    rewrite.
-        let pstate =
-            self.ensure_parent_stamped(parent.as_deref(), dacls)?;
+        let pstate = self.ensure_parent_stamped(parent.as_deref(), dacls)?;
 
         // 7. Fence bit = links≠1 (alternate names may be under
         //    unstamped parents) OR parent unstampable. Directory
@@ -1203,32 +1168,27 @@ impl Locked {
         }
         // Capture error → Unstampable (fail-closed; never accept a
         // stale row when we can't read the live DACL).
-        let (cur, cur_id) = match (
-            acl::capture_sd(parent),
-            path_id::capture_file_id(parent),
-        ) {
+        let (cur, cur_id) = match (acl::capture_sd(parent), path_id::capture_file_id(parent)) {
             (Ok(sd), Ok(id)) => (sd, id),
             (e_sd, e_id) => {
                 eprintln!(
                     "srt-win: parent '{parent}': capture failed \
                      (sd={:?}, id={:?}); routing children to the \
                      per-exec handle fence",
-                    e_sd.err(), e_id.err()
+                    e_sd.err(),
+                    e_id.err()
                 );
                 return Ok(ParentState::Unstampable);
             }
         };
         let class = acl::classify_sd(&cur, &dacls.calib)?;
         let prior = self.get_parent_stamp(parent)?;
-        let (original_sd, marker, already): (
-            Option<CapturedSd>, MarkerHash, bool,
-        ) = match class {
+        let (original_sd, marker, already): (Option<CapturedSd>, MarkerHash, bool) = match class {
             StampClass::ParentAllowList(h) => match prior {
                 Some(p) => match &p.original_sd {
                     Some(orig)
                         if p.file_id == Some(cur_id)
-                            && acl::compute_marker_hash(orig, &cur_id)
-                                == h =>
+                            && acl::compute_marker_hash(orig, &cur_id) == h =>
                     {
                         (Some(orig.clone()), h, true)
                     }
@@ -1267,8 +1227,7 @@ impl Locked {
             // ParentAllowList(_) is shape drift (a file-shape
             // DACL on a dir is something we never write). Same
             // fail-closed route as StampedUnrecognized.
-            StampClass::StampedUnrecognized
-            | StampClass::File(_, _) => {
+            StampClass::StampedUnrecognized | StampClass::File(_, _) => {
                 eprintln!(
                     "srt-win: parent '{parent}': broker-stamp derivative \
                      (stamped_unrecognized); routing children to handle \
@@ -1296,10 +1255,7 @@ impl Locked {
                 cur_id.as_bytes().as_slice(),
             ])
             .context("UPSERT parent_stamps")?;
-        if !already
-            && let Err(e) =
-                acl::apply_parent_allow_list(parent, dacls, &marker)
-        {
+        if !already && let Err(e) = acl::apply_parent_allow_list(parent, dacls, &marker) {
             eprintln!(
                 "srt-win: parent '{parent}': apply allow-list failed \
                  ({e:#}); routing children to handle fence"
@@ -1333,9 +1289,8 @@ impl Locked {
     /// child is still running. `ON CONFLICT DO UPDATE` updates in
     /// place and leaves child rows intact.
     pub fn register_broker(&self) -> Result<()> {
-        let ct = pid_create_time(self.holder_pid.0).with_context(|| {
-            format!("read create-time of holder pid {}", self.holder_pid.0)
-        })?;
+        let ct = pid_create_time(self.holder_pid.0)
+            .with_context(|| format!("read create-time of holder pid {}", self.holder_pid.0))?;
         let now = unix_now();
         self.conn
             .execute(
@@ -1413,10 +1368,7 @@ impl Locked {
 
     /// Look up a restore record. The row is a HINT — it never
     /// asserts on-disk state; corroborate against the marker.
-    pub fn get_snapshot(
-        &self,
-        canonical_path: &str,
-    ) -> Result<Option<Snapshot>> {
+    pub fn get_snapshot(&self, canonical_path: &str) -> Result<Option<Snapshot>> {
         self.conn
             .prepare_cached(SNAPSHOT_SELECT_BY_PATH)?
             .query_row(params![canonical_path], snapshot_from_row)
@@ -1456,10 +1408,7 @@ impl Locked {
         Ok(())
     }
 
-    fn get_parent_stamp(
-        &self,
-        canonical_parent_path: &str,
-    ) -> Result<Option<ParentStamp>> {
+    fn get_parent_stamp(&self, canonical_parent_path: &str) -> Result<Option<ParentStamp>> {
         self.conn
             .prepare_cached(
                 "SELECT original_sd, file_id \
@@ -1529,9 +1478,7 @@ impl Locked {
             // disk-first chokepoint. The sealed StampWitness makes
             // a "trust the row, skip the disk check" branch
             // unspellable.
-            match self.ensure_stamped(
-                canon, *mask, *is_dir, dacls, refuse_escalation,
-            ) {
+            match self.ensure_stamped(canon, *mask, *is_dir, dacls, refuse_escalation) {
                 Ok(w) => witnesses.push(w),
                 Err(e) => {
                     eprintln!("srt-win: '{canon}': {e:#}");
@@ -1541,14 +1488,15 @@ impl Locked {
         }
         if failed > 0 {
             let mut parent_outs = Vec::new();
-            let added: Vec<_> =
-                witnesses.iter().filter(|w| w.holder_added).collect();
+            let added: Vec<_> = witnesses.iter().filter(|w| w.holder_added).collect();
             let release_failed = added
                 .iter()
-                .filter(|w| matches!(
-                    self.release_one(&w.canon, dacls, &mut parent_outs),
-                    ReleaseOutcome::Failed,
-                ))
+                .filter(|w| {
+                    matches!(
+                        self.release_one(&w.canon, dacls, &mut parent_outs),
+                        ReleaseOutcome::Failed,
+                    )
+                })
                 .count();
             // The "{N} of {M} could not be stamped; rolled back"
             // line is the CALLER's to print (with `acl stamp` vs
@@ -1649,10 +1597,7 @@ impl Locked {
     /// `my_holds` / final `unregister_broker` errors propagate.
     ///
     /// Shared by `acl restore` and per-exec `--deny-*` teardown.
-    pub fn restore_all(
-        &self,
-        dacls: &PrebuiltDacls,
-    ) -> Result<RestoreAllOutcomes> {
+    pub fn restore_all(&self, dacls: &PrebuiltDacls) -> Result<RestoreAllOutcomes> {
         let holds = self.my_holds()?;
         let mut entries = Vec::new();
         let mut parent_outs = Vec::new();
@@ -1661,12 +1606,15 @@ impl Locked {
             match self.release_one(canon, dacls, &mut parent_outs) {
                 ReleaseOutcome::Restored(s, o) => entries.push((s, o)),
                 ReleaseOutcome::Failed => failed += 1,
-                ReleaseOutcome::StillHeld
-                | ReleaseOutcome::NoSnapshot => {}
+                ReleaseOutcome::StillHeld | ReleaseOutcome::NoSnapshot => {}
             }
         }
         self.unregister_broker()?;
-        Ok(RestoreAllOutcomes { entries, parent_outs, failed })
+        Ok(RestoreAllOutcomes {
+            entries,
+            parent_outs,
+            failed,
+        })
     }
 
     /// `register_broker` → run `f` → on `failed > 0` roll back this
@@ -1684,9 +1632,7 @@ impl Locked {
         let (witnesses, failed) = f(self)?;
         if failed > 0 {
             for w in witnesses.iter().filter(|w| w.holder_added) {
-                if let Err(e) =
-                    self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid)
-                {
+                if let Err(e) = self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid) {
                     eprintln!(
                         "srt-win: WARNING: rollback {} '{}': {e:#}; \
                          ACE left in place",
@@ -1730,16 +1676,11 @@ impl Locked {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
             let mut failed = 0usize;
-            let mut one = |canon: &str, ace: SbAce| {
-                match db.ensure_ace(canon, ace, sandbox_sid) {
-                    Ok(w) => witnesses.push(w),
-                    Err(e) => {
-                        eprintln!(
-                            "srt-win: {} '{canon}': {e:#}",
-                            ace.kind()
-                        );
-                        failed += 1;
-                    }
+            let mut one = |canon: &str, ace: SbAce| match db.ensure_ace(canon, ace, sandbox_sid) {
+                Ok(w) => witnesses.push(w),
+                Err(e) => {
+                    eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
+                    failed += 1;
                 }
             };
             for (canon, ace) in targets {
@@ -1758,12 +1699,7 @@ impl Locked {
     /// row plus `working_aces` row) then [`recompose_at`] so a
     /// crash between leaves a row whose ACE hasn't been written —
     /// the next call re-derives and reapplies.
-    fn ensure_ace(
-        &self,
-        canon: &str,
-        want: SbAce,
-        sandbox_sid: &str,
-    ) -> Result<AceWitness> {
+    fn ensure_ace(&self, canon: &str, want: SbAce, sandbox_sid: &str) -> Result<AceWitness> {
         let cur_id = path_id::capture_file_id(canon)
             .with_context(|| format!("capture file_id '{canon}'"))?;
         let prior: Option<Vec<u8>> = self
@@ -1806,9 +1742,7 @@ impl Locked {
             .context("UPSERT ace_holders")?
             > 0
             && prior.is_none();
-        let eff = self
-            .effective_ace(canon, want.kind())?
-            .unwrap_or(want);
+        let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
         self.conn
             .prepare_cached(
                 "INSERT INTO working_aces \
@@ -1836,11 +1770,7 @@ impl Locked {
     }
 
     /// `MAX(want_mask)` across live holders of `(canon, kind)`.
-    fn effective_ace(
-        &self,
-        canon: &str,
-        kind: &str,
-    ) -> Result<Option<SbAce>> {
+    fn effective_ace(&self, canon: &str, kind: &str) -> Result<Option<SbAce>> {
         let masks: Vec<String> = query_vec(
             &self.conn,
             "SELECT want_mask FROM ace_holders \
@@ -1863,12 +1793,7 @@ impl Locked {
     /// object is NOT touched — except for `Grant`, where we
     /// best-effort `locate_by_file_id` and revoke at the moved path
     /// so the sandbox user does not keep stale access.
-    fn release_one_ace(
-        &self,
-        canon: &str,
-        kind: &str,
-        sandbox_sid: &str,
-    ) -> Result<AceRelease> {
+    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
         self.conn
             .prepare_cached(
                 "DELETE FROM ace_holders WHERE canonical_path = ?1 \
@@ -1882,9 +1807,7 @@ impl Locked {
                 "SELECT file_id, mask FROM working_aces \
                  WHERE canonical_path = ?1 AND kind = ?2",
             )?
-            .query_row(params![canon, kind], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((fid, stored)) = row else {
             return Ok(AceRelease::NoRow);
@@ -1914,9 +1837,7 @@ impl Locked {
             IdGate::Match => {
                 recompose_at(&self.conn, canon, sandbox_sid)?;
                 Ok(match new_eff {
-                    Some(e) if e.as_str() == stored => {
-                        AceRelease::StillHeld
-                    }
+                    Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                     Some(_) => AceRelease::Downgraded,
                     None => AceRelease::Revoked,
                 })
@@ -1966,10 +1887,7 @@ impl Locked {
 
     /// `(canon, kind)` rows held by this holder, optionally filtered
     /// to one set of kinds.
-    fn my_ace_holds(
-        &self,
-        kinds: Option<&[&str]>,
-    ) -> Result<Vec<(String, String)>> {
+    fn my_ace_holds(&self, kinds: Option<&[&str]>) -> Result<Vec<(String, String)>> {
         let all: Vec<(String, String)> = query_vec(
             &self.conn,
             "SELECT canonical_path, kind FROM ace_holders \
@@ -1979,9 +1897,7 @@ impl Locked {
         )?;
         Ok(all
             .into_iter()
-            .filter(|(_, k)| {
-                kinds.is_none_or(|ks| ks.contains(&k.as_str()))
-            })
+            .filter(|(_, k)| kinds.is_none_or(|ks| ks.contains(&k.as_str())))
             .collect())
     }
 
@@ -2010,7 +1926,10 @@ impl Locked {
                 }
             }
         }
-        if self.my_ace_holds(None).map(|h| h.is_empty()).unwrap_or(false)
+        if self
+            .my_ace_holds(None)
+            .map(|h| h.is_empty())
+            .unwrap_or(false)
             && self.my_holds().map(|h| h.is_empty()).unwrap_or(false)
         {
             self.unregister_broker()?;
@@ -2024,11 +1943,7 @@ impl Locked {
 /// for sandbox-user ACE state — every add/drop/crash-recover routes
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
-fn recompose_at(
-    conn: &Connection,
-    canon: &str,
-    sandbox_sid: &str,
-) -> Result<()> {
+fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()> {
     let rows: Vec<(String, String)> = query_vec(
         conn,
         "SELECT kind, mask FROM working_aces \
@@ -2110,22 +2025,16 @@ enum ReleaseOutcome {
     Failed,
 }
 
-const SNAPSHOT_SELECT_BY_PATH: &str =
-    "SELECT canonical_path, original_sd, file_id, parent_path, is_dir \
+const SNAPSHOT_SELECT_BY_PATH: &str = "SELECT canonical_path, original_sd, file_id, parent_path, is_dir \
      FROM acl_snapshots WHERE canonical_path = ?1";
 
 fn snapshot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     Ok(Snapshot {
         canonical_path: r.get(0)?,
         original_sd: r.get::<_, Option<Vec<u8>>>(1)?.map(CapturedSd::from),
-        file_id: path_id::FileId::from_bytes(&r.get::<_, Vec<u8>>(2)?)
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Blob,
-                    e.into(),
-                )
-            })?,
+        file_id: path_id::FileId::from_bytes(&r.get::<_, Vec<u8>>(2)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Blob, e.into())
+        })?,
         parent_path: r.get(3)?,
         is_dir: r.get::<_, i64>(4)? != 0,
     })
@@ -2183,9 +2092,7 @@ fn crash_recovery(
     //     and one still-held kind keeps the held one. Sandbox SID
     //     comes from `read_setup_info` — when no sandbox user is
     //     provisioned, there are no `working_aces` rows to orphan.
-    if let Some(sb) =
-        read_setup_info(conn)?.map(|s| s.sandbox_user_sid)
-    {
+    if let Some(sb) = read_setup_info(conn)?.map(|s| s.sandbox_user_sid) {
         let orphan_aces: Vec<(String, String, Vec<u8>)> = query_vec(
             conn,
             "SELECT g.canonical_path, g.kind, g.file_id \
@@ -2248,9 +2155,8 @@ fn crash_recovery(
         // Each path is processed independently; a failure on
         // one does not abort the batch (the host raises after
         // reading the full structured result, never mid-batch).
-        let out = match try_restore_snapshot(
-            conn, &snap, dacls, force, &mut report.parent_entries,
-        ) {
+        let out = match try_restore_snapshot(conn, &snap, dacls, force, &mut report.parent_entries)
+        {
             Ok(o) => o,
             Err(e) => {
                 eprintln!(
@@ -2297,8 +2203,7 @@ fn crash_recovery(
     for parent in parent_orphans {
         match try_restore_parent_validated(conn, &parent, dacls, force)? {
             Some(
-                out @ (ParentRestoreOutcome::Restored
-                | ParentRestoreOutcome::AlreadyOriginal),
+                out @ (ParentRestoreOutcome::Restored | ParentRestoreOutcome::AlreadyOriginal),
             ) => {
                 report.parents_restored += 1;
                 report.parent_entries.push((parent, out));
@@ -2416,7 +2321,11 @@ fn try_restore_snapshot(
         &snap.canonical_path,
         snap.original_sd.as_ref(),
         snap.file_id,
-        if snap.is_dir { RestoreKind::Dir } else { RestoreKind::File },
+        if snap.is_dir {
+            RestoreKind::Dir
+        } else {
+            RestoreKind::File
+        },
         &dacls.calib,
         force,
     )?;
@@ -2431,8 +2340,7 @@ fn try_restore_snapshot(
         )
         .context("DELETE snapshot")?;
         if let Some(parent) = snap.parent_path.as_deref()
-            && let Some(po) =
-                try_restore_parent_validated(conn, parent, dacls, force)?
+            && let Some(po) = try_restore_parent_validated(conn, parent, dacls, force)?
         {
             parent_out.push((parent.to_string(), po));
         }
@@ -2441,13 +2349,12 @@ fn try_restore_snapshot(
         RestoreVerdict::Restored => RestoreOutcome::Restored,
         RestoreVerdict::AlreadyOriginal => RestoreOutcome::AlreadyOriginal,
         RestoreVerdict::LeftChanged => RestoreOutcome::LeftChanged,
-        RestoreVerdict::LeftUnreadable
-        | RestoreVerdict::RestoreFailed(_) => RestoreOutcome::LeftUnreadable,
+        RestoreVerdict::LeftUnreadable | RestoreVerdict::RestoreFailed(_) => {
+            RestoreOutcome::LeftUnreadable
+        }
         RestoreVerdict::Tampered => RestoreOutcome::Tampered,
         RestoreVerdict::OriginalLost { .. } => RestoreOutcome::OriginalLost,
-        RestoreVerdict::StampedUnrecognized => {
-            RestoreOutcome::StampedUnrecognized
-        }
+        RestoreVerdict::StampedUnrecognized => RestoreOutcome::StampedUnrecognized,
     })
 }
 
@@ -2485,7 +2392,9 @@ enum RestoreVerdict {
     /// Stamped on disk, `original_sd` is NULL. `force_dropped`
     /// when `--force` cleared the row anyway (so the user can
     /// `icacls /reset`).
-    OriginalLost { force_dropped: bool },
+    OriginalLost {
+        force_dropped: bool,
+    },
     StampedUnrecognized,
     RestoreFailed(String),
 }
@@ -2497,7 +2406,9 @@ impl RestoreVerdict {
             self,
             Self::Restored
                 | Self::AlreadyOriginal
-                | Self::OriginalLost { force_dropped: true }
+                | Self::OriginalLost {
+                    force_dropped: true
+                }
         )
     }
 }
@@ -2541,7 +2452,9 @@ fn verify_and_restore(
                      original ({what}); dropping row (reset the \
                      DACL manually, e.g. `icacls /reset`)"
                 );
-                RestoreVerdict::OriginalLost { force_dropped: true }
+                RestoreVerdict::OriginalLost {
+                    force_dropped: true,
+                }
             }
         }
     };
@@ -2578,9 +2491,7 @@ fn verify_and_restore(
     let ours = match (kind, &class) {
         (RestoreKind::File, StampClass::File(_, h))
         | (RestoreKind::Dir, StampClass::DirTarget(_, h))
-        | (RestoreKind::Parent, StampClass::ParentAllowList(h)) => {
-            Ours::Match(*h)
-        }
+        | (RestoreKind::Parent, StampClass::ParentAllowList(h)) => Ours::Match(*h),
         (_, StampClass::Unstamped) => Ours::Foreign,
         // Any other (kind, on-disk-shape) pair is shape drift —
         // a marker-bearing DACL that this caller never writes.
@@ -2624,11 +2535,11 @@ fn verify_and_restore(
                      wiped); leaving stamped (`acl recover --force` \
                      will drop the row so you can `icacls /reset`)"
                 );
-                RestoreVerdict::OriginalLost { force_dropped: false }
+                RestoreVerdict::OriginalLost {
+                    force_dropped: false,
+                }
             }
-            Some(orig)
-                if acl::compute_marker_hash(orig, &file_id) != h =>
-            {
+            Some(orig) if acl::compute_marker_hash(orig, &file_id) != h => {
                 if force {
                     force_out("Tampered")
                 } else {
@@ -2658,16 +2569,12 @@ enum IdGate {
 /// any other open error → `Unreadable` (retryable, not a
 /// mismatch).
 fn identity_gate(path: &str, expect: path_id::FileId) -> IdGate {
-    use windows::Win32::Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-    };
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     match path_id::capture_file_id(path) {
         Ok(cur) if cur == expect => IdGate::Match,
         Ok(_) => IdGate::Mismatch,
         Err(e) => {
-            let code = e
-                .downcast_ref::<windows::core::Error>()
-                .map(|we| we.code());
+            let code = e.downcast_ref::<windows::core::Error>().map(|we| we.code());
             let gone = matches!(
                 code,
                 Some(c) if c == ERROR_FILE_NOT_FOUND.into()
@@ -2695,11 +2602,7 @@ fn parent_stamp_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ParentStamp>
             .map(path_id::FileId::from_bytes)
             .transpose()
             .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Blob,
-                    e.into(),
-                )
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, e.into())
             })?,
     })
 }
@@ -2777,9 +2680,7 @@ fn try_restore_parent_validated(
             return Ok(Some(ParentRestoreOutcome::Missing));
         }
         IdGate::Unreadable => {
-            return Ok(Some(ParentRestoreOutcome::Failed(
-                "capture file_id".into(),
-            )));
+            return Ok(Some(ParentRestoreOutcome::Failed("capture file_id".into())));
         }
     }
 
@@ -2808,16 +2709,10 @@ fn try_restore_parent_validated(
     }
     Ok(Some(match v {
         RestoreVerdict::Restored => ParentRestoreOutcome::Restored,
-        RestoreVerdict::AlreadyOriginal => {
-            ParentRestoreOutcome::AlreadyOriginal
-        }
+        RestoreVerdict::AlreadyOriginal => ParentRestoreOutcome::AlreadyOriginal,
         RestoreVerdict::LeftChanged => ParentRestoreOutcome::LeftChanged,
-        RestoreVerdict::LeftUnreadable => {
-            ParentRestoreOutcome::Failed("capture SD".into())
-        }
-        RestoreVerdict::Tampered => {
-            ParentRestoreOutcome::Failed("original_sd_tampered".into())
-        }
+        RestoreVerdict::LeftUnreadable => ParentRestoreOutcome::Failed("capture SD".into()),
+        RestoreVerdict::Tampered => ParentRestoreOutcome::Failed("original_sd_tampered".into()),
         RestoreVerdict::OriginalLost { .. } => {
             ParentRestoreOutcome::Failed("original_sd_lost".into())
         }
@@ -2890,10 +2785,8 @@ fn pid_create_time(pid: u32) -> Result<i64> {
     if pid == std::process::id() {
         return process_create_time(unsafe { GetCurrentProcess() });
     }
-    let h = unsafe {
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-    }
-    .with_context(|| format!("OpenProcess({pid}) for create-time"))?;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .with_context(|| format!("OpenProcess({pid}) for create-time"))?;
     if h.is_invalid() {
         bail!("OpenProcess({pid}) returned invalid handle");
     }
@@ -2911,8 +2804,7 @@ fn process_create_time(h: HANDLE) -> Result<i64> {
         GetProcessTimes(h, &mut create, &mut exit, &mut kernel, &mut user)
             .context("GetProcessTimes")?;
     }
-    Ok(((create.dwHighDateTime as i64) << 32)
-        | (create.dwLowDateTime as i64))
+    Ok(((create.dwHighDateTime as i64) << 32) | (create.dwLowDateTime as i64))
 }
 
 fn unix_now() -> i64 {
@@ -3014,7 +2906,10 @@ mod tests {
     fn snapshot_round_trip() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            let id = path_id::FileId { volume_serial: 0xdead, id128: [7u8; 16] };
+            let id = path_id::FileId {
+                volume_serial: 0xdead,
+                id128: [7u8; 16],
+            };
             db.upsert_snapshot(
                 r"\\?\C:\f",
                 Some(&vec![1, 2, 3].into()),
@@ -3087,10 +2982,7 @@ mod tests {
                      (canonical_path, original_sd, file_id, \
                       parent_path, parent_stamp_failed) \
                      VALUES (?1, x'01', ?2, NULL, 0)",
-                    params![
-                        r"\\?\C:\srt-win-no-such-file",
-                        [0u8; 24].as_slice(),
-                    ],
+                    params![r"\\?\C:\srt-win-no-such-file", [0u8; 24].as_slice(),],
                 )
                 .unwrap();
             // PID 999999 with create_time 1 is dead.
@@ -3099,8 +2991,7 @@ mod tests {
                 &crate::sid::current_user_sid().unwrap(),
             )
             .unwrap();
-            let rep =
-                crash_recovery(&db.conn, Some(&dacls), false).unwrap();
+            let rep = crash_recovery(&db.conn, Some(&dacls), false).unwrap();
             assert_eq!(rep.dead_brokers, 1);
             // Path gone → identity-gate mismatch → Missing
             // (locate_by_file_id on an all-zero file_id finds
@@ -3113,16 +3004,12 @@ mod tests {
             // row STAYS (orphan record).
             let h: i64 = db
                 .conn
-                .query_row(
-                    "SELECT count(*) FROM holders", [], |r| r.get(0),
-                )
+                .query_row("SELECT count(*) FROM holders", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(h, 0);
             let s: i64 = db
                 .conn
-                .query_row(
-                    "SELECT count(*) FROM acl_snapshots", [], |r| r.get(0),
-                )
+                .query_row("SELECT count(*) FROM acl_snapshots", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(s, 1, "missing-file orphan row must be kept");
         });
@@ -3136,11 +3023,11 @@ mod tests {
     fn fence_fallback_filter() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            let id = path_id::FileId { volume_serial: 0, id128: [0; 16] };
-            for (p, failed) in [
-                (r"\\?\C:\d\ok", 0i64),
-                (r"\\?\C:\d\fail", 1),
-            ] {
+            let id = path_id::FileId {
+                volume_serial: 0,
+                id128: [0; 16],
+            };
+            for (p, failed) in [(r"\\?\C:\d\ok", 0i64), (r"\\?\C:\d\fail", 1)] {
                 db.conn
                     .execute(
                         "INSERT INTO acl_snapshots \
@@ -3153,10 +3040,7 @@ mod tests {
                 db.add_holder(p).unwrap();
             }
             let plan = fence_plan_on(&db.conn, db.holder_pid).unwrap();
-            assert_eq!(
-                plan.fallback_files,
-                vec![r"\\?\C:\d\fail".to_string()]
-            );
+            assert_eq!(plan.fallback_files, vec![r"\\?\C:\d\fail".to_string()]);
             assert_eq!(plan.parents, vec![r"\\?\C:\d".to_string()]);
             // Sibling fan-out (=1 only): UPDATE WHERE parent_path.
             db.conn
@@ -3174,8 +3058,7 @@ mod tests {
 
     #[test]
     fn aliveness_self_is_alive() {
-        let ct =
-            process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+        let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
         assert!(is_process_alive(std::process::id(), ct));
         // Same PID, wrong create time would normally be "recycled →
         // dead", but we special-case ourselves.

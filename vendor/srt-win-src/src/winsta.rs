@@ -80,10 +80,9 @@
 //! The creator keeps the [`IsolatedDesk`] handle open until the child
 //! exits — dropping it then releases the kernel object.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::size_of;
-use windows::core::PCWSTR;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
     NtOpenDirectoryObject, NtQuerySecurityObject, NtSetSecurityObject,
@@ -91,29 +90,27 @@ use windows::Wdk::Storage::FileSystem::{
 use windows::Win32::Foundation::{
     HANDLE, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_DENIED, UNICODE_STRING,
 };
-use windows::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, GetUserObjectSecurity,
-    InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
-    SetUserObjectSecurity, ACL, DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetUserObjectSecurity,
+    InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR,
+    SetSecurityDescriptorDacl, SetUserObjectSecurity,
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CreateDesktopW, GetProcessWindowStation, GetThreadDesktop,
-    GetUserObjectInformationW, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+    CloseDesktop, CreateDesktopW, DESKTOP_CONTROL_FLAGS, GetProcessWindowStation, GetThreadDesktop,
+    GetUserObjectInformationW, HDESK, UOI_NAME,
 };
 use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::core::PCWSTR;
 
 use crate::acl::{
-    ace_sid_is, build_allow_dacl, filter_aces, rebuild_acl, Allow, Mask,
-    NewAce, NO_INHERIT, SID_SYSTEM,
+    Allow, Mask, NO_INHERIT, NewAce, SID_SYSTEM, ace_sid_is, build_allow_dacl, filter_aces,
+    rebuild_acl,
 };
 use crate::sid::{current_user_sid, sid_bytes};
-use crate::util::{wstr, OwnedHandle};
+use crate::util::{OwnedHandle, wstr};
 
 // winuser.h: DESKTOP_ALL_ACCESS = 0x1FF. OR with
 // STANDARD_RIGHTS_REQUIRED so the creator holds full control on the
@@ -165,8 +162,7 @@ impl IsolatedDesk {
         // child's `lpDesktop` carries this name verbatim, so if the
         // read failed a guessed `WinSta0` would point the child at a
         // station the runner may not even be on — propagate.
-        let ws_name = current_winsta_name()
-            .context("read caller's window-station name")?;
+        let ws_name = current_winsta_name().context("read caller's window-station name")?;
 
         // pid + 32 random bits (system CSPRNG). The random suffix
         // is what makes concurrent same-process callers (e.g. test
@@ -174,11 +170,9 @@ impl IsolatedDesk {
         // zero suffix on RNG failure — surface it. `BCryptGenRandom`
         // with `USE_SYSTEM_PREFERRED_RNG` essentially never fails.
         let mut r = [0u8; 4];
-        unsafe {
-            BCryptGenRandom(None, &mut r, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-        }
-        .ok()
-        .context("BCryptGenRandom (desktop name suffix)")?;
+        unsafe { BCryptGenRandom(None, &mut r, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+            .ok()
+            .context("BCryptGenRandom (desktop name suffix)")?;
         let req = format!(
             "srt-sb-{}-{:08x}",
             std::process::id(),
@@ -260,8 +254,7 @@ impl Drop for IsolatedDesk {
 /// the fresh one is appended). Persists for the broker's logon
 /// session — see module doc for why there is no revoke.
 pub fn grant_sandbox_on_winsta(sb_sid: &str) -> Result<()> {
-    let ws = unsafe { GetProcessWindowStation() }
-        .context("GetProcessWindowStation")?;
+    let ws = unsafe { GetProcessWindowStation() }.context("GetProcessWindowStation")?;
     if ws.0.is_null() {
         return Err(anyhow!("GetProcessWindowStation returned null"));
     }
@@ -277,22 +270,17 @@ pub fn grant_sandbox_on_winsta(sb_sid: &str) -> Result<()> {
         || {
             let mut needed = 0u32;
             unsafe {
-                let _ =
-                    GetUserObjectSecurity(h, &si.0, None, 0, &mut needed);
+                let _ = GetUserObjectSecurity(h, &si.0, None, 0, &mut needed);
             }
             if needed == 0 {
-                return Err(anyhow!(
-                    "GetUserObjectSecurity sizing returned 0"
-                ));
+                return Err(anyhow!("GetUserObjectSecurity sizing returned 0"));
             }
             let mut sd = vec![0u8; needed as usize];
             unsafe {
                 GetUserObjectSecurity(
                     h,
                     &si.0,
-                    Some(PSECURITY_DESCRIPTOR(
-                        sd.as_mut_ptr() as *mut c_void,
-                    )),
+                    Some(PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut c_void)),
                     needed,
                     &mut needed,
                 )
@@ -300,10 +288,7 @@ pub fn grant_sandbox_on_winsta(sb_sid: &str) -> Result<()> {
             }
             Ok(sd)
         },
-        |psd| unsafe {
-            SetUserObjectSecurity(h, &si, psd)
-                .context("SetUserObjectSecurity(DACL)")
-        },
+        |psd| unsafe { SetUserObjectSecurity(h, &si, psd).context("SetUserObjectSecurity(DACL)") },
     )
     .context("grant srt-sandbox on WinSta0")
 }
@@ -325,23 +310,17 @@ pub fn grant_sandbox_on_session_bno(sb_sid: &str) -> Result<()> {
             // STATUS_BUFFER_TOO_SMALL and writes the needed length.
             let mut needed = 0u32;
             unsafe {
-                let _ = NtQuerySecurityObject(
-                    bno.raw(), si, None, 0, &mut needed,
-                );
+                let _ = NtQuerySecurityObject(bno.raw(), si, None, 0, &mut needed);
             }
             if needed == 0 {
-                return Err(anyhow!(
-                    "NtQuerySecurityObject sizing returned 0"
-                ));
+                return Err(anyhow!("NtQuerySecurityObject sizing returned 0"));
             }
             let mut sd = vec![0u8; needed as usize];
             unsafe {
                 NtQuerySecurityObject(
                     bno.raw(),
                     si,
-                    Some(PSECURITY_DESCRIPTOR(
-                        sd.as_mut_ptr() as *mut c_void,
-                    )),
+                    Some(PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut c_void)),
                     needed,
                     &mut needed,
                 )
@@ -387,9 +366,7 @@ fn open_session_bno() -> Result<OwnedHandle> {
         ..Default::default()
     };
     let mut h = HANDLE::default();
-    let st = unsafe {
-        NtOpenDirectoryObject(&mut h, READ_CONTROL | WRITE_DAC, &oa)
-    };
+    let st = unsafe { NtOpenDirectoryObject(&mut h, READ_CONTROL | WRITE_DAC, &oa) };
     if st.is_err() {
         // STATUS_ACCESS_DENIED → the broker is not the interactive
         // user (e.g. service context with no full-control ACE on
@@ -491,13 +468,9 @@ fn recompose_dacl(
     let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut c_void);
     unsafe {
         InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION)
-            .with_context(|| {
-                format!("InitializeSecurityDescriptor({what})")
-            })?;
+            .with_context(|| format!("InitializeSecurityDescriptor({what})"))?;
         SetSecurityDescriptorDacl(psd, true, Some(new.as_ptr()), false)
-            .with_context(|| {
-                format!("SetSecurityDescriptorDacl({what})")
-            })?;
+            .with_context(|| format!("SetSecurityDescriptorDacl({what})"))?;
     }
     write(psd)
 }
@@ -505,8 +478,7 @@ fn recompose_dacl(
 /// Name of the window station this process is attached to (e.g.
 /// `WinSta0`, `Service-0x0-<logonid>$`).
 pub fn current_winsta_name() -> Result<String> {
-    let ws = unsafe { GetProcessWindowStation() }
-        .context("GetProcessWindowStation")?;
+    let ws = unsafe { GetProcessWindowStation() }.context("GetProcessWindowStation")?;
     if ws.0.is_null() {
         return Err(anyhow!("GetProcessWindowStation returned null"));
     }
@@ -516,8 +488,7 @@ pub fn current_winsta_name() -> Result<String> {
 /// Name of this thread's current desktop (e.g. `Default`,
 /// `srt-sb-…`).
 pub fn current_desktop_name() -> Result<String> {
-    let d = unsafe { GetThreadDesktop(GetCurrentThreadId()) }
-        .context("GetThreadDesktop")?;
+    let d = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.context("GetThreadDesktop")?;
     if d.0.is_null() {
         return Err(anyhow!("GetThreadDesktop returned null"));
     }
@@ -547,14 +518,10 @@ fn object_name(h: HANDLE) -> Result<String> {
     // Sizing call — expected to fail with ERROR_INSUFFICIENT_BUFFER
     // and write the required byte count.
     unsafe {
-        let _ = GetUserObjectInformationW(
-            h, UOI_NAME, None, 0, Some(&mut needed),
-        );
+        let _ = GetUserObjectInformationW(h, UOI_NAME, None, 0, Some(&mut needed));
     }
     if needed == 0 {
-        return Err(anyhow!(
-            "GetUserObjectInformationW sizing returned 0"
-        ));
+        return Err(anyhow!("GetUserObjectInformationW sizing returned 0"));
     }
     let mut buf = vec![0u8; needed as usize];
     unsafe {
@@ -569,12 +536,8 @@ fn object_name(h: HANDLE) -> Result<String> {
     }
     // SAFETY: `buf` is `needed` bytes, even-length (UTF-16);
     // reinterpret as u16.
-    let wide = unsafe {
-        std::slice::from_raw_parts(
-            buf.as_ptr() as *const u16,
-            (needed as usize) / 2,
-        )
-    };
+    let wide =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, (needed as usize) / 2) };
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     Ok(String::from_utf16_lossy(&wide[..end]))
 }

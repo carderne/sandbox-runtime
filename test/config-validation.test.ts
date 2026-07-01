@@ -732,6 +732,90 @@ describe('Config Validation', () => {
       }
     })
 
+    test('accepts maskDuplicates alongside extract', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/hosts.yml',
+              mode: 'mask',
+              extract: 'oauth_token:\\s*(\\S+)',
+              maskDuplicates: true,
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.credentials?.files?.[0]?.maskDuplicates).toBe(true)
+      }
+    })
+
+    test('maskDuplicates without extract is accepted (ignored)', () => {
+      // Mirrors the injectHosts-on-deny precedent: harmless, so no error.
+      // Whole-file masking already replaces all content, so the option
+      // has nothing to add.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            { path: '~/.config/gh/token', mode: 'mask', maskDuplicates: true },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('maskDuplicates on a deny-mode entry is accepted (ignored)', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          files: [{ path: '~/.netrc', mode: 'deny', maskDuplicates: true }],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects a non-boolean maskDuplicates', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.netrc',
+              mode: 'mask',
+              extract: 'password (\\S+)',
+              maskDuplicates: 'yes',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.maskDuplicates',
+        )
+        expect(issue).toBeDefined()
+      }
+    })
+
     test('rejects mode "mask" on a directory path (trailing slash)', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,

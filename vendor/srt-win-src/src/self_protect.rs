@@ -21,20 +21,20 @@
 //! can therefore open the broker. That's intentional — the threat
 //! model is the sandbox child, not the rest of the user's session.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::size_of;
-use windows::core::PWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
-    SetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::{
-    AddAccessAllowedAce, GetLengthSid, InitializeAcl, ACL, ACL_REVISION,
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetLengthSid, InitializeAcl,
+    PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, PROCESS_ALL_ACCESS};
+use windows::core::PWSTR;
 
 use crate::sid::LocalPsid;
 
@@ -64,10 +64,7 @@ pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
     // RAII over `ConvertStringSidToSidW` → freed via `LocalFree` on
     // drop.
     let group = group_sid
-        .map(|s| {
-            LocalPsid::from_string(s)
-                .with_context(|| format!("parse group SID '{s}'"))
-        })
+        .map(|s| LocalPsid::from_string(s).with_context(|| format!("parse group SID '{s}'")))
         .transpose()?;
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
@@ -76,11 +73,9 @@ pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
     // (sid, mask) — SYSTEM/Admins/group get full access; OWNER_RIGHTS
     // gets READ_CONTROL only. CI passes `group_sid ==
     // BUILTIN\Administrators`; dedup so we don't write a redundant ACE.
-    let mut aces: Vec<(windows::Win32::Security::PSID, u32)> = vec![
-        (system.as_psid(), PROCESS_ALL_ACCESS.0),
-    ];
-    if !matches!(group_sid, Some(s) if s.eq_ignore_ascii_case(SID_BUILTIN_ADMINS))
-    {
+    let mut aces: Vec<(windows::Win32::Security::PSID, u32)> =
+        vec![(system.as_psid(), PROCESS_ALL_ACCESS.0)];
+    if !matches!(group_sid, Some(s) if s.eq_ignore_ascii_case(SID_BUILTIN_ADMINS)) {
         aces.push((admins.as_psid(), PROCESS_ALL_ACCESS.0));
     }
     if let Some(g) = &group {
@@ -106,11 +101,9 @@ pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
     let mut buf = vec![0u8; total];
     let acl = buf.as_mut_ptr() as *mut ACL;
     unsafe {
-        InitializeAcl(acl, total as u32, ACL_REVISION)
-            .context("InitializeAcl")?;
+        InitializeAcl(acl, total as u32, ACL_REVISION).context("InitializeAcl")?;
         for (s, mask) in &aces {
-            AddAccessAllowedAce(acl, ACL_REVISION, *mask, *s)
-                .context("AddAccessAllowedAce")?;
+            AddAccessAllowedAce(acl, ACL_REVISION, *mask, *s).context("AddAccessAllowedAce")?;
         }
         // PROTECTED strips inherited ACEs — without it the user
         // SID's default "full access to own process" inherited
@@ -125,9 +118,7 @@ pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
             None,
         );
         if r.is_err() {
-            return Err(anyhow!(
-                "SetSecurityInfo(broker process DACL): {r:?}"
-            ));
+            return Err(anyhow!("SetSecurityInfo(broker process DACL): {r:?}"));
         }
     }
     // `buf` can drop here — `SetSecurityInfo` copies the ACL into
@@ -140,9 +131,7 @@ pub fn install_broker_dacl(group_sid: Option<&str>) -> Result<()> {
     // command. CI sets the env var so E6 still records the SDDL.
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
         match read_self_dacl_sddl() {
-            Some(sddl) => eprintln!(
-                "srt-win: self-protect applied (DACL: {sddl})"
-            ),
+            Some(sddl) => eprintln!("srt-win: self-protect applied (DACL: {sddl})"),
             None => eprintln!("srt-win: self-protect applied"),
         }
     }

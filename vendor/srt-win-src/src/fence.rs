@@ -29,17 +29,15 @@
 //! file deleted from outside the sandbox after initialization is
 //! no longer in scope.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::time::Duration;
-use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 
-use crate::util::{pcwstr, wstr, OwnedHandle};
+use crate::util::{OwnedHandle, pcwstr, wstr};
 
 const RETRY_ROUNDS: u32 = 10;
 /// Increasing backoff: round `r` (1-indexed) sleeps `20·r` ms
@@ -221,18 +219,12 @@ mod tests {
     /// violation); after dropping the fence the delete succeeds.
     #[test]
     fn fence_blocks_delete_then_lifts() {
-        let tmp = std::env::temp_dir().join(format!(
-            "srt-win-fence-rt-{}.tmp",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("srt-win-fence-rt-{}.tmp", std::process::id()));
         std::fs::write(&tmp, b"x").unwrap();
         let p = tmp.display().to_string();
         let f = open_delete_fence(std::slice::from_ref(&p)).expect("fence");
         let r = std::fs::remove_file(&tmp);
-        assert!(
-            r.is_err(),
-            "delete of fenced file should fail; got {r:?}"
-        );
+        assert!(r.is_err(), "delete of fenced file should fail; got {r:?}");
         drop(f);
         std::fs::remove_file(&tmp).expect("delete after fence drop");
     }
@@ -240,10 +232,7 @@ mod tests {
     /// A nonexistent path is skipped (Gone), not fatal.
     #[test]
     fn fence_skips_gone_path() {
-        let bogus = format!(
-            r"\\?\C:\srt-win-fence-no-such-{}.tmp",
-            std::process::id()
-        );
+        let bogus = format!(r"\\?\C:\srt-win-fence-no-such-{}.tmp", std::process::id());
         let f = open_delete_fence(&[bogus]).expect("gone is skip");
         assert_eq!(f._handles.len(), 0);
     }
@@ -253,10 +242,8 @@ mod tests {
     /// path + retry count). Releasing the holder → fence succeeds.
     #[test]
     fn fence_blocked_path_is_fatal_after_retries() {
-        let tmp = std::env::temp_dir().join(format!(
-            "srt-win-fence-blocked-{}.tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("srt-win-fence-blocked-{}.tmp", std::process::id()));
         std::fs::write(&tmp, b"x").unwrap();
         let p = tmp.display().to_string();
         // Hold the file with dwShareMode=0 so any other open fails

@@ -218,6 +218,100 @@ describe('extractAndSubstitute', () => {
       ['A', 0],
     ])
   })
+
+  describe('maskDuplicates', () => {
+    test('a verbatim duplicate outside the match is also masked when true', () => {
+      const content =
+        'oauth_token: ghp_supersecret123\n' +
+        '# backup copy: ghp_supersecret123\n'
+      const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S, {
+        maskDuplicates: true,
+      })!
+      expect(out.captures).toEqual(['ghp_supersecret123'])
+      expect(out.fakeContent).toBe('oauth_token: <S0>\n# backup copy: <S0>\n')
+      expect(out.fakeContent).not.toContain('ghp_supersecret123')
+    })
+
+    test('explicit false keeps the offset-only behaviour', () => {
+      const content =
+        'oauth_token: ghp_supersecret123\n' +
+        '# backup copy: ghp_supersecret123\n'
+      const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S, {
+        maskDuplicates: false,
+      })!
+      expect(out.fakeContent).toBe(
+        'oauth_token: <S0>\n# backup copy: ghp_supersecret123\n',
+      )
+    })
+
+    test('inserted sentinels survive when the capture is a substring of the sentinel literal', () => {
+      // The capture `value` is a substring of the sentinel `fake_value_0`.
+      // A naive post-pass split/join over the substituted output would
+      // re-match inside the sentinels it just inserted and mangle them;
+      // spans are computed against the original content instead.
+      const content = 'secret: value\n# repeated: value\n'
+      const out = extractAndSubstitute(
+        content,
+        'secret:\\s*(\\S+)',
+        () => 'fake_value_0',
+        { maskDuplicates: true },
+      )!
+      expect(out.fakeContent).toBe(
+        'secret: fake_value_0\n# repeated: fake_value_0\n',
+      )
+    })
+
+    test('a short capture also replaces coincidental substrings (documented collateral)', () => {
+      // The verbatim scan is raw substring matching — `abc` inside the
+      // unrelated word `xabcy` is replaced too. This pins the documented
+      // semantics: the option is for long, high-entropy secrets.
+      const content = 'token: abc\nword: xabcy\n'
+      const out = extractAndSubstitute(content, 'token:\\s*(\\S+)', S, {
+        maskDuplicates: true,
+      })!
+      expect(out.fakeContent).toBe('token: <S0>\nword: x<S0>y\n')
+    })
+
+    test('a capture that is a substring of another cannot claim part of the longer one', () => {
+      // tok is a substring of tok-long; the verbatim pass runs
+      // longest-capture-first, so the duplicated tok-long in the comment
+      // is claimed whole by <S0> rather than partially by <S1>.
+      const content = 'a=tok-long b=tok\n# dup: tok-long and tok\n'
+      const out = extractAndSubstitute(content, '[ab]=(\\S+)', S, {
+        maskDuplicates: true,
+      })!
+      expect(out.captures).toEqual(['tok-long', 'tok'])
+      expect(out.fakeContent).toBe('a=<S0> b=<S1>\n# dup: <S0> and <S1>\n')
+    })
+
+    test('the duplicate pass does not re-invoke the sentinel callback', () => {
+      const calls: Array<[string, number]> = []
+      extractAndSubstitute(
+        'k=A\n# A again: A\n',
+        'k=(\\S+)',
+        (cap, i) => {
+          calls.push([cap, i])
+          return `<S${i}>`
+        },
+        { maskDuplicates: true },
+      )
+      expect(calls).toEqual([['A', 0]])
+    })
+
+    test('a declined capture (callback returns it unchanged) is not duplicate-scanned', () => {
+      // The decode-verification gate declines a candidate by returning the
+      // capture itself. Its duplicates must stay unmasked, and its spans
+      // must not block another capture's verbatim occurrences.
+      const content = 'k=good k=bad\n# dup: good and bad\n'
+      const out = extractAndSubstitute(
+        content,
+        'k=(\\S+)',
+        (cap, i) => (cap === 'bad' ? cap : `<S${i}>`),
+        { maskDuplicates: true },
+      )!
+      expect(out.fakeContent).toBe('k=<S0> k=bad\n# dup: <S0> and bad\n')
+    })
+  })
 })
 
 describe('buildMaskedFileBinds', () => {
@@ -373,6 +467,62 @@ describe('buildMaskedFileBinds', () => {
     expect(m![1]!.startsWith(SENTINEL_PREFIX)).toBe(true)
     expect(reg.lookupReal(m![1]!)).toBe(HOSTS_TOKEN)
     expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('extract with maskDuplicates: a duplicate in a comment is masked in the fake', () => {
+    const dupFile = join(FIXTURE_DIR, 'hosts-dup.yml')
+    writeFileSync(
+      dupFile,
+      `# rotate ${HOSTS_TOKEN} before 2027\n` + HOSTS_CONTENT,
+    )
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds } = buildMaskedFileBinds(
+      [
+        {
+          path: dupFile,
+          mode: 'mask',
+          extract: 'oauth_token:\\s*(\\S+)',
+          maskDuplicates: true,
+        },
+      ],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    expect(fake).not.toContain(HOSTS_TOKEN)
+    // Both the matched span and the comment duplicate carry the same
+    // sentinel, registered once.
+    const sentinels = fake.match(new RegExp(`${SENTINEL_PREFIX}\\S+`, 'g'))!
+    expect(sentinels).toHaveLength(2)
+    expect(new Set(sentinels).size).toBe(1)
+    expect(reg.lookupReal(sentinels[0]!)).toBe(HOSTS_TOKEN)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('extract without maskDuplicates leaves a comment duplicate intact', () => {
+    const dupFile = join(FIXTURE_DIR, 'hosts-dup-off.yml')
+    writeFileSync(
+      dupFile,
+      `# rotate ${HOSTS_TOKEN} before 2027\n` + HOSTS_CONTENT,
+    )
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds } = buildMaskedFileBinds(
+      [{ path: dupFile, mode: 'mask', extract: 'oauth_token:\\s*(\\S+)' }],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    // Default (#326) behaviour: only the regex-matched span is replaced.
+    expect(fake).toContain(`# rotate ${HOSTS_TOKEN} before 2027\n`)
+    expect(fake).not.toContain(`oauth_token: ${HOSTS_TOKEN}`)
     store.dispose()
   })
 
@@ -641,6 +791,48 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     const fakeToken = fake.match(/id_token: (\S+)/)![1]!
     expect(verifyJwt(fakeToken)).toBe(true)
     expect(reg.lookupReal(fakeToken)).toBe(REAL_JWT)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('decode + maskDuplicates: a verified JWT duplicated in a comment is masked with the same fake', () => {
+    const file = join(DECODE_DIR, 'dup-jwt.yml')
+    // The comment duplicate is outside the extract pattern's reach; the
+    // pseudo-JWT candidate fails verification, so its comment duplicate
+    // must stay untouched.
+    writeFileSync(
+      file,
+      `id_token: ${REAL_JWT}\nblob: ${PSEUDO_JWT}\n` +
+        `# rotate ${REAL_JWT} before 2027 (blob was ${PSEUDO_JWT})\n`,
+    )
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds } = buildMaskedFileBinds(
+      [
+        {
+          path: file,
+          mode: 'mask',
+          extract: '(?:id_token|blob):\\s*(\\S+)',
+          decode: 'jwt',
+          maskDuplicates: true,
+        },
+      ],
+      ['api.example.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    expect(fake).not.toContain(REAL_JWT)
+    // Both occurrences carry the SAME fake JWT — the duplicate reuses the
+    // verified capture's sentinel without re-verification.
+    const fakeToken = fake.match(/id_token: (\S+)/)![1]!
+    expect(verifyJwt(fakeToken)).toBe(true)
+    expect(fake).toContain(`# rotate ${fakeToken} before 2027`)
+    expect(reg.lookupReal(fakeToken)).toBe(REAL_JWT)
+    // The unverified candidate and its duplicate are left as-is.
+    expect(fake).toContain(`blob: ${PSEUDO_JWT}\n`)
+    expect(fake).toContain(`(blob was ${PSEUDO_JWT})`)
     expect(reg.size).toBe(1)
     store.dispose()
   })
