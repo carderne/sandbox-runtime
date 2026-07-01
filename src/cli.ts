@@ -52,11 +52,9 @@ async function main(): Promise<void> {
   program
     .command('windows-install')
     .description(
-      'Windows: create the discriminator group + install WFP filters ' +
-        '(one UAC prompt). Then log out and back in.',
+      'Windows: provision the `srt-sandbox` user account + install WFP ' +
+        'filters (one UAC prompt). No logout needed.',
     )
-    .option('--name <group>', 'discriminator group name')
-    .option('--group-sid <sid>', 'discriminator group SID (overrides --name)')
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .option(
       '--proxy-port-range <lo-hi>',
@@ -73,8 +71,6 @@ async function main(): Promise<void> {
           : undefined
       try {
         const r = installWindowsSandbox({
-          groupName: o.name as string | undefined,
-          groupSid: o.groupSid as string | undefined,
           sublayerGuid: o.sublayerGuid as string | undefined,
           proxyPortRange: range,
           force: Boolean(o.force),
@@ -85,19 +81,16 @@ async function main(): Promise<void> {
         }
         console.log(
           `Installed.\n` +
-            `  group: ${r.group.state}` +
-            (r.group.sid ? ` (${r.group.sid})` : '') +
+            `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
+            (r.user.sid ? ` (${r.user.sid})` : '') +
             `\n` +
             `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
             (r.wfp.portRange
               ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
               : '') +
             `\n\n` +
-            (r.group.state === 'ready'
-              ? `Group is already in your token — no logout needed.`
-              : `→ LOG OUT and back in so the group SID enters your token.\n` +
-                `  Network stays up meanwhile (WFP filter-0 PERMITs ` +
-                `non-members).`),
+            `No logout needed — the WFP filter keys on the dedicated ` +
+            `\`srt-sandbox\` user's SID, so your network is unaffected.`,
         )
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`)
@@ -108,8 +101,7 @@ async function main(): Promise<void> {
   program
     .command('windows-uninstall')
     .description(
-      'Windows: remove WFP filters (one UAC prompt). Group is kept — ' +
-        'use `srt-win.exe group delete` for full teardown.',
+      'Windows: remove WFP filters + the `srt-sandbox` account (one UAC prompt).',
     )
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .action(async (o: Record<string, string | undefined>) => {
@@ -122,7 +114,7 @@ async function main(): Promise<void> {
           console.error('Uninstall cancelled at the UAC prompt.')
           process.exit(2)
         }
-        console.log('WFP filters removed. Group membership kept.')
+        console.log('WFP filters and `srt-sandbox` account removed.')
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`)
         process.exit(1)

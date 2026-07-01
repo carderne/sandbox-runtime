@@ -224,7 +224,7 @@ describe('buildMaskedFileBinds', () => {
   test('registers a sentinel keyed on file path and writes it to a fake', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: TOKEN_FILE, mode: 'mask' }],
       ['api.github.com'],
       reg,
@@ -244,7 +244,7 @@ describe('buildMaskedFileBinds', () => {
   test('a file sentinel only substitutes at its own injectHosts', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: TOKEN_FILE, mode: 'mask', injectHosts: ['api.github.com'] }],
       ['api.github.com', 'evil.example.com'],
       reg,
@@ -266,7 +266,7 @@ describe('buildMaskedFileBinds', () => {
   test('absent injectHosts → defaults to allowedDomains', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: TOKEN_FILE, mode: 'mask' }],
       ['fallback.example.com'],
       reg,
@@ -283,13 +283,14 @@ describe('buildMaskedFileBinds', () => {
   test('skips a masked file that does not exist on the host', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
       [{ path: join(FIXTURE_DIR, 'no-such-file'), mode: 'mask' }],
       [],
       reg,
       store,
     )
     expect(binds).toHaveLength(0)
+    expect(degradeToDenyPaths).toHaveLength(0)
     expect(reg.size).toBe(0)
     // No fake was written → store dir was never created.
     expect(store.dirPath).toBeUndefined()
@@ -299,7 +300,7 @@ describe('buildMaskedFileBinds', () => {
   test('skips a masked entry that resolves to a directory', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: SUBDIR, mode: 'mask' }],
       [],
       reg,
@@ -318,13 +319,14 @@ describe('buildMaskedFileBinds', () => {
     writeFileSync(binFile, Buffer.from([0x67, 0x68, 0x70, 0x5f, 0xff, 0xfe]))
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
       [{ path: binFile, mode: 'mask' }],
       [],
       reg,
       store,
     )
     expect(binds).toHaveLength(0)
+    expect(degradeToDenyPaths).toHaveLength(0)
     expect(reg.size).toBe(0)
     store.dispose()
   })
@@ -332,7 +334,7 @@ describe('buildMaskedFileBinds', () => {
   test('ignores deny-mode entries', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: TOKEN_FILE, mode: 'deny' }],
       [],
       reg,
@@ -345,7 +347,7 @@ describe('buildMaskedFileBinds', () => {
   test('extract: fake preserves structure with sentinel substituted in', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
       [
         {
           path: HOSTS_YML,
@@ -358,6 +360,7 @@ describe('buildMaskedFileBinds', () => {
       reg,
       store,
     )
+    expect(degradeToDenyPaths).toHaveLength(0)
     expect(binds).toHaveLength(1)
     const fake = readFileSync(binds[0]!.fakePath, 'utf8')
     // Structure preserved byte-for-byte except the token span.
@@ -373,29 +376,110 @@ describe('buildMaskedFileBinds', () => {
     store.dispose()
   })
 
-  test('extract with no match leaves the file unprotected and warns', () => {
-    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
-    const reg = new SentinelRegistry()
-    const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
-      [{ path: HOSTS_YML, mode: 'mask', extract: 'no_such_key: (\\S+)' }],
-      ['api.github.com'],
-      reg,
-      store,
-    )
-    // Fail-open: no bind — the entry is skipped entirely so the real
-    // file stays readable via the root mount.
-    expect(binds).toHaveLength(0)
-    expect(reg.size).toBe(0)
-    expect(store.dirPath).toBeUndefined()
-    // A loud stderr warning surfaces the config error to the operator.
-    expect(warnSpy).toHaveBeenCalledTimes(1)
-    const msg = warnSpy.mock.calls[0]![0] as string
-    expect(msg).toContain('UNPROTECTED')
-    expect(msg).toContain(HOSTS_YML)
-    expect(msg).toContain('no_such_key: (\\S+)')
-    warnSpy.mockRestore()
-    store.dispose()
+  describe('extract with no match (onExtractNoMatch)', () => {
+    const noMatch = { path: HOSTS_YML, mode: 'mask', extract: 'nope: (\\S+)' }
+
+    test('default → "warn": file left unprotected, stderr warning', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [noMatch] as const,
+        ['api.github.com'],
+        reg,
+        store,
+      )
+      // Fail-open: no bind, no deny — the entry is skipped entirely so
+      // the real file stays readable via the root mount.
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toHaveLength(0)
+      expect(reg.size).toBe(0)
+      expect(store.dirPath).toBeUndefined()
+      // A loud stderr warning surfaces the config error to the operator.
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const msg = warnSpy.mock.calls[0]![0] as string
+      expect(msg).toContain('UNPROTECTED')
+      expect(msg).toContain(HOSTS_YML)
+      expect(msg).toContain('nope: (\\S+)')
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('explicit "warn" matches the default', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [{ ...noMatch, onExtractNoMatch: 'warn' }] as const,
+        [],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toHaveLength(0)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('"deny": entry degrades to read-deny (fail-closed)', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [{ ...noMatch, onExtractNoMatch: 'deny' }] as const,
+        ['api.github.com'],
+        reg,
+        store,
+      )
+      // No bind is emitted (the real file is NOT exposed); the resolved
+      // path is reported for the read-deny set.
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
+      expect(reg.size).toBe(0)
+      expect(store.dirPath).toBeUndefined()
+      // No stderr warning — deny is a configured outcome, not a surprise.
+      expect(warnSpy).not.toHaveBeenCalled()
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('"error": throws with a clear message', () => {
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      expect(() =>
+        buildMaskedFileBinds(
+          [{ ...noMatch, onExtractNoMatch: 'error' }] as const,
+          [],
+          reg,
+          store,
+        ),
+      ).toThrow(/matched nothing.*onExtractNoMatch: "error"/)
+      store.dispose()
+    })
+
+    test('onExtractNoMatch is per-entry: one "deny" does not affect a sibling "warn"', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const other = join(FIXTURE_DIR, 'other.yml')
+      writeFileSync(other, 'k: v\n')
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [
+          { ...noMatch, onExtractNoMatch: 'deny' },
+          { path: other, mode: 'mask', extract: 'nope: (\\S+)' },
+        ] as const,
+        [],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      expect(warnSpy.mock.calls[0]![0] as string).toContain(other)
+      warnSpy.mockRestore()
+      store.dispose()
+    })
   })
 })
 
@@ -430,7 +514,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     writeFileSync(file, `{"access_token":"${REAL_JWT}","note":"keep"}`)
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: file, mode: 'mask', decode: 'jwt' }],
       ['api.example.com'],
       reg,
@@ -467,7 +551,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     writeFileSync(file, `good: ${REAL_JWT}\nblob: ${PSEUDO_JWT}\n`)
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: file, mode: 'mask', decode: 'jwt' }],
       ['api.example.com'],
       reg,
@@ -489,7 +573,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     writeFileSync(file, `blob: ${PSEUDO_JWT}\n`)
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: file, mode: 'mask', decode: 'jwt' }],
       ['api.example.com'],
       reg,
@@ -513,7 +597,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     writeFileSync(file, 'just some plain text\n')
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [{ path: file, mode: 'mask', decode: 'jwt' }],
       ['api.example.com'],
       reg,
@@ -535,7 +619,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     )
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [
         {
           path: file,
@@ -567,7 +651,7 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     writeFileSync(file, 'id_token: opaque-session-cookie\n')
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [
         {
           path: file,
@@ -671,67 +755,103 @@ describe.if(isLinux)('structured file masking on Linux (extract)', () => {
 })
 
 /**
- * Linux: an `extract` pattern that matches nothing fails open — the
- * entry is skipped (no bind, no deny), the file stays readable via the
- * root mount, and a loud warning is emitted to stderr so the operator
- * fixes the regex.
+ * Linux integration: an `extract` pattern that matches nothing follows
+ * the entry's `onExtractNoMatch` — default `"warn"` leaves the file
+ * readable as-is with a stderr warning; `"deny"` makes it unreadable.
  */
-describe.if(isLinux)(
-  'extract no-match leaves file readable and warns on Linux',
-  () => {
-    const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
-    const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
-    const SECRET = 'gho_nomatch_real_0123456789'
+describe.if(isLinux)('extract no-match onExtractNoMatch on Linux', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
+  const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
+  const SECRET = 'gho_nomatch_real_0123456789'
 
-    beforeAll(async () => {
-      mkdirSync(TEST_DIR, { recursive: true })
-      writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
-      await SandboxManager.reset()
-      await SandboxManager.initialize({
-        network: { allowedDomains: ['localhost'], deniedDomains: [] },
-        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
-        credentials: {
-          files: [
-            {
-              path: SECRET_FILE,
-              mode: 'mask',
-              extract: 'will_not_match_(\\S+)',
-            },
-          ],
-          allowPlaintextInject: true,
-        },
-      })
+  async function init(onExtractNoMatch?: 'warn' | 'deny' | 'error') {
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: SECRET_FILE,
+            mode: 'mask',
+            extract: 'will_not_match_(\\S+)',
+            ...(onExtractNoMatch && { onExtractNoMatch }),
+          },
+        ],
+        allowPlaintextInject: true,
+      },
     })
+  }
 
-    afterAll(async () => {
-      await SandboxManager.reset()
-      rmSync(TEST_DIR, { recursive: true, force: true })
-    })
+  beforeAll(() => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+  })
 
-    test('the file is readable as-is inside the sandbox (fail-open)', async () => {
-      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
-      const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
-      // A loud stderr warning surfaces the config error at wrap time.
-      expect(warnSpy).toHaveBeenCalled()
-      expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
-      warnSpy.mockRestore()
-      // No fake-file bind and no /dev/null deny bind are emitted for the
-      // path — the entry is skipped entirely.
-      expect(wrapped).not.toMatch(
-        new RegExp(`--ro-bind \\S+ ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
-      )
-      const result = spawnSync(wrapped, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 10000,
-      })
-      // cat succeeds and returns the real bytes: fail-open means the
-      // file is left readable via the root mount.
-      expect(result.status).toBe(0)
-      expect(result.stdout).toBe(`oauth_token: ${SECRET}\n`)
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  test('default ("warn"): file readable as-is, stderr warning at wrap', async () => {
+    await init()
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    // A loud stderr warning surfaces the config error at wrap time.
+    expect(warnSpy).toHaveBeenCalled()
+    expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
+    warnSpy.mockRestore()
+    // No fake-file bind and no /dev/null deny bind are emitted for the
+    // path — the entry is skipped entirely.
+    expect(wrapped).not.toMatch(
+      new RegExp(`--ro-bind \\S+ ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
+    )
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
     })
-  },
-)
+    // cat succeeds and returns the real bytes: fail-open means the
+    // file is left readable via the root mount.
+    expect(result.status).toBe(0)
+    expect(result.stdout).toBe(`oauth_token: ${SECRET}\n`)
+  })
+
+  test('"deny": file unreadable inside the sandbox (fail-closed)', async () => {
+    await init('deny')
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    // The real credential never appears in the wrapped command.
+    expect(wrapped).not.toContain(SECRET)
+    // No --ro-bind <fake> <real> — degraded entries go via denyRead, not
+    // the masked-file bind path.
+    expect(wrapped).not.toMatch(
+      new RegExp(`--ro-bind \\S+\\.fake ${SECRET_FILE.replace(/\//g, '\\/')}`),
+    )
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    // cat fails: the file is unreadable inside the sandbox, and the
+    // real bytes are never exposed on stdout.
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain(SECRET)
+  })
+
+  test('"error": wrapWithSandbox rejects', async () => {
+    await init('error')
+    let thrown: unknown
+    try {
+      await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toMatch(
+      /matched nothing.*onExtractNoMatch: "error"/,
+    )
+  })
+})
 
 /**
  * macOS: SBPL cannot redirect a read, so a masked file degrades to a
@@ -771,7 +891,7 @@ describe('file masking on macOS degrades to read-deny', () => {
     // exactly as unsupported as whole-file masking — the file is denied.
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()
-    const binds = buildMaskedFileBinds(
+    const { binds } = buildMaskedFileBinds(
       [
         {
           path: HOSTS_YML,

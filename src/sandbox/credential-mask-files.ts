@@ -74,10 +74,9 @@ type MatchWithIndices = RegExpMatchArray & {
  * coincidentally appears elsewhere in the file (outside any match) is
  * left intact. No placeholder pass, no substring-ordering concern.
  *
- * Returns `null` when the pattern matches nothing — the caller treats that
- * as fail-open (skip the entry, leave the file readable as-is) with a loud
- * stderr warning. A non-matching pattern is a config mistake for the
- * operator to fix; see {@link buildMaskedFileBinds} for the rationale.
+ * Returns `null` when the pattern matches nothing — the caller routes
+ * that per the entry's `onExtractNoMatch` option (warn / deny / error;
+ * see {@link buildMaskedFileBinds}).
  *
  * Throws when a match has no group-1 capture. The schema already rejects
  * patterns with zero groups, so this only fires when group 1 is optional
@@ -191,11 +190,24 @@ export class MaskedFileStore {
   }
 }
 
+/** Result of {@link buildMaskedFileBinds}. */
+export interface MaskedFileBuildResult {
+  binds: MaskedFileBind[]
+  /**
+   * Resolved paths of `mode: "mask"` entries that degraded to deny at
+   * runtime — populated when `extract` matches nothing (or, with
+   * `decode`, no candidate verifies) and the entry's `onExtractNoMatch`
+   * is `"deny"`. Callers union these into the read-deny set so the
+   * credential file is unreadable rather than exposed.
+   */
+  degradeToDenyPaths: string[]
+}
+
 /**
  * For each `mode: "mask"` file entry: resolve the path, read the real
  * content, build the fake content (whole-file or structured per `extract`),
  * register sentinels in `registry`, write the fake via `store`, and return
- * the bind list.
+ * the bind list plus any entries that degraded to deny.
  *
  * Whole-file mode (no `extract`): one sentinel keyed `file:<path>` whose
  * real value is the entire file content; the fake file *is* the sentinel.
@@ -208,12 +220,12 @@ export class MaskedFileStore {
  * before it is masked (failed candidates are left untouched), and the
  * sentinel is a JWT-shaped fake ({@link mintFakeJwt}) registered via
  * `registerWithSentinel`. If the regex matches nothing — or, with decode,
- * no candidate verifies — the entry is **skipped with a loud stderr
- * warning** — fail-open: no bind, no deny, the file stays readable via the
- * root mount. The operator's regex is treated as a config error to surface
- * and fix, not a reason to block file access; a wrong pattern should not
- * break a tool that needs the file when the credential is legitimately
- * absent.
+ * no candidate verifies — the entry's `onExtractNoMatch` decides:
+ * - `"warn"` (default): skip the entry with a loud stderr warning —
+ *   fail-open, the file stays readable via the root mount;
+ * - `"deny"`: push the path to `degradeToDenyPaths` — fail-closed, the
+ *   file becomes unreadable inside the sandbox;
+ * - `"error"`: throw, so nothing runs until the config is fixed.
  *
  * Entries whose path does not exist, is unreadable, or resolves to a
  * directory are skipped with a debug log — same posture as a masked env
@@ -228,8 +240,9 @@ export function buildMaskedFileBinds(
   allowedDomains: readonly string[],
   registry: SentinelRegistry,
   store: MaskedFileStore,
-): MaskedFileBind[] {
+): MaskedFileBuildResult {
   const binds: MaskedFileBind[] = []
+  const degradeToDenyPaths: string[] = []
   for (const f of files) {
     if (f.mode !== 'mask') continue
     const realPath = normalizePathForSandbox(f.path)
@@ -300,21 +313,45 @@ export function buildMaskedFileBinds(
           : registry.register(name, cap, injectHosts)
       })
       if (extracted === null || maskedCount === 0) {
-        // Fail-open: a non-matching pattern (or, with decode, no candidate
-        // surviving verification) is a config error to surface, not a
-        // reason to block file access. Skip the entry (no bind, no deny) —
-        // the file stays readable via the root mount — and warn loudly on
-        // stderr so the operator fixes the config.
+        // Nothing was masked — either the pattern matched nothing or, with
+        // decode, no candidate survived verification. Both are the same
+        // "masking cannot apply" condition, so both route through the
+        // entry's onExtractNoMatch policy.
         const cause =
           f.decode === 'jwt'
             ? `decode "jwt" with pattern "${pattern}" that matched no ` +
               `verified JWT`
             : `extract pattern "${pattern}" that matched nothing`
+        const onNoMatch = f.onExtractNoMatch ?? 'warn'
+        if (onNoMatch === 'error') {
+          throw new Error(
+            `credentials.files entry "${f.path}": ${cause} ` +
+              `(onExtractNoMatch: "error"). Fix the config, change to ` +
+              `"warn"/"deny", or remove the entry.`,
+          )
+        }
+        if (onNoMatch === 'deny') {
+          // Fail-closed: the operator declared this file as containing a
+          // credential. Masking can't apply — degrade to deny so the
+          // sandboxed process cannot read the credential at all.
+          logForDebugging(
+            `[credential-mask] ${f.path} has ${cause} — degrading to ` +
+              `mode "deny".`,
+            { level: 'warn' },
+          )
+          degradeToDenyPaths.push(realPath)
+          continue
+        }
+        // 'warn' (default): fail-open. A non-matching config is an error
+        // to surface, not a reason to block file access. Skip the entry
+        // (no bind, no deny) — the file stays readable via the root mount
+        // — and warn loudly on stderr so the operator fixes the config.
         const msg =
           `[sandbox-runtime] WARNING: credentials.files entry ` +
           `"${f.path}" has ${cause} in the file. The file is left ` +
           `UNPROTECTED (readable as-is inside the sandbox). Fix the ` +
-          `config or remove the entry.`
+          `config, set onExtractNoMatch to "deny" or "error", or remove ` +
+          `the entry.`
         console.warn(msg)
         logForDebugging(msg, { level: 'warn' })
         continue
@@ -325,7 +362,7 @@ export function buildMaskedFileBinds(
     const fakePath = store.write(key, fakeContent)
     binds.push({ realPath, fakePath })
   }
-  return binds
+  return { binds, degradeToDenyPaths }
 }
 
 export const MASKED_FILE_STORE_PREFIX = 'srt-credmask-'

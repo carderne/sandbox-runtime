@@ -186,9 +186,9 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * sentinels — the rest of the file is preserved byte-for-byte. This lets a
  * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
  * inside the sandbox while the credential values are protected. If the
- * regex matches nothing, a warning is emitted to stderr and the file is
- * left readable as-is (unprotected) — fix the regex or remove the entry.
- * A future option may make this behaviour configurable.
+ * pattern matches nothing, behaviour is governed by `onExtractNoMatch`
+ * (default `"warn"` — the file is left readable as-is and a stderr
+ * warning is emitted).
  *
  * `mode: "mask"` with `decode: "jwt"` handles files containing JWTs:
  *
@@ -205,9 +205,10 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  *   header declares `alg: HS256` (not `alg: none`, which misconfigured
  *   validators accept) with a garbage signature, so any validator the
  *   unswapped fake reaches rejects it.
- * - **Fail-open**: if nothing matches or no candidate verifies, a warning
- *   is emitted to stderr and the file is left readable as-is — same
- *   behaviour as a non-matching `extract`.
+ * - **No verified candidate**: if nothing matches or no candidate
+ *   verifies, behaviour is governed by `onExtractNoMatch` — same as a
+ *   non-matching `extract` (default `"warn"`: stderr warning, file left
+ *   readable as-is).
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
@@ -224,10 +225,38 @@ export const CredentialFileConfigSchema = z.object({
     .describe(
       'Optional regex for structured masking. Applied globally; capture ' +
         'group 1 of each match is masked, the rest of the file is preserved. ' +
-        'If the pattern matches nothing in the file, a warning is emitted ' +
-        'and the file is left readable as-is (unprotected) — fix the regex ' +
-        'or remove the entry. A future option may make this configurable. ' +
-        'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+        'If the pattern matches nothing, behaviour is governed by ' +
+        'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the file at runtime —
+   * or, with `decode`, when no candidate survives verification.
+   *
+   * - `"warn"` (default): emit a stderr warning and leave the file
+   *   readable as-is inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the file when the credential is
+   *   legitimately absent.
+   * - `"deny"`: degrade the entry to `mode: "deny"` so the file is
+   *   unreadable inside the sandbox (fail-closed). The operator declared
+   *   this file as containing a credential; if the regex cannot find it,
+   *   block access rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the config.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` or `decode` is
+   * set; accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing (or, with decode, no ' +
+        'candidate verifies): "warn" (default — stderr warning, file left ' +
+        'readable), "deny" (degrade to mode "deny" — file unreadable), or ' +
+        '"error" (throw at wrap time). Only meaningful with mode "mask" ' +
+        'and extract or decode set.',
     ),
   decode: z
     .enum(['jwt'])
@@ -237,8 +266,8 @@ export const CredentialFileConfigSchema = z.object({
         'with a built-in JWT regex (or the explicit extract pattern, if ' +
         'set), verified to actually be JWTs before masking, and replaced ' +
         'with a structurally valid fake JWT so client-side token parsing ' +
-        'keeps working. If no candidate verifies, a warning is emitted and ' +
-        'the file is left readable as-is. Only meaningful when mode is ' +
+        'keeps working. If no candidate verifies, behaviour is governed by ' +
+        'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
         '"mask"; accepted but ignored for "deny".',
     ),
   injectHosts: z
@@ -428,6 +457,19 @@ export const NetworkConfigSchema = z.object({
             'the MITM CA. Hosts still need to be reachable via ' +
             'allowedDomains; this list only changes how they are tunnelled.',
         ),
+      extraCaCertPaths: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          'Paths to PEM CA certificate files appended to the trust bundle ' +
+            'the sandboxed child is pointed at, after the MITM CA and the ' +
+            "host's regular roots. Use for site-local roots (e.g. an " +
+            'internal mTLS CA) presented by excluded/passthrough hosts, so ' +
+            'the child can verify them itself. Only the CERTIFICATE blocks ' +
+            'of each file are copied; files that are missing, unreadable, ' +
+            'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
+            'log), so paths that exist on only some hosts are safe to list.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -516,22 +558,6 @@ export const RipgrepConfigSchema = z.object({
  * must agree with.
  */
 export const WindowsConfigSchema = z.object({
-  groupName: z
-    .string()
-    .min(1)
-    .default('sandbox-runtime-net')
-    .describe(
-      'Discriminator group name. Must match the group created at install ' +
-        'time. Ignored if groupSid is set.',
-    ),
-  groupSid: z
-    .string()
-    .regex(/^S-1-/, 'must be an S-1-… SID string')
-    .optional()
-    .describe(
-      'Discriminator group SID. Overrides groupName lookup — use for ' +
-        'domain groups or where name resolution is unreliable.',
-    ),
   wfpSublayerGuid: z
     .string()
     .uuid()
@@ -541,16 +567,6 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
-  asSandboxUser: z
-    .boolean()
-    .default(false)
-    .describe(
-      'Run sandboxed commands as the dedicated `srt-sandbox` local user ' +
-        '(two-hop launch via CreateProcessWithLogonW) instead of the ' +
-        'same-user deny-only-group token. Requires `srt-win install` to ' +
-        'have provisioned the user. Opt-in while the separate-user path ' +
-        'stabilises; the same-user path is unchanged when false.',
-    ),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
@@ -559,7 +575,7 @@ export const WindowsConfigSchema = z.object({
     .optional()
     .describe(
       'Inclusive [low, high] port range the JS http/socks proxies bind ' +
-        'inside. MUST match the range passed to `srt-win wfp install ' +
+        'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
@@ -656,7 +672,7 @@ export const SandboxRuntimeConfigSchema = z
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
     windows: WindowsConfigSchema.optional().describe(
-      'Windows-specific settings (group, WFP sublayer, proxy port range).',
+      'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
   })
   .superRefine((cfg, ctx) => {

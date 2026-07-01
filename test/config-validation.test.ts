@@ -679,6 +679,59 @@ describe('Config Validation', () => {
       expect(result.success).toBe(true)
     })
 
+    test.each(['warn', 'deny', 'error'] as const)(
+      'accepts onExtractNoMatch: "%s"',
+      onExtractNoMatch => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['api.github.com'],
+            deniedDomains: [],
+            tlsTerminate: {},
+          },
+          credentials: {
+            files: [
+              {
+                path: '~/.config/gh/hosts.yml',
+                mode: 'mask',
+                extract: 'oauth_token:\\s*(\\S+)',
+                onExtractNoMatch,
+              },
+            ],
+          },
+        })
+        expect(result.success).toBe(true)
+      },
+    )
+
+    test('rejects an invalid onExtractNoMatch value', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/hosts.yml',
+              mode: 'mask',
+              extract: 'oauth_token:\\s*(\\S+)',
+              onExtractNoMatch: 'ignore',
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.onExtractNoMatch',
+        )
+        expect(issue).toBeDefined()
+      }
+    })
+
     test('rejects mode "mask" on a directory path (trailing slash)', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
@@ -1237,6 +1290,51 @@ describe('Config Validation', () => {
           },
         })
         expect(result.success).toBe(true)
+      })
+    })
+
+    describe('extraCaCertPaths', () => {
+      test('accepts a list of paths and round-trips it', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: {
+              extraCaCertPaths: ['/etc/site-local-roots.pem', '/etc/extra.pem'],
+            },
+          },
+        })
+        expect(result.success).toBe(true)
+        if (result.success) {
+          expect(result.data.network.tlsTerminate?.extraCaCertPaths).toEqual([
+            '/etc/site-local-roots.pem',
+            '/etc/extra.pem',
+          ])
+        }
+      })
+
+      test('is optional', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: { ...base.network, tlsTerminate: {} },
+        })
+        expect(result.success).toBe(true)
+        if (result.success) {
+          expect(
+            result.data.network.tlsTerminate?.extraCaCertPaths,
+          ).toBeUndefined()
+        }
+      })
+
+      test('rejects an empty path', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: { extraCaCertPaths: [''] },
+          },
+        })
+        expect(result.success).toBe(false)
       })
     })
   })
