@@ -18,10 +18,10 @@ import {
 import type { Server, AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { extractAndSubstitute } from '../../src/sandbox/credential-extract.js'
 import {
   MaskedFileStore,
   buildMaskedFileBinds,
-  extractAndSubstitute,
   MASKED_FILE_STORE_PREFIX,
 } from '../../src/sandbox/credential-mask-files.js'
 import {
