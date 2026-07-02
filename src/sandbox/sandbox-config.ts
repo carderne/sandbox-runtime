@@ -190,7 +190,10 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * (default `"warn"` — the file is left readable as-is and a stderr
  * warning is emitted).
  *
- * `mode: "mask"` with `decode: "jwt"` handles files containing JWTs:
+ * `mode: "mask"` with `decode: "jwt"` extends structured masking into
+ * encoded values: where `extract` opens plain text to mask a span inside
+ * it, `decode` opens the encoding so masking can target fields inside the
+ * decoded payload (`maskClaims`):
  *
  * - **Default pattern**: when `extract` is absent, a built-in JWT regex is
  *   used (every JWT starts `eyJ` — base64url of `{"`), so authors don't
@@ -199,16 +202,26 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * - **Decode-verification**: each candidate must actually BE a JWT (three
  *   segments, JSON header/payload, `alg` in the header) before it is
  *   masked; candidates failing verification are left untouched.
- * - **JWT-shaped sentinel**: the fake written into the masked file is a
- *   structurally valid JWT (parseable header/payload, far-future `exp`),
- *   so client-side token parsing inside the sandbox doesn't break. Its
- *   header declares `alg: HS256` (not `alg: none`, which misconfigured
- *   validators accept) with a garbage signature, so any validator the
- *   unswapped fake reaches rejects it.
- * - **No verified candidate**: if nothing matches or no candidate
- *   verifies, behaviour is governed by `onExtractNoMatch` — same as a
- *   non-matching `extract` (default `"warn"`: stderr warning, file left
- *   readable as-is).
+ * - **Claim-level masking** (`maskClaims`): each named top-level payload
+ *   claim present with a string value is replaced by its own sentinel and
+ *   the token is rebuilt around the modified payload (original header,
+ *   filler signature). All other claims stay real, so a client that
+ *   decodes the token and reads a non-secret claim keeps working. The
+ *   proxy substitutes both the whole rebuilt token (sent as a bearer
+ *   credential) and each claim sentinel (extracted and sent alone).
+ * - **Whole-token fallback** (no `maskClaims`): the whole decoded value is
+ *   treated as the credential — for bearer-style usage where the token
+ *   itself is the secret — and replaced with a structurally valid fake JWT
+ *   (parseable header/payload, far-future `exp`), so client-side token
+ *   parsing inside the sandbox doesn't break. Its header declares
+ *   `alg: HS256` (not `alg: none`, which misconfigured validators accept)
+ *   with a garbage signature, so any validator the unswapped fake reaches
+ *   rejects it.
+ * - **No verified candidate**: if nothing matches, no candidate verifies,
+ *   or (with `maskClaims`) no named claim matches in any verified token,
+ *   behaviour is governed by `onExtractNoMatch` — same as a non-matching
+ *   `extract` (default `"warn"`: stderr warning, file left readable
+ *   as-is).
  *
  * `maskDuplicates: true` (only meaningful with `extract` or `decode`)
  * additionally replaces every verbatim occurrence of each masked value
