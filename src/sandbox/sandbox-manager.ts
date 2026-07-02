@@ -8,6 +8,7 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
+import { buildMaskedEnvVars } from './credential-mask-env.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -708,11 +709,9 @@ function checkDependencies(ripgrepConfig?: {
  *
  * Only explicitly declared sources are restricted: `mode: 'deny'` file
  * entries join the read-deny set, `mode: 'deny'` env vars are unset, and
- * `mode: 'mask'` env vars are set to a per-session sentinel registered in
- * {@link sentinelRegistry}. A masked var with no value in the host
- * environment is skipped — there is nothing to protect, and emitting an
- * unset var would change tool behaviour (presence checks would pass where
- * they didn't before).
+ * `mode: 'mask'` env vars are set to a fake value (whole-value sentinel,
+ * or the real value with extract-captured spans swapped for sentinels)
+ * registered in {@link sentinelRegistry} — see {@link buildMaskedEnvVars}.
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
@@ -731,23 +730,21 @@ function getCredentialRestrictions(
   const denyReadPaths = getCredentialDenyReadPaths(credentials)
 
   const unsetEnvVars: string[] = []
-  const setEnvVars: Record<string, string> = {}
   for (const v of credentials.envVars ?? []) {
-    if (v.mode === 'deny') {
-      unsetEnvVars.push(v.name)
-    } else if (v.mode === 'mask') {
-      const real = process.env[v.name]
-      if (real === undefined) continue
-      // Effective injectHosts: per-entry narrows; if unset, default to
-      // every reachable host (network.allowedDomains). injectHosts is an
-      // *optional narrowing*, not a required allowlist. Trade-off: a
-      // masked credential with no injectHosts is injectable at every host
-      // the sandbox can reach — narrow it explicitly when the credential
-      // should only go to a subset.
-      const injectHosts = v.injectHosts ?? allowedDomains ?? []
-      setEnvVars[v.name] = sentinelRegistry.register(v.name, real, injectHosts)
-    }
+    if (v.mode === 'deny') unsetEnvVars.push(v.name)
   }
+
+  // Masked env vars: read the real value from the host environment,
+  // register sentinel(s), and set the variable to the fake value inside
+  // the sandbox. degradeToUnsetNames carries variables whose extract
+  // pattern matched nothing with onExtractNoMatch: "deny" — merged into
+  // unsetEnvVars below so the value is withheld rather than exposed.
+  const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
+    credentials.envVars ?? [],
+    allowedDomains ?? [],
+    sentinelRegistry,
+  )
+  unsetEnvVars.push(...degradeToUnsetNames)
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
