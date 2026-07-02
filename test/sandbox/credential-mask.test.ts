@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 import {
   createServer as createHttpServer,
   type IncomingHttpHeaders,
@@ -13,6 +13,7 @@ import {
   SENTINEL_PREFIX,
 } from '../../src/sandbox/credential-sentinel.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
+import { verifyJwt } from '../../src/sandbox/credential-decode.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
@@ -826,6 +827,249 @@ describe.if(isLinux)(
     }, 20000)
   },
 )
+
+/**
+ * Env-var masking with decode: "jwt" — the variable's whole value is a JWT
+ * and the sandbox sees a JWT-shaped fake instead of the bare fake_value_
+ * sentinel, so token-parsing clients keep working.
+ */
+describe.if(isLinux)('env decode: "jwt" masking on Linux (bwrap)', () => {
+  const JWT_VAR = 'SRT_TEST_JWT_ENV_TOKEN'
+  const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
+  const REAL_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u('{"sub":"env-user","iat":1516239022}') +
+    '.ZW52LXJlYWwtc2ln'
+
+  function decodeConfig(name: string): SandboxRuntimeConfig {
+    return {
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        envVars: [{ name, mode: 'mask', decode: 'jwt' }],
+        allowPlaintextInject: true,
+      },
+    }
+  }
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    delete process.env[JWT_VAR]
+  })
+
+  test('the sandbox sees a parseable HS256 fake JWT, never the real one', async () => {
+    process.env[JWT_VAR] = REAL_JWT
+    await SandboxManager.reset()
+    await SandboxManager.initialize(decodeConfig(JWT_VAR))
+
+    const wrapped = await SandboxManager.wrapWithSandbox(`printenv ${JWT_VAR}`)
+    expect(wrapped).not.toContain(REAL_JWT)
+
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+      env: { ...process.env, [JWT_VAR]: REAL_JWT },
+    })
+    expect(result.status).toBe(0)
+    const fakeJwt = result.stdout.trim()
+    expect(fakeJwt).not.toBe(REAL_JWT)
+    expect(fakeJwt).not.toContain(REAL_JWT)
+
+    // The fake is a structurally valid JWT: a tool that parses the token
+    // from env (segment count, header, exp) keeps working.
+    expect(fakeJwt.split('.')).toHaveLength(3)
+    expect(verifyJwt(fakeJwt)).toBe(true)
+    const header = JSON.parse(
+      Buffer.from(fakeJwt.split('.')[0]!, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>
+    expect(header).toEqual({ alg: 'HS256', typ: 'JWT' })
+
+    // The registry maps the fake back to the real token for the proxy.
+    expect(SandboxManager.getSentinelRegistry().lookupReal(fakeJwt)).toBe(
+      REAL_JWT,
+    )
+  })
+
+  test('a set value that is not a JWT fails open with a loud warning', async () => {
+    const NOT_JWT_VAR = 'SRT_TEST_NOT_A_JWT'
+    process.env[NOT_JWT_VAR] = 'hunter2-not-a-jwt'
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(decodeConfig(NOT_JWT_VAR))
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `printenv ${NOT_JWT_VAR}`,
+      )
+
+      // Nothing was masked: no sentinel is set for the var...
+      expect(wrapped).not.toContain(`--setenv ${NOT_JWT_VAR}`)
+      // ...and the variable is not unset either — the real value passes
+      // through to the sandbox (fail-open).
+      const result = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, [NOT_JWT_VAR]: 'hunter2-not-a-jwt' },
+      })
+      expect(result.status).toBe(0)
+      expect(result.stdout.trim()).toBe('hunter2-not-a-jwt')
+
+      // The fail-open is loud: a stderr warning names the variable.
+      const msgs = warnSpy.mock.calls.map(c => c[0] as string)
+      const msg = msgs.find(m => m.includes(NOT_JWT_VAR))
+      expect(msg).toBeDefined()
+      expect(msg).toContain('UNPROTECTED')
+      expect(msg).toContain('did not verify')
+      expect(msg).toContain('JWT')
+    } finally {
+      warnSpy.mockRestore()
+      delete process.env[NOT_JWT_VAR]
+    }
+  })
+
+  test('an unset decode var is skipped silently', async () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(decodeConfig('SRT_TEST_JWT_NEVER_SET'))
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      expect(wrapped).not.toContain('--setenv SRT_TEST_JWT_NEVER_SET')
+      expect(
+        warnSpy.mock.calls.some(c =>
+          (c[0] as string).includes('SRT_TEST_JWT_NEVER_SET'),
+        ),
+      ).toBe(false)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  test('regression: without decode, a JWT-valued var gets the plain sentinel', async () => {
+    process.env[JWT_VAR] = REAL_JWT
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        envVars: [{ name: JWT_VAR, mode: 'mask' }],
+        allowPlaintextInject: true,
+      },
+    })
+    const wrapped = await SandboxManager.wrapWithSandbox('true')
+    expect(wrapped).toMatch(
+      new RegExp(`--setenv ${JWT_VAR} ${SENTINEL_PREFIX}[0-9a-f-]{36}`),
+    )
+    expect(wrapped).not.toContain(REAL_JWT)
+  })
+})
+
+/**
+ * End-to-end env decode masking: the env var holds a JWT; inside the
+ * sandbox the tool reads a structurally valid FAKE JWT; sending it through
+ * the manager proxy delivers the REAL JWT to the injectHost, while a
+ * non-injectHost receives the fake.
+ */
+describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
+  const JWT_VAR = 'SRT_TEST_E2E_JWT_TOKEN'
+  const HOST_A = 'localhost'
+  const HOST_B = 'localtest.me'
+
+  const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
+  const REAL_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u('{"sub":"e2e-env-user","iat":1516239022}') +
+    '.ZTJlLWVudi1zaWc'
+
+  let upstream: Server
+  let upstreamPort: number
+  let lastHeaders: IncomingHttpHeaders | undefined
+
+  beforeAll(async () => {
+    upstream = createHttpServer((req, res) => {
+      lastHeaders = req.headers
+      res.writeHead(200)
+      res.end('ok')
+    })
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
+    upstreamPort = (upstream.address() as AddressInfo).port
+
+    process.env[JWT_VAR] = REAL_JWT
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        envVars: [
+          { name: JWT_VAR, mode: 'mask', decode: 'jwt', injectHosts: [HOST_A] },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    delete process.env[JWT_VAR]
+    await new Promise<void>(r => upstream.close(() => r()))
+  })
+
+  /** Wrap printenv and run it: the fake JWT the sandbox actually sees. */
+  function readFakeFromSandbox(wrapped: string): string {
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+      env: { ...process.env, [JWT_VAR]: REAL_JWT },
+    })
+    expect(result.status).toBe(0)
+    return result.stdout.trim()
+  }
+
+  test('printenv → fake JWT; proxy delivers the real JWT to the injectHost', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`printenv ${JWT_VAR}`)
+    expect(wrapped).not.toContain(REAL_JWT)
+    const fakeJwt = readFakeFromSandbox(wrapped)
+    expect(fakeJwt).not.toBe(REAL_JWT)
+    expect(verifyJwt(fakeJwt)).toBe(true)
+
+    const proxyPort = SandboxManager.getProxyPort()!
+    const authToken = SandboxManager.getProxyAuthToken()!
+    lastHeaders = undefined
+    const r = await curlViaProxy(
+      proxyPort,
+      `http://${HOST_A}:${upstreamPort}/`,
+      {
+        headers: ['Authorization: Bearer ' + fakeJwt],
+        proxyAuth: `srt:${authToken}`,
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_JWT}`)
+  }, 20000)
+
+  test('a non-injectHost destination receives the fake JWT unchanged', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`printenv ${JWT_VAR}`)
+    const fakeJwt = readFakeFromSandbox(wrapped)
+
+    const proxyPort = SandboxManager.getProxyPort()!
+    const authToken = SandboxManager.getProxyAuthToken()!
+    lastHeaders = undefined
+    const r = await curlViaProxy(
+      proxyPort,
+      `http://${HOST_B}:${upstreamPort}/`,
+      {
+        headers: ['Authorization: Bearer ' + fakeJwt],
+        proxyAuth: `srt:${authToken}`,
+        resolve: `${HOST_B}:${upstreamPort}:127.0.0.1`,
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
+    expect(lastHeaders?.authorization).not.toContain(REAL_JWT)
+  }, 20000)
+})
 
 type CurlResult = {
   exit: number
