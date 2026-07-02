@@ -1019,6 +1019,55 @@ describe('Config Validation', () => {
       expect(result.success).toBe(true)
     })
 
+    test('accepts a masked env var with decode "jwt"', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [{ name: 'CI_JOB_JWT', mode: 'mask', decode: 'jwt' }],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects an unknown decode encoding on an env var entry', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          envVars: [{ name: 'CI_JOB_JWT', mode: 'mask', decode: 'base64' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.envVars.0.decode',
+        )
+        expect(issue).toBeDefined()
+      }
+    })
+
+    test('decode on a deny-mode env var entry is accepted (ignored)', () => {
+      // Mirrors the extract/injectHosts-on-deny precedent: harmless, so
+      // no error.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          envVars: [{ name: 'CI_JOB_JWT', mode: 'deny', decode: 'jwt' }],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
     test('accepts per-entry injectHosts that are a subset of allowedDomains', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,

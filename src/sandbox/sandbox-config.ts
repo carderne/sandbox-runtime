@@ -308,12 +308,46 @@ export const CredentialFileConfigSchema = z.object({
 
 /**
  * Schema for a single credential environment variable entry.
+ *
+ * `mode: "mask"` replaces the variable's value inside the sandbox with a
+ * per-session sentinel; the proxy substitutes sentinel→real on egress to
+ * the credential's injectHosts. A masked var that is unset on the host is
+ * skipped — there is nothing to protect.
+ *
+ * `mode: "mask"` with `decode: "jwt"` handles a variable whose whole value
+ * is a JWT (CI OIDC tokens, Supabase keys, ...). `decode` opens the encoded
+ * value for masking: without claim-level configuration the entire token is
+ * replaced by a structurally valid fake JWT — parseable three-segment shape
+ * with JSON header/payload and far-future `exp`, so a tool that inspects
+ * the token before sending it (segment count, exp, claims) keeps working.
+ * The fake's header declares `alg: HS256` — never `alg: none`, which
+ * misconfigured validators accept — with a filler signature, so a verifier
+ * the unswapped fake ever reaches rejects it cryptographically. The proxy
+ * swaps the whole fake token for the real one on egress.
+ *
+ * If the variable is set but its value does not verify as a JWT, nothing
+ * was masked: the entry currently fails open — the real value stays in the
+ * sandbox environment and a loud stderr warning names the variable. This
+ * policy routing will unify with `onExtractNoMatch` when env-var extraction
+ * lands.
  */
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
   mode: credentialModeSchema.describe(
     'Access mode for this environment variable',
   ),
+  decode: z
+    .enum(['jwt'])
+    .optional()
+    .describe(
+      'Optional encoded-credential format. "jwt": the variable\'s whole ' +
+        'value is verified to actually be a JWT and replaced with a ' +
+        'structurally valid fake JWT so client-side token parsing keeps ' +
+        'working; the proxy swaps the whole fake token on egress. If the ' +
+        'value does not verify, the variable is left unmasked with a ' +
+        'stderr warning (fail-open). Only meaningful when mode is "mask"; ' +
+        'accepted but ignored for "deny".',
+    ),
   injectHosts: z
     .array(domainPatternSchema)
     .optional()
