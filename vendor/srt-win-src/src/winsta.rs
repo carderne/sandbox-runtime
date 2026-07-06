@@ -1,46 +1,40 @@
-//! Per-exec [`IsolatedDesk`] on `WinSta0`, plus (for the
-//! `--as-sandbox-user` two-hop) [`grant_sandbox_on_winsta`] on the
-//! station and [`grant_sandbox_on_session_bno`] on
+//! Broker-side grants on the session's kernel objects so the two-hop
+//! runner+child can attach them: the per-exec [`IsolatedDesk`] on
+//! `WinSta0`, [`grant_sandbox_on_winsta`] on the station itself, and
+//! [`grant_sandbox_on_session_bno`] on
 //! `\Sessions\<TS>\BaseNamedObjects`.
 //!
-//! **Isolated desktop.** A per-exec named desktop on the caller's
-//! current window station so the child cannot enumerate or message
+//! **Isolated desktop.** The broker creates a per-exec named desktop
+//! on its current window station, passes the `<winsta>\<desk>` path
+//! via `CreateProcessWithLogonW`'s `lpDesktop`, the runner lands
+//! there, the lockdown child inherits it (`lpDesktop = NULL` in
+//! `CreateProcessAsUserW`); neither can enumerate or message
 //! top-level windows on the interactive `WinSta0\Default`, and a
 //! co-located human's keystrokes are not capturable
 //! (`WH_KEYBOARD_LL` is per-desktop; the Job's `UILIMIT_HANDLES` does
-//! NOT gate low-level hooks, so desktop separation is the only fence
-//! for that vector).
+//! NOT gate low-level hooks, so desktop separation is the only
+//! fence for that vector).
 //!
-//! **`SameUser` mode:** `run_lockdown` creates the desktop with the
-//! caller's default DACL ([`IsolatedDesk::new`]`(None)`). Creator and
-//! child share the user SID so the default DACL grants the child
-//! attach.
-//!
-//! **`SandboxUser` mode:** the **broker** creates the desktop
-//! ([`IsolatedDesk::new`]`(Some(sb_sid))`, explicit `[broker,
-//! srt-sandbox, SY]:GA` DACL) and passes `<winsta>\<desk>` via
-//! `CreateProcessWithLogonW`'s `lpDesktop`; the runner lands there
-//! and the lockdown child inherits (`lpDesktop = NULL` in
-//! `CreateProcessAsUserW`). The interactive user has
-//! `WINSTA_CREATEDESKTOP` non-elevated; the runner does not — so the
-//! create MUST happen broker-side. With `lpDesktop != NULL` seclogon
-//! **skips** its station auto-grant for the new logon, so the runner
-//! cannot attach `WinSta0` without an explicit ACE — hence
+//! Why the broker creates it (not the runner): the interactive user
+//! has `WINSTA_CREATEDESKTOP` on `WinSta0` non-elevated (verified by
+//! probe). When `lpDesktop != NULL`, seclogon **skips** its station
+//! auto-grant for the new logon, so the runner cannot attach
+//! `WinSta0` without an explicit ACE (verified by probe — child
+//! `DLL_INIT_FAILED` without it) — hence
 //! [`grant_sandbox_on_winsta`]: the broker adds attach-level rights
 //! for the `srt-sandbox` **user** SID before resume. The grant is on
 //! the user SID (not the per-logon SID) because seclogon stamps the
 //! **broker's** interactive logon SID into the runner's
 //! `TokenGroups` (`whoami /logonid` is identical for broker and
 //! runner; the per-CPWLW logon session exists only at the
-//! `AuthenticationId` LUID level), so there is no separate runner
-//! logon SID to grant. The lockdown child inherits the runner's
-//! already-attached station+desktop, so its deny-only logon SID
-//! never matters for station attach. `run_lockdown` fails closed if
-//! the runner is on `Default`.
+//! `AuthenticationId` LUID level, not as a distinct `S-1-5-5-*`
+//! group), so there is no separate runner logon SID to grant. The
+//! lockdown child inherits the runner's already-attached
+//! station+desktop, so its deny-only logon SID never matters for
+//! station attach.
 //!
-//! **Session BNO** (`SandboxUser` only). The lockdown child has
-//! every `SE_GROUP_LOGON_ID` SID deny-only
-//! ([`crate::token::make_sandbox_token`]). The session
+//! **Session BNO.** The lockdown child has every `SE_GROUP_LOGON_ID`
+//! SID deny-only ([`crate::token::make_sandbox_token`]). The session
 //! `BaseNamedObjects` directory grants `CREATE_OBJECT |
 //! CREATE_SUBDIRECTORY` only to the broker's logon SID; Everyone gets
 //! `QUERY | TRAVERSE`. So the child can open existing named objects
@@ -49,9 +43,10 @@
 //! [`grant_sandbox_on_session_bno`] adds `(A;;DIRECTORY_QUERY|
 //! TRAVERSE|CREATE_OBJECT|CREATE_SUBDIRECTORY;;;<srt-sandbox>)` so
 //! the **user** SID carries the create rights independently of the
-//! disabled logon SID. The broker's user SID has full control on the
-//! session BNO (verified by probe), so the broker can write the DACL
-//! non-elevated.
+//! disabled logon SID. Unlike `WinSta0`, the BNO is an ordinary
+//! object-manager directory whose access check honours user-SID ACEs;
+//! and the broker's user SID has full control on it (verified by
+//! probe), so the broker can write the DACL non-elevated.
 //!
 //! **Both grants persist for the session — no revoke-on-drop.**
 //! Concurrent brokers (parallel `srt-win exec`, the normal case for a
@@ -77,8 +72,9 @@
 //! (`JOB_OBJECT_UILIMIT_READCLIPBOARD | WRITECLIPBOARD | GLOBALATOMS`).
 //!
 //! The kernel reference-counts a desktop by attached threads/handles.
-//! The creator keeps the [`IsolatedDesk`] handle open until the child
-//! exits — dropping it then releases the kernel object.
+//! The broker keeps the [`IsolatedDesk`] handle open from creation
+//! until after the runner exits — dropping it then releases the
+//! kernel object.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
@@ -146,18 +142,14 @@ pub struct IsolatedDesk {
 
 impl IsolatedDesk {
     /// Create a fresh per-exec desktop on the **current** window
-    /// station — no `SetProcessWindowStation` dance.
-    ///
-    /// `sb_sid` selects the DACL: `None` → caller's default DACL
-    /// (`SameUser` `run_lockdown`; child shares the caller's user
-    /// SID). `Some(s)` → explicit `[broker-user, <s>, SYSTEM] :
-    /// GENERIC_ALL` so a `SandboxUser` runner+child (different user)
-    /// can attach — see module doc.
+    /// station — no `SetProcessWindowStation` dance. Explicit DACL
+    /// `[broker-user, srt-sandbox, SYSTEM] : GENERIC_ALL` so the
+    /// runner and lockdown child (both `srt-sandbox`) can attach.
     ///
     /// Name = `srt-sb-<pid>-<rand32>` (random suffix so concurrent
     /// execs in the same process — e.g. tests — don't collide; the
     /// kernel-assigned name is read back for the `lpDesktop` path).
-    pub fn new(sb_sid: Option<&str>) -> Result<Self> {
+    pub fn new(sb_sid: &str) -> Result<Self> {
         // Current station name (for the `<winsta>\<desk>` path). The
         // child's `lpDesktop` carries this name verbatim, so if the
         // read failed a guessed `WinSta0` would point the child at a
@@ -180,26 +172,17 @@ impl IsolatedDesk {
         );
         let req_w = wstr(&req);
 
-        // Explicit DACL only when `sb_sid` is `Some` — the broker is
-        // a different user from the runner/child, so the default
-        // DACL (broker's TokenDefaultDacl) would deny `srt-sandbox`.
-        // `OwnedSa` heap-pins the SD; keep it alive until
-        // `CreateDesktopW` returns.
-        let me;
-        let sa = match sb_sid {
-            Some(s) => {
-                me = current_user_sid()?;
-                Some(
-                    build_allow_dacl(&[
-                        Allow(&me, Mask::GENERIC_ALL, NO_INHERIT),
-                        Allow(s, Mask::GENERIC_ALL, NO_INHERIT),
-                        Allow(SID_SYSTEM, Mask::GENERIC_ALL, NO_INHERIT),
-                    ])?
-                    .into_security_attributes()?,
-                )
-            }
-            None => None,
-        };
+        // Explicit DACL — the broker is a different user from the
+        // runner/child, so the default DACL (broker's TokenDefaultDacl)
+        // would deny `srt-sandbox`. `OwnedSa` heap-pins the SD; keep
+        // it alive until `CreateDesktopW` returns.
+        let me = current_user_sid()?;
+        let sa = build_allow_dacl(&[
+            Allow(&me, Mask::GENERIC_ALL, NO_INHERIT),
+            Allow(sb_sid, Mask::GENERIC_ALL, NO_INHERIT),
+            Allow(SID_SYSTEM, Mask::GENERIC_ALL, NO_INHERIT),
+        ])?
+        .into_security_attributes()?;
 
         let desktop = unsafe {
             CreateDesktopW(
@@ -208,7 +191,7 @@ impl IsolatedDesk {
                 None,
                 DESKTOP_CONTROL_FLAGS(0),
                 DESK_ALL_ACCESS,
-                sa.as_ref().map(|s| s.as_ptr()),
+                Some(sa.as_ptr()),
             )
         }
         .with_context(|| format!("CreateDesktopW({req}) on {ws_name}"))?;
@@ -234,10 +217,6 @@ impl IsolatedDesk {
     /// call returns.
     pub fn desktop_name_ptr(&mut self) -> *mut u16 {
         self.desk_path.as_mut_ptr()
-    }
-    /// Wide name (incl. NUL) as a slice — for diagnostics only.
-    pub fn desktop_name_ptr_slice(&mut self) -> &[u16] {
-        &self.desk_path
     }
 }
 
@@ -421,21 +400,11 @@ fn recompose_dacl(
         )
         .with_context(|| format!("GetSecurityDescriptorDacl({what})"))?;
     }
-    // No-DACL (`!present`) and present-but-NULL both mean "grant
-    // everyone everything" — `target_sid` already has access;
-    // rewriting it as a one-ACE DACL would lock out every other
-    // principal. Shouldn't happen on a csrss-created session
-    // object, but don't make it worse.
-    let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    if !present.as_bool() || old.is_null() {
-        if dbg {
-            eprintln!(
-                "srt-win: recompose_dacl({what}): present={} old_null={} \
-                 -> NO-OP (no DACL to recompose)",
-                present.as_bool(),
-                old.is_null(),
-            );
-        }
+    // A present-but-NULL DACL is "grant everyone everything" —
+    // `target_sid` already has access; rewriting it as a one-ACE
+    // DACL would lock out every other principal. Shouldn't happen on
+    // a csrss-created session object, but don't make it worse.
+    if present.as_bool() && old.is_null() {
         return Ok(());
     }
 
@@ -456,12 +425,6 @@ fn recompose_dacl(
         &[NewAce::Allow(sid, mask, NO_INHERIT)],
     )
     .with_context(|| format!("rebuild_acl({what})"))?;
-    if dbg {
-        eprintln!(
-            "srt-win: recompose_dacl({what}): kept={} aces, writing +1 grant",
-            kept.aces.len(),
-        );
-    }
 
     // 4) Write back via a fresh absolute SD.
     let mut sd: SECURITY_DESCRIPTOR = Default::default();
@@ -486,29 +449,29 @@ pub fn current_winsta_name() -> Result<String> {
 }
 
 /// Name of this thread's current desktop (e.g. `Default`,
-/// `srt-sb-…`).
-pub fn current_desktop_name() -> Result<String> {
-    let d = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.context("GetThreadDesktop")?;
+/// `srt-sb-…`). `None` on failure.
+pub fn current_desktop_name() -> Option<String> {
+    let d = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
     if d.0.is_null() {
-        return Err(anyhow!("GetThreadDesktop returned null"));
+        return None;
     }
-    object_name(HANDLE(d.0))
+    object_name(HANDLE(d.0)).ok()
 }
 
 /// `true` when this thread is on the interactive `Default` desktop.
 ///
-/// `run_lockdown` reads this on both modes: `SandboxUser` **fails
-/// closed** when `true` (the broker passed its `WinSta0\srt-sb-…`
-/// via `lpDesktop`, so the runner is never on `Default` in the
-/// two-hop path; a `Default` runner means the broker-side create
-/// failed); `SameUser` creates a fresh [`IsolatedDesk`] when `true`
-/// (a `SameUser` caller already off `Default` lets the child
-/// inherit). Name-based — a non-`Default` custom desktop is assumed
-/// isolated. A name-read failure propagates as `Err` so the
-/// `SandboxUser` arm reports it distinctly rather than misreporting
-/// a transient failure as "on `Default`".
-pub fn on_default_desktop() -> Result<bool> {
-    Ok(current_desktop_name()?.eq_ignore_ascii_case("Default"))
+/// `run_lockdown` **fails closed** when this returns `true`: the
+/// broker passes its `WinSta0\srt-sb-…` desktop via `lpDesktop` to
+/// `CreateProcessWithLogonW`, so the runner is never on `Default`
+/// in the two-hop path. A `Default` runner means the broker-side
+/// creation failed and the child would share the interactive
+/// desktop (`WH_KEYBOARD_LL` keylogging risk). Name-based — a
+/// non-`Default` custom desktop is assumed isolated. Any read
+/// failure → `true` (fail closed).
+pub fn on_default_desktop() -> bool {
+    current_desktop_name()
+        .map(|n| n.eq_ignore_ascii_case("Default"))
+        .unwrap_or(true)
 }
 
 /// Read a user-object's `UOI_NAME` (returned as a wide

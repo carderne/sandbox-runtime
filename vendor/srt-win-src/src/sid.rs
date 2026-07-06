@@ -11,10 +11,9 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
 use windows::Win32::Security::{
-    EqualSid, GetLengthSid, GetTokenInformation, LookupAccountNameW, LookupAccountSidW, PSID,
-    SID_NAME_USE, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
+    GetLengthSid, GetTokenInformation, LookupAccountNameW, LookupAccountSidW, PSID, SID_NAME_USE,
+    TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
-use windows::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PWSTR;
 
@@ -91,8 +90,8 @@ pub enum SidExistence {
 }
 
 /// Reverse-lookup: does any account correspond to `sid_str`?
-/// Used by `group status --group-sid` so a typo'd SID is reported as
-/// `absent` rather than `created-not-on-token`.
+/// SAM/LSA liveness probe when resolving the sandbox group for the
+/// state-dir DENY ACE.
 pub fn sid_account_exists(sid_str: &str) -> Result<SidExistence> {
     use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GetLastError};
     let psid = LocalPsid::from_string(sid_str)?;
@@ -222,60 +221,6 @@ pub fn current_user_sid() -> Result<String> {
         r.context("GetTokenInformation(TokenUser)")?;
         let tu = &*(buf.as_ptr() as *const TOKEN_USER);
         psid_to_string(tu.User.Sid)
-    }
-}
-
-/// State of a SID inside the current process's `TokenGroups`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupState {
-    /// Present with `SE_GROUP_ENABLED` set. Broker tokens look like
-    /// this once the user has logged out + back in after group
-    /// creation.
-    Enabled,
-    /// Present with `SE_GROUP_USE_FOR_DENY_ONLY` set. A sandbox child
-    /// token looks like this; a broker should never see it.
-    DenyOnly,
-    /// Present but neither enabled nor deny-only. Unexpected.
-    Present,
-    /// Not in `TokenGroups` at all. Typical immediately after group
-    /// creation, before the user re-logs-in.
-    Absent,
-}
-
-/// How does `target_sid` appear in the current process token's
-/// `TokenGroups`?
-pub fn group_state_for_self(target_sid: &str) -> Result<GroupState> {
-    let target = LocalPsid::from_string(target_sid)?;
-    unsafe {
-        let mut tok = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok).context("OpenProcessToken")?;
-        let mut len = 0u32;
-        let _ = GetTokenInformation(tok, TokenGroups, None, 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        let r = GetTokenInformation(
-            tok,
-            TokenGroups,
-            Some(buf.as_mut_ptr() as *mut c_void),
-            len,
-            &mut len,
-        );
-        let _ = CloseHandle(tok);
-        r.context("GetTokenInformation(TokenGroups)")?;
-        let tg = &*(buf.as_ptr() as *const TOKEN_GROUPS);
-        let arr = std::slice::from_raw_parts(tg.Groups.as_ptr(), tg.GroupCount as usize);
-        for g in arr {
-            if EqualSid(target.as_psid(), g.Sid).is_ok() {
-                let attrs = g.Attributes as i32;
-                if attrs & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
-                    return Ok(GroupState::DenyOnly);
-                }
-                if attrs & SE_GROUP_ENABLED != 0 {
-                    return Ok(GroupState::Enabled);
-                }
-                return Ok(GroupState::Present);
-            }
-        }
-        Ok(GroupState::Absent)
     }
 }
 

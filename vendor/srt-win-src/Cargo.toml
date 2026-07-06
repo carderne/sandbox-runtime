@@ -43,6 +43,8 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Registry",
 ] }
+# Only used by the (dead) hash-ACE marker in `acl.rs`; dropped with
+# the PROTECTED-stamp deletion in the follow-up PR.
 sha2 = "0.11"
 # `bundled` compiles the sqlite3 amalgamation via `cc` — works on the
 # Windows runner (MSVC). NOTE: `cargo check --target …-windows-msvc`

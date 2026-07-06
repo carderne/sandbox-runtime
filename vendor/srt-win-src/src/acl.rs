@@ -1129,22 +1129,19 @@ pub fn stamp_target_apply(
 /// per-file stamp paths where DENY ACEs interact badly with
 /// inheritance. NOT the `acl stamp` directory-target path —
 /// that uses the marker-carrying [`PrebuiltDacls`] shapes.
-pub fn stamp_dir_inheriting(
-    canonical_path: &str,
-    group_sid: &str,
-    deny_sid: Option<&str>,
-) -> Result<()> {
+pub fn stamp_dir_inheriting(canonical_path: &str, deny_sid: Option<&str>) -> Result<()> {
     let deny = deny_sid
         .map(|s| format!("(D;OICI;FA;;;{s})"))
         .unwrap_or_default();
-    // Same trustees and masks as `broker_only_aces(ReadDeny,
-    // inherit=true)`: <group>/SY/BA = FILE_ALL `(OI)(CI)`,
+    // Trustee = the **real user** (the broker matches; the
+    // `srt-sandbox` child does not). SY/BA = FILE_ALL `(OI)(CI)`;
     // OWNER_RIGHTS = READ_CONTROL `(OI)(CI)`. SDDL's `FA` =
     // `FILE_ALL_ACCESS`; `RC` = `READ_CONTROL`; `S-1-3-4` =
     // OWNER_RIGHTS. Canonical ACE order = DENY before ALLOW.
+    let user_sid = crate::sid::current_user_sid()?;
     let sddl = format!(
         "D:P{deny}\
-         (A;OICI;FA;;;{group_sid})\
+         (A;OICI;FA;;;{user_sid})\
          (A;OICI;FA;;;SY)\
          (A;OICI;FA;;;BA)\
          (A;OICI;RC;;;S-1-3-4)"
@@ -1240,9 +1237,17 @@ impl DenyMask {
     fn bits(self) -> u32 {
         match self {
             DenyMask::ReadDeny => Mask::FILE_ALL.bits(),
+            // FILE_GENERIC_WRITE includes SYNCHRONIZE + READ_CONTROL
+            // — denying SYNCHRONIZE blocks ANY synchronous open
+            // (read included). Strip both so denyWrite leaves
+            // read open. FILE_WRITE_ATTRIBUTES is already in
+            // FILE_GENERIC_WRITE; the explicit `.with()` is
+            // belt-and-braces (it survives a constant change).
             DenyMask::WriteDeny => Mask::FILE_GENERIC_WRITE
                 .with(Mask::DELETE)
                 .with(Mask::FILE_WRITE_ATTRIBUTES)
+                .without(Mask::SYNCHRONIZE)
+                .without(Mask::READ_CONTROL)
                 .bits(),
         }
     }
@@ -1373,15 +1378,16 @@ pub fn apply_parent_allow_list(
     set_file_dacl_protected(canonical_parent_path, &dacl, "parent allow-list")
 }
 
-/// `SECURITY_ATTRIBUTES` for the named init-mutex — broker-only
-/// (`<group>`/SYSTEM/Admins) so a sandbox child cannot open it
-/// (and therefore cannot stall stamps by sitting on the lock).
-/// `GENERIC_ALL` is the kernel-object equivalent of
+/// `SECURITY_ATTRIBUTES` for the named init-mutex — real-user-only
+/// (real-user/SYSTEM/Admins) so the `srt-sandbox` child cannot
+/// open it (and therefore cannot stall stamps by sitting on the
+/// lock). `GENERIC_ALL` is the kernel-object equivalent of
 /// `FILE_ALL_ACCESS`; the kernel resolves it via the mutex's
 /// generic mapping at create time.
-pub fn build_init_mutex_sa(group_sid: &str) -> Result<OwnedSa> {
+pub fn build_init_mutex_sa() -> Result<OwnedSa> {
+    let user_sid = crate::sid::current_user_sid()?;
     build_allow_dacl(&[
-        Allow(group_sid, Mask::GENERIC_ALL, NO_INHERIT),
+        Allow(&user_sid, Mask::GENERIC_ALL, NO_INHERIT),
         Allow(SID_SYSTEM, Mask::GENERIC_ALL, NO_INHERIT),
         Allow(SID_BUILTIN_ADMINS, Mask::GENERIC_ALL, NO_INHERIT),
         Allow::OWNER_RIGHTS,
@@ -1579,13 +1585,11 @@ mod tests {
 
     #[test]
     fn init_mutex_sa_builds() {
-        for g in [SID_BUILTIN_ADMINS, "S-1-5-21-1-2-3-1004"] {
-            let sa = build_init_mutex_sa(g).unwrap_or_else(|e| panic!("{g}: {e:#}"));
-            assert!(!sa.as_ptr().is_null());
-            // BA-dedup: 3 ACEs when group == Admins, else 4.
-            let want = if g == SID_BUILTIN_ADMINS { 3 } else { 4 };
-            assert_eq!(ace_count(&sa._acl), want, "group={g}");
-        }
+        let sa = build_init_mutex_sa().expect("build");
+        assert!(!sa.as_ptr().is_null());
+        // current_user / SY / BA / OWNER_RIGHTS = 4 ACEs (the
+        // current user is never SY/BA, so no dedup).
+        assert_eq!(ace_count(&sa._acl), 4);
     }
 
     #[test]

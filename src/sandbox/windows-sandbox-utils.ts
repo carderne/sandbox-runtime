@@ -1135,11 +1135,6 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   delete generated.TMPDIR
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
-  // Required while srt-win still has LaunchMode::SameUser as
-  // default; dropped in the Rust same-user-removal PR. `--env`
-  // on main carries `requires = "as_sandbox_user"`, so this
-  // must precede the overlay below.
-  argv.push('--as-sandbox-user')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env

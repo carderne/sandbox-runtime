@@ -257,12 +257,9 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(false)
     // Every --env must precede `--` (clap stops parsing after it).
     expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
-    // --as-sandbox-user is still passed while srt-win has
-    // LaunchMode::SameUser as the default; the Rust same-user-
-    // removal PR drops both the flag and this assertion.
-    expect(on.argv).toContain('--as-sandbox-user')
-    // Obsolete discriminator-group flags must NOT appear.
+    // Obsolete same-user flags must NOT appear.
     for (const dead of [
+      '--as-sandbox-user',
       '--group-sid',
       '--name',
       '--holder-pid',

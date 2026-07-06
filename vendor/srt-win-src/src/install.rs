@@ -25,18 +25,12 @@ pub const SETUP_VERSION: u32 = 1;
 
 /// DPAPI-encrypt `u.password` and write the credential + setup
 /// marker to the `sandbox_user` table. [`state_db::open_db`]
-/// creates and stamps the directory
-/// (broker-only `PROTECTED` allow set plus the explicit
-/// [`user::SANDBOX_GROUP`] DENY) — the file DACL is the **only**
-/// gate on the credential, since machine-scope DPAPI lets any local
-/// account decrypt a readable blob.
-///
-/// `broker_group_sid` is the discriminator group SID — the
-/// directory stamp keys on it (not `current_user_sid()`) so the
-/// non-elevated broker can read what an over-the-shoulder-elevated
-/// install wrote.
-pub fn write_setup(u: &user::ProvisionedUser, broker_group_sid: &str) -> Result<()> {
-    let conn = state_db::open_db(broker_group_sid).context("open state DB for setup write")?;
+/// creates and stamps the directory (real-user `PROTECTED` allow
+/// set plus the explicit [`user::SANDBOX_GROUP`] DENY) — the file
+/// DACL is the **only** gate on the credential, since machine-scope
+/// DPAPI lets any local account decrypt a readable blob.
+pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
+    let conn = state_db::open_db().context("open state DB for setup write")?;
     state_db::write_setup_info(
         &conn,
         &SetupInfo {
@@ -141,8 +135,7 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
              into the sandbox user's hive failed; CA NOT recorded"
         ));
     }
-    let path = state_db::state_dir()?.join("state.db");
-    let conn = state_db::open_db_at(&path).context("open state DB for CA write")?;
+    let conn = state_db::open_db().context("open state DB for CA write")?;
     state_db::set_ca_cert(&conn, der)
 }
 
@@ -155,6 +148,9 @@ pub fn clear_setup() -> Result<()> {
     if !path.try_exists().unwrap_or(true) {
         return Ok(());
     }
-    let conn = state_db::open_db_at(&path).context("open state DB for setup clear")?;
+    // Route through `open_db()` so a v5-schema DB is renamed away
+    // (the rename-on-mismatch chokepoint) rather than written to
+    // by `open_db_at`'s schema-less write path.
+    let conn = state_db::open_db().context("open state DB for setup clear")?;
     state_db::clear_setup_info(&conn)
 }
