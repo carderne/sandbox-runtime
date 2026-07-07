@@ -13,6 +13,7 @@ import {
   normalizePathForSandbox,
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
+  encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -73,6 +74,11 @@ export interface LinuxSandboxParams {
   bwrapPath?: string
   /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
   socatPath?: string
+  /** Filesystem unix socket bound by the Linux violation monitor. When set,
+   *  the socket is bind-mounted into the sandbox and apply-seccomp is told
+   *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
+   *  stream observed write-intent paths over that socket as newline JSON. */
+  observeSocketPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -1272,6 +1278,7 @@ export async function wrapCommandWithSandboxLinux(
     seccompConfig,
     bwrapPath,
     socatPath,
+    observeSocketPath,
     abortSignal,
   } = params
 
@@ -1332,6 +1339,28 @@ export async function wrapCommandWithSandboxLinux(
       logForDebugging(
         '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
       )
+    }
+
+    // ========== VIOLATION OBSERVATION (best-effort) ==========
+    // Only meaningful when apply-seccomp will run — it is the binary that
+    // installs the USER_NOTIF filter and ships the listener fd.
+    if (observeSocketPath && applySeccompPrefix) {
+      if (fs.existsSync(observeSocketPath)) {
+        bwrapArgs.push('--bind', observeSocketPath, observeSocketPath)
+        bwrapArgs.push('--setenv', 'SRT_OBSERVE_SOCK', observeSocketPath)
+        // Tag events with the encoded command so the violation store can
+        // associate them with this invocation (parity with macOS log tag).
+        bwrapArgs.push(
+          '--setenv',
+          'SRT_ENCODED_CMD',
+          encodeSandboxedCommand(command),
+        )
+      } else {
+        logForDebugging(
+          '[Sandbox Linux] observe socket missing — supervisor not running; ' +
+            'continuing without violation monitoring',
+        )
+      }
     }
 
     // ========== ENV RESTRICTIONS ==========

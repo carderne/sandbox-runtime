@@ -44,6 +44,10 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  startLinuxSandboxViolationMonitor,
+  type LinuxViolationMonitor,
+} from './linux-violation-monitor.js'
+import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
@@ -97,6 +101,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
@@ -422,6 +427,26 @@ async function initialize(
       config.ignoreViolations,
     )
     logForDebugging('Started macOS sandbox log monitor')
+  }
+  if (enableLogMonitor && getPlatform() === 'linux') {
+    linuxMonitor = startLinuxSandboxViolationMonitor(
+      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+      {
+        // apply-seccomp's observer reports every write-intent syscall
+        // (allowed or not). Only paths bwrap would actually refuse — outside
+        // allowWrite or inside a denyWrite carve-out — go to the store.
+        allowWritePaths: [
+          ...getDefaultWritePaths(),
+          ...config.filesystem.allowWrite,
+        ],
+        denyWritePaths: config.filesystem.denyWrite,
+        ignoreViolations: config.ignoreViolations,
+      },
+    )
+    // Don't block initialization on listen() — wrap-time checks
+    // fs.existsSync(observeSocketPath) and degrades gracefully.
+    void linuxMonitor.ready
+    logForDebugging('Started Linux seccomp violation monitor')
   }
 
   // Register cleanup handlers first time
@@ -1326,6 +1351,7 @@ async function wrapWithSandbox(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       })
 
@@ -1710,6 +1736,10 @@ async function reset(): Promise<void> {
   if (logMonitorShutdown) {
     logMonitorShutdown()
     logMonitorShutdown = undefined
+  }
+  if (linuxMonitor) {
+    linuxMonitor.stop()
+    linuxMonitor = undefined
   }
 
   if (managerContext?.linuxBridge) {
