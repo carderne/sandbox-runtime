@@ -153,8 +153,11 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     expect(Date.now() - t0).toBeLessThan(3000)
   })
 
-  it('relays signal death as WIFSIGNALED', () => {
+  it('reports signal death as 128+signal', () => {
+    // The namespace init cannot distinguish a worker's exit(128+N) from
+    // a real signal death, so the status is relayed verbatim as an exit
+    // code; the layer above (bwrap) applies its own normalization.
     const r = spawnSync(applyPath!, ['/bin/sh', '-c', 'kill -TERM $$'])
-    expect(r.signal).toBe('SIGTERM')
+    expect(r.status).toBe(128 + 15)
   })
 })

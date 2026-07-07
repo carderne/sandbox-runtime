@@ -545,39 +545,31 @@ static void install_forwarders(pid_t target) {
 
 /*
  * Wait for `main_child`, reaping any other children that exit first.
- * Returns the raw wait status as soon as `main_child` terminates — the
- * caller then exit_like_wstatus()s, which as PID 1 tears down the namespace
- * and SIGKILLs any stragglers.
+ * Returns as soon as `main_child` terminates — the caller then _exit()s,
+ * which as PID 1 tears down the namespace and SIGKILLs any stragglers.
+ * Returns an exit(3)-style status: exit code, or 128+signal.
  */
 static int reap_until(pid_t main_child) {
     int status = 0;
     for (;;) {
         pid_t r = waitpid(-1, &status, 0);
         if (r < 0) {
-            if (errno == EINTR) continue;
-            return W_EXITCODE(1, 0);  /* ECHILD without seeing main_child */
+            if (errno == EINTR) {
+                continue;
+            }
+            return 1;  /* ECHILD without seeing main_child — shouldn't happen. */
         }
-        if (r == main_child) return status;
+        if (r == main_child) {
+            if (WIFEXITED(status)) {
+                return WEXITSTATUS(status);
+            }
+            if (WIFSIGNALED(status)) {
+                return 128 + WTERMSIG(status);
+            }
+            return 1;
+        }
         /* Reaped an orphan that died before main_child; keep waiting. */
     }
-}
-
-/* Mirror the child's termination so OUR parent sees the same WIFSIGNALED /
- * WEXITSTATUS it would have seen had it spawned the workload directly
- * (tini/dumb-init semantics). For a signal death, reset the disposition and
- * re-raise; if that returns — it does for the inner init, since the kernel
- * never delivers default-fatal signals to a namespace's PID 1 — fall through
- * to the 128+sig convention. The outer stub then decodes 128+sig back into a
- * real signal and re-raises so bwrap/shell observe the genuine signal. */
-static void exit_like_wstatus(int ws) __attribute__((noreturn));
-static void exit_like_wstatus(int ws) {
-    if (WIFSIGNALED(ws)) {
-        int sig = WTERMSIG(ws);
-        signal(sig, SIG_DFL);
-        raise(sig);
-        _exit(128 + sig);
-    }
-    _exit(WIFEXITED(ws) ? WEXITSTATUS(ws) : 1);
 }
 
 int main(int argc, char *argv[]) {
@@ -690,18 +682,10 @@ int main(int argc, char *argv[]) {
             if (r < 0) die("apply-seccomp: waitpid");
             break;
         }
-        /* Inner init is namespace PID 1 and cannot re-raise, so it encodes a
-         * signal death as exit(128+sig). Decode and re-raise here so the
-         * grandparent sees WIFSIGNALED. */
         if (WIFEXITED(status)) {
-            int ec = WEXITSTATUS(status);
-            if (ec > 128 && ec < 128 + NSIG) {
-                signal(ec - 128, SIG_DFL);
-                raise(ec - 128);
-            }
-            _exit(ec);
+            _exit(WEXITSTATUS(status));
         }
-        exit_like_wstatus(status);
+        _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
     }
 
     /* Child side: drop the stub's socketpair end. */
@@ -749,7 +733,7 @@ int main(int argc, char *argv[]) {
          * PID 1 drops signals without handlers, so install forwarders. */
         if (sp[1] >= 0) close(sp[1]);
         install_forwarders(worker);
-        exit_like_wstatus(reap_until(worker));
+        _exit(reap_until(worker));
     }
 
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
