@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import {
   JWT_DEFAULT_EXTRACT_PATTERN,
+  maskJwtClaims,
   mintFakeJwt,
   verifyJwt,
 } from '../../src/sandbox/credential-decode.js'
@@ -112,6 +113,101 @@ describe('mintFakeJwt', () => {
     // JWT candidate (idempotent registry handles re-registration).
     expect(mintFakeJwt('u')).toMatch(
       new RegExp(`^${JWT_DEFAULT_EXTRACT_PATTERN}$`),
+    )
+  })
+})
+
+describe('maskJwtClaims', () => {
+  // Header with a kid, so header reuse is observable (mintFakeJwt's
+  // header has no kid).
+  const HEADER = b64u('{"alg":"RS256","typ":"JWT","kid":"key-7"}')
+  const PAYLOAD = {
+    sub: 'user-1',
+    api_key: 'real-secret',
+    aud: 'https://api.example.com',
+    n: 42,
+    naïve: 'café', // non-ASCII survives JSON.stringify re-encoding
+  }
+  const TOKEN = `${HEADER}.${b64u(JSON.stringify(PAYLOAD))}.cmVhbC1zaWc`
+
+  const sentinelFor = (claim: string, _real: string) => `fake_value_${claim}`
+
+  test('the named claim is replaced; every other claim decodes verbatim', () => {
+    const result = maskJwtClaims(TOKEN, ['api_key'], sentinelFor)
+    expect(result).not.toBeNull()
+    const payload = JSON.parse(
+      Buffer.from(result!.fakeToken.split('.')[1]!, 'base64url').toString(
+        'utf8',
+      ),
+    ) as Record<string, unknown>
+    expect(payload).toEqual({ ...PAYLOAD, api_key: 'fake_value_api_key' })
+    expect(result!.claimSentinels).toEqual(
+      new Map([['api_key', 'fake_value_api_key']]),
+    )
+    expect(result!.fakeToken).not.toContain(b64u(JSON.stringify(PAYLOAD)))
+  })
+
+  test('the header segment is reused byte-identical', () => {
+    const result = maskJwtClaims(TOKEN, ['api_key'], sentinelFor)
+    expect(result!.fakeToken.split('.')[0]).toBe(HEADER)
+  })
+
+  test('the signature is the fixed filler, never the real signature', () => {
+    // The real signature over a modified payload would give the sandbox
+    // a public-key brute-force oracle for a low-entropy masked claim.
+    const result = maskJwtClaims(TOKEN, ['api_key'], sentinelFor)
+    expect(result!.fakeToken.split('.')[2]).toBe('c3J0LWZha2U')
+    expect(result!.fakeToken.split('.')[2]).toBe(mintFakeJwt('u').split('.')[2])
+  })
+
+  test('the rebuilt token still verifies as a JWT', () => {
+    // A re-run over an already-masked file must see the fake as a
+    // candidate again (idempotent registry handles re-registration).
+    expect(
+      verifyJwt(maskJwtClaims(TOKEN, ['api_key'], sentinelFor)!.fakeToken),
+    ).toBe(true)
+  })
+
+  test('an absent claim is skipped; present ones still mask', () => {
+    const result = maskJwtClaims(TOKEN, ['nope', 'api_key'], sentinelFor)
+    expect(result).not.toBeNull()
+    expect([...result!.claimSentinels.keys()]).toEqual(['api_key'])
+  })
+
+  test('a non-string claim is skipped; present ones still mask', () => {
+    const result = maskJwtClaims(TOKEN, ['n', 'api_key'], sentinelFor)
+    expect(result).not.toBeNull()
+    expect([...result!.claimSentinels.keys()]).toEqual(['api_key'])
+    const payload = JSON.parse(
+      Buffer.from(result!.fakeToken.split('.')[1]!, 'base64url').toString(
+        'utf8',
+      ),
+    ) as Record<string, unknown>
+    expect(payload.n).toBe(42)
+  })
+
+  test('no named claim matching → null, sentinelFor never invoked', () => {
+    let calls = 0
+    const counting = (claim: string) => {
+      calls++
+      return `fake_value_${claim}`
+    }
+    expect(maskJwtClaims(TOKEN, ['nope', 'n'], counting)).toBeNull()
+    expect(calls).toBe(0)
+  })
+
+  test('a non-object JSON payload → null', () => {
+    // verifyJwt only requires the payload to parse as JSON — a scalar or
+    // array payload has no claims to mask.
+    const scalar = `${HEADER}.${b64u('"just-a-string"')}.c2ln`
+    const array = `${HEADER}.${b64u('["a","b"]')}.c2ln`
+    expect(maskJwtClaims(scalar, ['api_key'], sentinelFor)).toBeNull()
+    expect(maskJwtClaims(array, ['api_key'], sentinelFor)).toBeNull()
+  })
+
+  test('deterministic given the sentinels', () => {
+    expect(maskJwtClaims(TOKEN, ['api_key'], sentinelFor)!.fakeToken).toBe(
+      maskJwtClaims(TOKEN, ['api_key'], sentinelFor)!.fakeToken,
     )
   })
 })

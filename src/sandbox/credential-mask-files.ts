@@ -29,6 +29,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { normalizePathForSandbox } from './sandbox-utils.js'
 import {
   JWT_DEFAULT_EXTRACT_PATTERN,
+  maskJwtClaims,
   mintFakeJwt,
   verifyJwt,
 } from './credential-decode.js'
@@ -294,8 +295,18 @@ export interface MaskedFileBuildResult {
  * the built-in JWT pattern, each candidate must pass {@link verifyJwt}
  * before it is masked (failed candidates are left untouched), and the
  * sentinel is a JWT-shaped fake ({@link mintFakeJwt}) registered via
- * `registerWithSentinel`. If the regex matches nothing — or, with decode,
- * no candidate verifies — the entry's `onExtractNoMatch` decides:
+ * `registerWithSentinel`. With `maskClaims`, masking goes one level
+ * deeper: each named top-level payload claim present with a string value
+ * gets its own sentinel and the token is rebuilt around the modified
+ * payload ({@link maskJwtClaims}); BOTH mappings are registered — the
+ * whole fake token → the whole real token (a tool sending the token as a
+ * bearer credential) and each claim sentinel → the real claim value (a
+ * tool extracting the claim and sending it alone) — under the same
+ * injectHosts. Named claims absent or non-string in a token are skipped
+ * with a debug log (portable-config posture, like a missing file). If the
+ * regex matches nothing — or, with decode, no candidate verifies, or with
+ * `maskClaims`, no named claim matches in any verified token — the
+ * entry's `onExtractNoMatch` decides:
  * - `"warn"` (default): skip the entry with a loud stderr warning —
  *   fail-open, the file stays readable via the root mount;
  * - `"deny"`: push the path to `degradeToDenyPaths` — fail-closed, the
@@ -382,8 +393,45 @@ export function buildMaskedFileBinds(
           // (the default pattern over-matches by design) is left untouched —
           // returning the capture replaces the span with itself.
           if (f.decode === 'jwt' && !verifyJwt(cap)) return cap
-          maskedCount++
           const name = `${key}#${i}`
+          if (f.decode === 'jwt' && f.maskClaims?.length) {
+            // Claim-level masking: sentinels go INSIDE the payload; the
+            // rebuilt fake token is itself registered as a sentinel for
+            // the whole real token, so both the bearer path (token sent
+            // verbatim) and the extracted-claim path substitute on egress.
+            const masked = maskJwtClaims(cap, f.maskClaims, (claim, real) =>
+              registry.register(`${key}#jwt${i}.${claim}`, real, injectHosts),
+            )
+            if (masked === null) {
+              // A verified JWT none of whose named claims are present as
+              // strings: nothing to mask in THIS token — leave it as-is;
+              // if no token matches any claim, onExtractNoMatch applies.
+              logForDebugging(
+                `[credential-mask] ${f.path}: verified JWT candidate has ` +
+                  `none of maskClaims ${JSON.stringify(f.maskClaims)} as ` +
+                  `string claims — left unmasked.`,
+              )
+              return cap
+            }
+            const skipped = f.maskClaims.filter(
+              c => !masked.claimSentinels.has(c),
+            )
+            if (skipped.length > 0) {
+              logForDebugging(
+                `[credential-mask] ${f.path}: maskClaims ` +
+                  `${JSON.stringify(skipped)} absent or non-string in a ` +
+                  `verified JWT — skipped.`,
+              )
+            }
+            maskedCount++
+            return registry.registerWithSentinel(
+              name,
+              masked.fakeToken,
+              cap,
+              injectHosts,
+            )
+          }
+          maskedCount++
           // For decode the fake must keep the token's shape: a JWT-shaped
           // sentinel keeps client-side parsers (segment count, payload
           // decode, exp checks) working inside the sandbox.
@@ -405,8 +453,12 @@ export function buildMaskedFileBinds(
         // entry's onExtractNoMatch policy.
         const cause =
           f.decode === 'jwt'
-            ? `decode "jwt" with pattern "${pattern}" that matched no ` +
-              `verified JWT`
+            ? f.maskClaims?.length
+              ? `decode "jwt" with pattern "${pattern}" that matched no ` +
+                `verified JWT with maskable claims (maskClaims: ` +
+                `${JSON.stringify(f.maskClaims)})`
+              : `decode "jwt" with pattern "${pattern}" that matched no ` +
+                `verified JWT`
             : `extract pattern "${pattern}" that matched nothing`
         const onNoMatch = f.onExtractNoMatch ?? 'warn'
         if (onNoMatch === 'error') {

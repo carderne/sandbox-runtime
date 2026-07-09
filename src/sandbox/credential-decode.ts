@@ -84,3 +84,79 @@ export function mintFakeJwt(uuid: string): string {
   )
   return `${header}.${payload}.${FAKE_JWT_SIGNATURE}`
 }
+
+/** Result of {@link maskJwtClaims}. */
+export interface MaskedClaimsResult {
+  /**
+   * The rebuilt token: the original header segment verbatim, the modified
+   * payload re-encoded, and the fixed filler signature.
+   */
+  fakeToken: string
+  /** Claim name → the sentinel now carried in the fake payload. */
+  claimSentinels: Map<string, string>
+}
+
+/**
+ * Claim-level masking for a verified JWT: replace each named top-level
+ * payload claim that is present with a string value by a caller-provided
+ * sentinel, and rebuild the token around the modified payload.
+ *
+ * The rebuilt token is `header.payload'.signature-filler`:
+ *
+ * - **Header**: the original base64url segment is reused verbatim, so the
+ *   token still advertises the real `alg`/`typ`/`kid` and client-side
+ *   header inspection sees exactly what it would outside the sandbox.
+ * - **Payload**: the decoded object with the named claims swapped for
+ *   sentinels, re-encoded with `JSON.stringify`. Key order and whitespace
+ *   inside the payload segment may differ from the original encoding —
+ *   irrelevant to any JSON consumer, and the segment bytes change anyway
+ *   because a claim value changed.
+ * - **Signature**: the fixed filler from {@link mintFakeJwt}, NOT the real
+ *   signature. For RS/ES algorithms signature verification needs only the
+ *   public key, so shipping the real signature over a modified payload
+ *   would hand the sandbox an offline brute-force oracle for a low-entropy
+ *   masked claim (guess the claim, re-encode, verify). The filler also
+ *   keeps the fake a non-credential end to end, consistent with the
+ *   garbage-signature rationale in {@link mintFakeJwt}.
+ *
+ * Claims that are absent from the payload, or present with a non-string
+ * value, are skipped (the caller logs them). Returns `null` — without
+ * invoking `sentinelFor` — when no named claim matched, or when the
+ * payload does not decode to a JSON object; the caller routes that
+ * through its no-match policy.
+ *
+ * Pure on `token`/`claims`; the callback may close over a registry.
+ */
+export function maskJwtClaims(
+  token: string,
+  claims: readonly string[],
+  sentinelFor: (claim: string, realValue: string) => string,
+): MaskedClaimsResult | null {
+  const [headerSeg, payloadSeg] = token.split('.')
+  const payload = decodeSegment(payloadSeg ?? '')
+  // verifyJwt only guarantees the payload is JSON — it could still be a
+  // scalar or array, which has no claims to mask.
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload))
+    return null
+  const record = payload as Record<string, unknown>
+
+  // Collect matches before minting any sentinel, so a null return never
+  // leaves an orphaned registration behind in the caller's registry.
+  const matched: Array<[claim: string, value: string]> = []
+  for (const claim of claims) {
+    const value = record[claim]
+    if (typeof value === 'string') matched.push([claim, value])
+  }
+  if (matched.length === 0) return null
+
+  const claimSentinels = new Map<string, string>()
+  for (const [claim, value] of matched) {
+    const sentinel = sentinelFor(claim, value)
+    record[claim] = sentinel
+    claimSentinels.set(claim, sentinel)
+  }
+  return {
+    fakeToken: `${headerSeg}.${base64url(JSON.stringify(record))}.${FAKE_JWT_SIGNATURE}`,
+    claimSentinels,
+  }
+}

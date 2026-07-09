@@ -862,6 +862,182 @@ describe('buildMaskedFileBinds decode: "jwt"', () => {
     warnSpy.mockRestore()
     store.dispose()
   })
+
+  describe('maskClaims', () => {
+    // A JWT whose payload carries a secret in one claim next to
+    // claim-reading metadata a client legitimately needs.
+    const CLAIMS_PAYLOAD = {
+      sub: 'user-1',
+      api_key: 'real-claim-secret-0123456789',
+      aud: 'api.example.com',
+      iat: 1516239022,
+    }
+    const CLAIMS_JWT =
+      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+      b64u(JSON.stringify(CLAIMS_PAYLOAD)) +
+      '.Y2xhaW1zLXNpZw'
+
+    test('masks the named claim inside the token; both registry mappings exist', () => {
+      const file = join(DECODE_DIR, 'claims.json')
+      writeFileSync(file, `{"id_token":"${CLAIMS_JWT}","note":"keep"}`)
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds } = buildMaskedFileBinds(
+        [{ path: file, mode: 'mask', decode: 'jwt', maskClaims: ['api_key'] }],
+        ['api.example.com'],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(1)
+      const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+      expect(fake).not.toContain(CLAIMS_JWT)
+      expect(fake).not.toContain(CLAIMS_PAYLOAD.api_key)
+      expect(fake).toContain('"note":"keep"')
+
+      const fakeToken = fake.match(/"id_token":"([^"]+)"/)![1]!
+      expect(verifyJwt(fakeToken)).toBe(true)
+      // Header segment reused verbatim; signature is the filler.
+      const [h, p, sig] = fakeToken.split('.')
+      expect(h).toBe(CLAIMS_JWT.split('.')[0])
+      expect(sig).toBe('c3J0LWZha2U')
+      const payload = JSON.parse(
+        Buffer.from(p!, 'base64url').toString('utf8'),
+      ) as Record<string, unknown>
+      // The named claim is a sentinel; every other claim is real.
+      const claimSentinel = payload.api_key as string
+      expect(claimSentinel).toStartWith(SENTINEL_PREFIX)
+      expect(payload).toEqual({ ...CLAIMS_PAYLOAD, api_key: claimSentinel })
+
+      // Mapping (a): whole fake token → whole real token (bearer usage).
+      expect(reg.lookupReal(fakeToken)).toBe(CLAIMS_JWT)
+      // Mapping (b): claim sentinel → real claim value (extracted usage).
+      expect(reg.lookupReal(claimSentinel)).toBe(CLAIMS_PAYLOAD.api_key)
+      expect(reg.size).toBe(2)
+      store.dispose()
+    })
+
+    test('a named claim absent from the payload is skipped; matching claims still mask', () => {
+      const file = join(DECODE_DIR, 'claims-partial.json')
+      writeFileSync(file, `token: ${CLAIMS_JWT}\n`)
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds } = buildMaskedFileBinds(
+        [
+          {
+            path: file,
+            mode: 'mask',
+            decode: 'jwt',
+            maskClaims: ['api_key', 'not_present', 'iat'],
+          },
+        ],
+        ['api.example.com'],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(1)
+      const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+      const fakeToken = fake.match(/token: (\S+)/)![1]!
+      const payload = JSON.parse(
+        Buffer.from(fakeToken.split('.')[1]!, 'base64url').toString('utf8'),
+      ) as Record<string, unknown>
+      expect(payload.api_key as string).toStartWith(SENTINEL_PREFIX)
+      // Absent and non-string (iat is a number) claims are skipped.
+      expect(payload.not_present).toBeUndefined()
+      expect(payload.iat).toBe(CLAIMS_PAYLOAD.iat)
+      // Only the whole-token mapping and the one matched claim.
+      expect(reg.size).toBe(2)
+      store.dispose()
+    })
+
+    test('no named claim matching in any verified token → onExtractNoMatch (warn)', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const file = join(DECODE_DIR, 'claims-none.json')
+      writeFileSync(file, `token: ${CLAIMS_JWT}\n`)
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds } = buildMaskedFileBinds(
+        [
+          {
+            path: file,
+            mode: 'mask',
+            decode: 'jwt',
+            maskClaims: ['not_present'],
+          },
+        ],
+        ['api.example.com'],
+        reg,
+        store,
+      )
+      // The verified JWT has none of the named claims: nothing was
+      // masked, so the entry routes through onExtractNoMatch like the
+      // no-verified-candidate case.
+      expect(binds).toHaveLength(0)
+      expect(reg.size).toBe(0)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const msg = warnSpy.mock.calls[0]![0] as string
+      expect(msg).toContain('UNPROTECTED')
+      expect(msg).toContain('maskable claims')
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('no named claim matching with onExtractNoMatch "deny" → degrades to deny', () => {
+      const file = join(DECODE_DIR, 'claims-deny.json')
+      writeFileSync(file, `token: ${CLAIMS_JWT}\n`)
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [
+          {
+            path: file,
+            mode: 'mask',
+            decode: 'jwt',
+            maskClaims: ['not_present'],
+            onExtractNoMatch: 'deny',
+          },
+        ],
+        ['api.example.com'],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toEqual([realpathSync(file)])
+      store.dispose()
+    })
+
+    test('two JWTs in one file: claim sentinels are per-token', () => {
+      const otherJwt =
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+        b64u('{"sub":"user-2","api_key":"other-claim-secret"}') +
+        '.b3RoZXItc2ln'
+      const file = join(DECODE_DIR, 'claims-two.yml')
+      writeFileSync(file, `a: ${CLAIMS_JWT}\nb: ${otherJwt}\n`)
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds } = buildMaskedFileBinds(
+        [{ path: file, mode: 'mask', decode: 'jwt', maskClaims: ['api_key'] }],
+        ['api.example.com'],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(1)
+      const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+      const fakeA = fake.match(/a: (\S+)/)![1]!
+      const fakeB = fake.match(/b: (\S+)/)![1]!
+      const claimOf = (t: string) =>
+        (
+          JSON.parse(
+            Buffer.from(t.split('.')[1]!, 'base64url').toString('utf8'),
+          ) as Record<string, unknown>
+        ).api_key as string
+      expect(reg.lookupReal(claimOf(fakeA))).toBe(CLAIMS_PAYLOAD.api_key)
+      expect(reg.lookupReal(claimOf(fakeB))).toBe('other-claim-secret')
+      expect(claimOf(fakeA)).not.toBe(claimOf(fakeB))
+      // Two whole-token mappings + two claim mappings.
+      expect(reg.size).toBe(4)
+      store.dispose()
+    })
+  })
 })
 
 /**
@@ -1717,5 +1893,172 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
     expect(exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
     expect(lastHeaders?.authorization).not.toContain(REAL_JWT)
+  }, 20000)
+})
+
+/**
+ * End-to-end claim-level JWT masking (`maskClaims`): the sandboxed read
+ * returns a token whose named claim is a sentinel while every other claim
+ * is real; the proxy substitutes BOTH the whole token (bearer usage) and
+ * the extracted claim sentinel (claim-extraction usage) on egress to the
+ * injectHost, and neither at a non-injectHost.
+ */
+describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-claims-e2e-' + Date.now())
+  const JWT_FILE = join(TEST_DIR, 'id-token')
+  const HOST_A = 'localhost'
+  const HOST_B = 'localtest.me'
+
+  const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
+  const REAL_CLAIM = 'e2e-real-claim-secret-0123456789'
+  const REAL_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.' +
+    b64u(`{"sub":"e2e-user","api_key":"${REAL_CLAIM}","iat":1516239022}`) +
+    '.ZTJlLXJlYWwtc2lnbmF0dXJl'
+
+  let upstream: Server
+  let upstreamPort: number
+  let lastHeaders: IncomingHttpHeaders | undefined
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(JWT_FILE, `${REAL_JWT}\n`)
+
+    upstream = createHttpServer((req, res) => {
+      lastHeaders = req.headers
+      res.writeHead(200)
+      res.end('ok')
+    })
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
+    upstreamPort = (upstream.address() as AddressInfo).port
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: JWT_FILE,
+            mode: 'mask',
+            decode: 'jwt',
+            maskClaims: ['api_key'],
+            injectHosts: [HOST_A],
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    await new Promise<void>(r => upstream.close(() => r()))
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  async function curlViaManagerProxy(
+    url: string,
+    bearer: string,
+    resolve?: string,
+  ): Promise<number> {
+    const proxyPort = SandboxManager.getProxyPort()!
+    const authToken = SandboxManager.getProxyAuthToken()!
+    const args = [
+      '-sS',
+      '--max-time',
+      '10',
+      '--proxy',
+      `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      '-H',
+      `Authorization: Bearer ${bearer}`,
+    ]
+    if (resolve) args.push('--resolve', resolve)
+    args.push(url)
+    const child = spawn('curl', args)
+    child.stdout.on('data', () => {})
+    child.stderr.on('data', () => {})
+    return new Promise(r => child.on('close', code => r(code ?? 1)))
+  }
+
+  /** Read the masked token from inside the sandbox. */
+  async function readFakeJwt(): Promise<string> {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${JWT_FILE}`)
+    expect(wrapped).not.toContain(REAL_JWT)
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(result.status).toBe(0)
+    return result.stdout.trim()
+  }
+
+  function claimOf(token: string): string {
+    const payload = JSON.parse(
+      Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>
+    return payload.api_key as string
+  }
+
+  test('cat → named claim is a sentinel, other claims real; bearer usage delivers the whole real token', async () => {
+    const fakeJwt = await readFakeJwt()
+    expect(fakeJwt).not.toBe(REAL_JWT)
+    expect(verifyJwt(fakeJwt)).toBe(true)
+    // Header reused verbatim; only the payload changed.
+    expect(fakeJwt.split('.')[0]).toBe(REAL_JWT.split('.')[0])
+    const payload = JSON.parse(
+      Buffer.from(fakeJwt.split('.')[1]!, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>
+    expect(payload.api_key as string).toStartWith(SENTINEL_PREFIX)
+    expect(payload.sub).toBe('e2e-user')
+    expect(payload.iat).toBe(1516239022)
+
+    // The tool sends the token verbatim → the injectHost receives the
+    // whole REAL token.
+    lastHeaders = undefined
+    const exit = await curlViaManagerProxy(
+      `http://${HOST_A}:${upstreamPort}/`,
+      fakeJwt,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_JWT}`)
+  }, 20000)
+
+  test('extracted-claim usage: the claim sentinel alone swaps to the real claim value', async () => {
+    const sentinel = claimOf(await readFakeJwt())
+    expect(sentinel).toStartWith(SENTINEL_PREFIX)
+
+    lastHeaders = undefined
+    const exit = await curlViaManagerProxy(
+      `http://${HOST_A}:${upstreamPort}/`,
+      sentinel,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_CLAIM}`)
+  }, 20000)
+
+  test('a non-injectHost destination receives the fake token and sentinel unchanged', async () => {
+    const fakeJwt = await readFakeJwt()
+
+    lastHeaders = undefined
+    let exit = await curlViaManagerProxy(
+      `http://${HOST_B}:${upstreamPort}/`,
+      fakeJwt,
+      `${HOST_B}:${upstreamPort}:127.0.0.1`,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
+    expect(lastHeaders?.authorization).not.toContain(REAL_CLAIM)
+
+    lastHeaders = undefined
+    exit = await curlViaManagerProxy(
+      `http://${HOST_B}:${upstreamPort}/`,
+      claimOf(fakeJwt),
+      `${HOST_B}:${upstreamPort}:127.0.0.1`,
+    )
+    expect(exit).toBe(0)
+    expect(lastHeaders?.authorization).toBe(`Bearer ${claimOf(fakeJwt)}`)
+    expect(lastHeaders?.authorization).not.toContain(REAL_CLAIM)
   }, 20000)
 })

@@ -679,6 +679,132 @@ describe('Config Validation', () => {
       expect(result.success).toBe(true)
     })
 
+    test('accepts maskClaims alongside decode "jwt"', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/app/credentials',
+              mode: 'mask',
+              decode: 'jwt',
+              maskClaims: ['api_key', 'secret'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.credentials?.files?.[0]?.maskClaims).toEqual([
+          'api_key',
+          'secret',
+        ])
+      }
+    })
+
+    test('rejects maskClaims without decode', () => {
+      // maskClaims names fields inside a decoded payload; without decode
+      // there is nothing to look inside.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/app/credentials',
+              mode: 'mask',
+              maskClaims: ['api_key'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issue = result.error.issues.find(
+          i => i.path.join('.') === 'credentials.files.0.maskClaims',
+        )
+        expect(issue?.message).toContain('requires decode')
+      }
+    })
+
+    test('rejects an explicitly empty maskClaims', () => {
+      // Same posture as an explicitly empty injectHosts.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/app/credentials',
+              mode: 'mask',
+              decode: 'jwt',
+              maskClaims: [],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message).join('\n')
+        expect(messages).toContain('explicitly empty')
+      }
+    })
+
+    test('rejects an empty string in maskClaims', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/app/credentials',
+              mode: 'mask',
+              decode: 'jwt',
+              maskClaims: [''],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('maskClaims with decode on a deny-mode entry is accepted (ignored)', () => {
+      // Mirrors the decode-on-deny precedent: mode "deny" ignores masking
+      // options; the decode requirement is structural, not mode-dependent.
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { allowedDomains: ['api.github.com'], deniedDomains: [] },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/app/credentials',
+              mode: 'deny',
+              decode: 'jwt',
+              maskClaims: ['api_key'],
+            },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
     test.each(['warn', 'deny', 'error'] as const)(
       'accepts onExtractNoMatch: "%s"',
       onExtractNoMatch => {
