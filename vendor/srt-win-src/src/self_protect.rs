@@ -52,6 +52,31 @@ use windows::core::PWSTR;
 
 use crate::sid::LocalPsid;
 
+/// Open `current_exe()` with `share_mode = FILE_SHARE_READ` only (no
+/// `FILE_SHARE_WRITE|FILE_SHARE_DELETE`) and return the handle. While
+/// held, any attempt to open the file for write/delete — and
+/// therefore rename-over / `MoveFileEx` /
+/// `SetFileInformationByHandle(FileRenameInfo)` onto it — fails with
+/// `ERROR_SHARING_VIOLATION`. Closes the "sandboxed command
+/// overwrites the broker → next exec runs attacker binary" hole for
+/// standalone `srt-win.exe` consumers under a `.`-granted cwd. Moot
+/// when the consumer sets `srtWin.path = process.execPath` (a running
+/// binary is already section-mapped), but standalone
+/// `vendor/srt-win.exe` needs it.
+///
+/// Defense-in-depth only — call sites treat failure as
+/// warn-and-continue so a third-party opener holding DELETE access
+/// (AV/indexer/updater) can't DoS the exec path.
+pub fn share_lock_current_exe() -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(std::env::current_exe().context("current_exe")?)
+        .context("open current_exe with FILE_SHARE_READ-only")
+}
+
 /// Owner-Rights well-known SID (`S-1-3-4`). An ALLOW ACE on this SID
 /// REPLACES the implicit `READ_CONTROL|WRITE_DAC` the object's owner
 /// otherwise gets. Mask is `READ_CONTROL` for consistency with

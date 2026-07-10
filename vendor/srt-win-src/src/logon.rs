@@ -105,13 +105,16 @@ fn pump(src: HANDLE, dst: HANDLE) {
 /// return its exit code. `cwd` is set as the runner's working
 /// directory; `None` inherits the broker's. `sb_sid` is the
 /// `srt-sandbox` user-SID string (for the desktop DACL and the
-/// `WinSta0` station grant).
+/// `WinSta0` station grant). `quiet` suppresses the informational
+/// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
+/// checkpoints are gated separately on `dbg` and are unaffected.
 pub fn spawn_runner(
     username: &str,
     password: &str,
     sb_sid: &str,
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
+    quiet: bool,
 ) -> Result<u32> {
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
     let stdin = make_pipe(false)?;
@@ -256,11 +259,13 @@ pub fn spawn_runner(
             .map(|we| we.code() == ERROR_NOT_SUPPORTED.to_hresult())
             .unwrap_or(false)
         {
-            eprintln!(
-                "srt-win: broker→runner Job assign not supported \
-                 (seclogon job); relying on runner→child Job for \
-                 kill-chain"
-            );
+            if !quiet {
+                eprintln!(
+                    "srt-win: broker→runner Job assign not supported \
+                     (seclogon job); relying on runner→child Job for \
+                     kill-chain"
+                );
+            }
         } else {
             return Err(e.context("assign runner to job"));
         }

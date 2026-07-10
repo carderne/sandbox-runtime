@@ -285,6 +285,13 @@ export interface WindowsSandboxParams {
    */
   caCertPath?: string
   /**
+   * Suppress srt-win's informational stderr (progress lines,
+   * per-exec-deny summary, seclogon-job note). Actual errors still
+   * print. Default `true` — the host surfaces sandbox diagnostics
+   * via its own debug log, not the child's stderr stream.
+   */
+  quiet?: boolean
+  /**
    * Resolved `srt-win` spawn descriptor — from
    * {@link resolveSrtWin}. Omit to resolve the packaged vendor
    * binary at call time.
@@ -1273,6 +1280,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   })
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
+  if (p.quiet !== false) argv.push('--quiet')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env

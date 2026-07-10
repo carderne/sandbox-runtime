@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdtempSync,
@@ -283,6 +283,19 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     ]) {
       expect(on.argv).not.toContain(dead)
     }
+  })
+
+  it('argv: --quiet on by default, before --; quiet:false omits it', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const on = wrapCommandWithSandboxWindows({ command: 'x', srtWin })
+    expect(on.argv).toContain('--quiet')
+    expect(on.argv.indexOf('--quiet')).toBeLessThan(on.argv.indexOf('--'))
+    const off = wrapCommandWithSandboxWindows({
+      command: 'x',
+      quiet: false,
+      srtWin,
+    })
+    expect(off.argv).not.toContain('--quiet')
   })
 
   it('resolveSrtWin: explicit path → sentinel prepend; unset → packaged binary, no sentinel', () => {
@@ -1097,6 +1110,95 @@ describe.if(isWindows)(
       // Exit-code only — see B/C convention: any non-zero is fenced.
       expect(r.status).not.toBe(0)
     }, 60_000)
+
+    it('H-kill-chain: taskkill /F on the broker reaps the sandboxed child (Job kill-on-close)', async () => {
+      // Proves the broker→runner→child Job kill-chain survives a
+      // hard broker kill. waitfor.exe blocks 30s for a signal that
+      // never arrives; the nonce in its cmdline lets us find OUR
+      // instance via CIM regardless of what else is on the runner.
+      const nonce = `SrtKc${process.pid}x${Date.now()}`
+      // quiet:false — the seclogon-job note in logon.rs is the
+      // breadcrumb for the documented `AssignProcessToJobObject →
+      // ERROR_NOT_SUPPORTED` degrade path; without it a flake here
+      // has zero diagnostic.
+      const { argv, env } = wrapCommandWithSandboxWindows({
+        command: `waitfor /t 30 ${nonce}`,
+        quiet: false,
+      })
+      const broker = spawn(argv[0], argv.slice(1), { env })
+      let stderr = ''
+      broker.stdout?.on('data', () => {})
+      broker.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
+      const closed = new Promise<void>(r => broker.once('close', () => r()))
+      const findChild = (): number | undefined => {
+        const r = spawnSync(
+          'powershell',
+          [
+            '-NoProfile',
+            '-Command',
+            `(Get-CimInstance Win32_Process -Filter "Name='waitfor.exe'" | ` +
+              `Where-Object { $_.CommandLine -like '*${nonce}*' }).ProcessId`,
+          ],
+          { encoding: 'utf8', timeout: 10_000 },
+        )
+        const pid = parseInt((r.stdout ?? '').trim(), 10)
+        return Number.isFinite(pid) && pid > 0 ? pid : undefined
+      }
+      let childPid: number | undefined
+      try {
+        // Poll for the sandboxed waitfor.exe (up to ~15s: CPWLW +
+        // profile load can be slow on a cold runner).
+        for (let i = 0; i < 30 && childPid === undefined; i++) {
+          await new Promise(r => setTimeout(r, 500))
+          childPid = findChild()
+        }
+        if (childPid === undefined) {
+          throw new Error(
+            `H-kill-chain: sandboxed waitfor.exe (${nonce}) never appeared ` +
+              `— broker.pid=${broker.pid} stderr=${JSON.stringify(stderr)}`,
+          )
+        }
+        // Hard-kill the BROKER. The Job kill-chain (broker Job →
+        // runner → runner Job → child) must reap the whole tree; a
+        // surviving child would mean a broker crash orphans a
+        // sandboxed process.
+        const kill = spawnSync('taskkill', ['/PID', String(broker.pid), '/F'], {
+          encoding: 'utf8',
+          timeout: 10_000,
+        })
+        if (kill.status !== 0) {
+          throw new Error(
+            `taskkill /F broker(${broker.pid}) failed: ` +
+              `${kill.stderr || kill.stdout}`,
+          )
+        }
+        await closed
+        for (let i = 0; i < 20; i++) {
+          if (findChild() === undefined) {
+            // Cleared so the finally's belt-and-suspenders taskkill
+            // doesn't fire on a dead PID (which a busy runner may
+            // have already reused).
+            childPid = undefined
+            return
+          }
+          await new Promise(r => setTimeout(r, 500))
+        }
+        throw new Error(
+          `H-kill-chain: sandboxed child pid=${childPid} survived ` +
+            `taskkill /F on broker(${broker.pid}) — Job kill-chain ` +
+            `broken. stderr=${JSON.stringify(stderr)}`,
+        )
+      } finally {
+        // Belt-and-suspenders reap so a failure doesn't leak the
+        // child into the next test.
+        if (childPid !== undefined) {
+          spawnSync('taskkill', ['/PID', String(childPid), '/T', '/F'], {
+            timeout: 5_000,
+          })
+        }
+        broker.kill()
+      }
+    }, 90_000)
 
     // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
     // The G-rows in smoke-exec.ps1 exercise the srt-win primitives

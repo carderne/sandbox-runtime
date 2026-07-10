@@ -211,6 +211,13 @@ enum Cmd {
         /// source) passes them here explicitly.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Suppress informational stderr (progress lines,
+        /// per-exec-deny summary, seclogon-job note). Actual
+        /// errors still print. The host sets this by default so
+        /// the sandboxed child's stderr is not polluted with
+        /// broker chatter.
+        #[arg(long)]
+        quiet: bool,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -422,6 +429,7 @@ fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
 struct PerExecRestore {
     holder: srt_win::state_db::HolderPid,
     sandbox_sid: String,
+    quiet: bool,
 }
 
 impl Drop for PerExecRestore {
@@ -433,7 +441,10 @@ impl Drop for PerExecRestore {
             Ok(((_, failed), _)) => (failed, None),
             Err(e) => (0, Some(e)),
         };
-        if failed > 0 {
+        // `failed > 0` is fail-closed (leftover ACEs are reaped by
+        // the next `acl` op) so it's informational; `err` is a real
+        // state-DB failure and prints regardless of `--quiet`.
+        if failed > 0 && !self.quiet {
             eprintln!(
                 "srt-win: WARNING: per-exec restore left {failed} \
                  path(s) stamped (fail-closed) — see prior \
@@ -779,6 +790,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                 },
+                false,
             )
             .context("spawn runner for egress probe")?;
             let probe = match code {
@@ -1071,6 +1083,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             deny_read,
             deny_write,
             env,
+            quiet,
             target,
         } => {
             use srt_win::install;
@@ -1093,6 +1106,29 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
+
+            // Share-lock current_exe() so a sandboxed child can't
+            // rename/overwrite the broker binary mid-exec — see
+            // `self_protect::share_lock_current_exe` for the threat
+            // model. Acquired BEFORE per-exec stamps: held for the
+            // duration of the stamp attempt; on stamp failure the
+            // child never launches so lock release on unwind is
+            // moot. Warn-and-continue: defense-in-depth must not
+            // DoS the primary path when a third-party opener
+            // (AV/indexer/updater) holds DELETE access. `--quiet`
+            // gates the warning — that failure mode is a persistent
+            // per-machine condition that would otherwise print on
+            // every exec.
+            let _exe_lock = srt_win::self_protect::share_lock_current_exe()
+                .inspect_err(|e| {
+                    if !quiet {
+                        eprintln!(
+                            "srt-win: WARNING: share-lock current_exe: \
+                             {e:#} (proceeding; defense-in-depth only)"
+                        )
+                    }
+                })
+                .ok();
 
             // No WFP pre-flight here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
@@ -1141,12 +1177,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let guard = PerExecRestore {
                     holder: own,
                     sandbox_sid: sb_sid.clone(),
+                    quiet,
                 };
-                eprintln!(
-                    "srt-win: per-exec deny (deny-ace): \
-                     holder_pid={} → {n} target(s)",
-                    own.0,
-                );
+                if !quiet {
+                    eprintln!(
+                        "srt-win: per-exec deny (deny-ace): \
+                         holder_pid={} → {n} target(s)",
+                        own.0,
+                    );
+                }
                 Some(guard)
             };
 
@@ -1178,11 +1217,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                 })
                 .collect::<anyhow::Result<_>>()?;
-            eprintln!(
-                "srt-win: launching runner as '{}' (overlay={} var(s))",
-                cred.user,
-                env_overlay.len(),
-            );
+            if !quiet {
+                eprintln!(
+                    "srt-win: launching runner as '{}' (overlay={} var(s))",
+                    cred.user,
+                    env_overlay.len(),
+                );
+            }
             use srt_win::{logon, runner};
             let cwd = std::env::current_dir()
                 .ok()
@@ -1196,6 +1237,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     argv: target,
                     env_overlay,
                 }),
+                quiet,
             )?;
             // `cred` drops here → `SandboxCred::Drop` zeroes the
             // password. process::exit skips destructors, so the
@@ -1414,5 +1456,16 @@ mod tests {
         assert!(
             Cli::try_parse_from(["srt-win.exe", SRT_WIN_DISPATCH_ARG1, "user", "status",]).is_err()
         );
+    }
+
+    /// `--quiet` on `exec` parses and defaults false. Placement
+    /// before `--` (where the TS wrapper puts it) is accepted.
+    #[test]
+    fn exec_quiet_flag_parses() {
+        let with =
+            Cli::try_parse_from(["srt-win", "exec", "--quiet", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
+        let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 }

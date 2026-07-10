@@ -127,6 +127,7 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
         sb_sid,
         None,
         &runner::RunnerCmd::InstallCa { der: der.clone() },
+        false,
     )
     .context("spawn runner for CA install")?;
     if code != 0 {

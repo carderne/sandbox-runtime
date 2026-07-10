@@ -57,6 +57,8 @@ if (-not $sbSid) { throw 'setup marker missing user_sid' }
 Write-Host "smoke-aces: sandbox user sid=$sbSid"
 
 # Exec helper — same as smoke-exec.ps1's RExec.
+# Do NOT pass --quiet — A28's assertion depends on the
+# `per-exec deny.*holder_pid=\d+` diag line, which is `!quiet`-gated.
 function RExec {
   param([string[]] $tail)
   $argv = @('exec',
