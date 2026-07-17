@@ -108,7 +108,7 @@ jobs:
           # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
           Set-Content -Path verify.cjs -Value @"
           const { spawnSync } = require('child_process');
-          import('@anthropic-ai/sandbox-runtime').then(m => {
+          import('@carderne/sandbox-runtime').then(m => {
             const p = m.getSrtWinPath();
             console.log('resolved:', p);
             const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
