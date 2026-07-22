@@ -34,7 +34,7 @@ import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
  * Integration tests for mandatory deny paths.
  *
  * These tests verify that dangerous files (.bashrc, .gitconfig, etc.) and
- * directories (.git/hooks, .vscode, etc.) are blocked from writes even when
+ * directories (.git/hooks, .claude/commands, etc.) are blocked from writes even when
  * they're within an allowed write path.
  *
  * IMPORTANT: The mandatory deny patterns are relative to process.cwd().
@@ -231,11 +231,13 @@ describe.if(isSupportedPlatform)(
         expect(readFileSync('.profile', 'utf8')).toBe(ORIGINAL_CONTENT)
       })
 
-      it('blocks writes to .gitmodules', async () => {
+      it('allows writes to .gitmodules', async () => {
         const result = await runSandboxedWrite('.gitmodules', MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitmodules', 'utf8')).toBe(ORIGINAL_CONTENT)
+        expect(result.success).toBe(true)
+        expect(readFileSync('.gitmodules', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
+        )
       })
 
       it('blocks writes to .ripgreprc', async () => {
@@ -268,15 +270,15 @@ describe.if(isSupportedPlatform)(
     })
 
     describe('Dangerous directories should be blocked', () => {
-      it('blocks writes to .vscode/', async () => {
+      it('allows writes to .vscode/', async () => {
         const result = await runSandboxedWrite(
           '.vscode/settings.json',
           MODIFIED_CONTENT,
         )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.vscode/settings.json', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
+        expect(result.success).toBe(true)
+        expect(readFileSync('.vscode/settings.json', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
         )
       })
 
@@ -304,15 +306,15 @@ describe.if(isSupportedPlatform)(
         )
       })
 
-      it('blocks writes to .idea/', async () => {
+      it('allows writes to .idea/', async () => {
         const result = await runSandboxedWrite(
           '.idea/workspace.xml',
           MODIFIED_CONTENT,
         )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.idea/workspace.xml', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
+        expect(result.success).toBe(true)
+        expect(readFileSync('.idea/workspace.xml', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
         )
       })
     })
