@@ -290,6 +290,7 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
+- `network.allowUnauthenticatedSocksProxy` - Disable authentication for the local SOCKS proxy (boolean, default: false). This enables Git-over-SSH with the built-in macOS `nc`, which cannot send SOCKS5 credentials. Domain filtering still applies, but any local process that discovers the proxy port can use it while the sandbox is running.
 
 **TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
 
@@ -394,6 +395,19 @@ Examples:
     "denyRead": [],
     "allowWrite": ["."],
     "denyWrite": []
+  }
+}
+```
+
+On macOS, Git-over-SSH also requires unauthenticated SOCKS because the built-in
+`nc` cannot send SOCKS5 credentials:
+
+```json
+{
+  "network": {
+    "allowedDomains": ["github.com", "*.github.com"],
+    "deniedDomains": [],
+    "allowUnauthenticatedSocksProxy": true
   }
 }
 ```

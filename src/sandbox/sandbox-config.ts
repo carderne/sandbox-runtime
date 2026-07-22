@@ -602,6 +602,12 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'Port of an external SOCKS proxy to use instead of starting a local one. When provided, the library will skip starting its own SOCKS proxy and use this port. The external proxy must handle domain filtering.',
     ),
+  allowUnauthenticatedSocksProxy: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow unauthenticated access to the local SOCKS proxy. This enables Git-over-SSH with the built-in macOS nc, but lets other local processes use the proxy while it is running.',
+    ),
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
   ),
