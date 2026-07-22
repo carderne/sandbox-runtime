@@ -24,6 +24,7 @@ describe('Config Validation', () => {
       network: {
         allowedDomains: ['example.com', '*.github.com', 'localhost'],
         deniedDomains: ['evil.com'],
+        allowUnauthenticatedSocksProxy: true,
       },
       filesystem: {
         denyRead: [],

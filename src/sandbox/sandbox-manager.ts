@@ -346,7 +346,9 @@ async function startMuxProxyServer(
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     parentProxy,
-    proxyAuthToken,
+    proxyAuthToken: config?.network.allowUnauthenticatedSocksProxy
+      ? undefined
+      : proxyAuthToken,
   })
 
   muxProxyServer = createMuxProxyServer({

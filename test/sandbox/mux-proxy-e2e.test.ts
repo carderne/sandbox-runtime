@@ -129,3 +129,38 @@ describe('mux-proxy end-to-end via SandboxManager', () => {
     expect(reply[5]).toBe(0x02)
   })
 })
+
+describe('unauthenticated SOCKS proxy', () => {
+  let port: number
+
+  beforeAll(async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowUnauthenticatedSocksProxy: true,
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    port = SandboxManager.getSocksProxyPort()!
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  it('accepts a SOCKS5 no-auth greeting', async () => {
+    const reply = await new Promise<Buffer>((resolve, reject) => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(Buffer.from([0x05, 0x01, 0x00]))
+      })
+      socket.once('data', data => {
+        socket.destroy()
+        resolve(data)
+      })
+      socket.on('error', reject)
+    })
+
+    expect(reply.subarray(0, 2)).toEqual(Buffer.from([0x05, 0x00]))
+  })
+})
