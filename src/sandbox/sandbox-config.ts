@@ -700,7 +700,7 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Disable all filesystem policy enforcement. When true, no read or write rules are emitted: ' +
         'denyRead/allowRead/allowWrite/denyWrite are ignored, and the built-in mandatory write ' +
-        'protections (.git/hooks, .git/config, shell rc files, .mcp.json, .vscode/.idea, ' +
+        'protections (.git/hooks, .git/config, shell rc files, .mcp.json, ' +
         '.claude/commands, .claude/agents) are NOT applied. Use only when the sandboxed process ' +
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',

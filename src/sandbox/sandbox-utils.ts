@@ -10,7 +10,6 @@ import { logForDebugging } from '../utils/debug.js'
  */
 export const DANGEROUS_FILES = [
   '.gitconfig',
-  '.gitmodules',
   '.bashrc',
   '.bash_profile',
   '.zshrc',
@@ -22,9 +21,10 @@ export const DANGEROUS_FILES = [
 
 /**
  * Dangerous directories that should be protected from writes.
- * These directories contain sensitive configuration or executable files.
+ * .git is handled specially (see getDangerousDirectories): it stays writable
+ * for git operations, and only .git/hooks and .git/config are blocked.
  */
-export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+export const DANGEROUS_DIRECTORIES = ['.git'] as const
 
 /**
  * Get the list of dangerous directories to deny writes to.
