@@ -21,22 +21,15 @@ export const DANGEROUS_FILES = [
 
 /**
  * Dangerous directories that should be protected from writes.
- * .git is handled specially (see getDangerousDirectories): it stays writable
- * for git operations, and only .git/hooks and .git/config are blocked.
+ * These directories contain sensitive configuration or executable files.
  */
-export const DANGEROUS_DIRECTORIES = ['.git'] as const
+export const DANGEROUS_DIRECTORIES = [] as const
 
 /**
  * Get the list of dangerous directories to deny writes to.
- * Excludes .git since we need it writable for git operations -
- * instead we block specific paths within .git (hooks and config).
  */
 export function getDangerousDirectories(): string[] {
-  return [
-    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
-    '.claude/commands',
-    '.claude/agents',
-  ]
+  return [...DANGEROUS_DIRECTORIES, '.claude/commands', '.claude/agents']
 }
 
 /**

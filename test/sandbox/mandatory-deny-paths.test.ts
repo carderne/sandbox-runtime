@@ -34,7 +34,7 @@ import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
  * Integration tests for mandatory deny paths.
  *
  * These tests verify that dangerous files (.bashrc, .gitconfig, etc.) and
- * directories (.git/hooks, .claude/commands, etc.) are blocked from writes even when
+ * directories (.claude/commands, etc.) are blocked from writes even when
  * they're within an allowed write path.
  *
  * IMPORTANT: The mandatory deny patterns are relative to process.cwd().
@@ -248,23 +248,27 @@ describe.if(isSupportedPlatform)(
       })
     })
 
-    describe('Git hooks and config should be blocked', () => {
-      it('blocks writes to .git/config', async () => {
+    describe('Git hooks and config should be writable', () => {
+      it('allows writes to .git/config', async () => {
+        writeFileSync('.git/config', ORIGINAL_CONTENT)
         const result = await runSandboxedWrite('.git/config', MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.git/config', 'utf8')).toBe(ORIGINAL_CONTENT)
+        expect(result.success).toBe(true)
+        expect(readFileSync('.git/config', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
+        )
       })
 
-      it('blocks writes to .git/hooks/pre-commit', async () => {
+      it('allows writes to .git/hooks/pre-commit', async () => {
+        writeFileSync('.git/hooks/pre-commit', ORIGINAL_CONTENT)
         const result = await runSandboxedWrite(
           '.git/hooks/pre-commit',
           MODIFIED_CONTENT,
         )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
+        expect(result.success).toBe(true)
+        expect(readFileSync('.git/hooks/pre-commit', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
         )
       })
     })
@@ -372,98 +376,6 @@ describe.if(isSupportedPlatform)(
         expect(result.success).toBe(true)
         expect(readFileSync('.claude/some-other-file.txt', 'utf8').trim()).toBe(
           MODIFIED_CONTENT,
-        )
-      })
-    })
-
-    describe('allowGitConfig option', () => {
-      async function runSandboxedWriteWithGitConfig(
-        filePath: string,
-        content: string,
-        allowGitConfig: boolean,
-      ): Promise<{ success: boolean; stderr: string }> {
-        const platform = getPlatform()
-        const command = `echo '${content}' > '${filePath}'`
-
-        const writeConfig = {
-          allowOnly: ['.'],
-          denyWithinAllow: [],
-        }
-
-        let wrappedCommand: string
-        if (platform === 'macos') {
-          wrappedCommand = wrapCommandWithSandboxMacOS({
-            command,
-            needsNetworkRestriction: false,
-            readConfig: undefined,
-            writeConfig,
-            allowGitConfig,
-          })
-        } else {
-          wrappedCommand = await wrapCommandWithSandboxLinux({
-            command,
-            needsNetworkRestriction: false,
-            readConfig: undefined,
-            writeConfig,
-            allowGitConfig,
-          })
-        }
-
-        const result = spawnSync(wrappedCommand, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
-        })
-
-        return {
-          success: result.status === 0,
-          stderr: result.stderr || '',
-        }
-      }
-
-      it('blocks writes to .git/config when allowGitConfig is false (default)', async () => {
-        // Reset .git/config to original content
-        writeFileSync('.git/config', ORIGINAL_CONTENT)
-
-        const result = await runSandboxedWriteWithGitConfig(
-          '.git/config',
-          MODIFIED_CONTENT,
-          false,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.git/config', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('allows writes to .git/config when allowGitConfig is true', async () => {
-        // Reset .git/config to original content
-        writeFileSync('.git/config', ORIGINAL_CONTENT)
-
-        const result = await runSandboxedWriteWithGitConfig(
-          '.git/config',
-          MODIFIED_CONTENT,
-          true,
-        )
-
-        expect(result.success).toBe(true)
-        expect(readFileSync('.git/config', 'utf8').trim()).toBe(
-          MODIFIED_CONTENT,
-        )
-      })
-
-      it('still blocks writes to .git/hooks even when allowGitConfig is true', async () => {
-        // Reset pre-commit to original content
-        writeFileSync('.git/hooks/pre-commit', ORIGINAL_CONTENT)
-
-        const result = await runSandboxedWriteWithGitConfig(
-          '.git/hooks/pre-commit',
-          MODIFIED_CONTENT,
-          true,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
         )
       })
     })
@@ -1138,48 +1050,19 @@ describe.if(isSupportedPlatform)(
 )
 
 describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
-  it('includes .git/config in deny patterns when allowGitConfig is false', () => {
-    const patterns = macGetMandatoryDenyPatterns(false)
+  it('does not include .git/config in deny patterns', () => {
+    const patterns = macGetMandatoryDenyPatterns()
 
-    // Should include .git/config pattern
-    const hasGitConfigPattern = patterns.some(
-      p => p.includes('.git/config') || p.endsWith('.git/config'),
-    )
-    expect(hasGitConfigPattern).toBe(true)
-  })
-
-  it('excludes .git/config from deny patterns when allowGitConfig is true', () => {
-    const patterns = macGetMandatoryDenyPatterns(true)
-
-    // Should NOT include .git/config pattern
     const hasGitConfigPattern = patterns.some(
       p => p.includes('.git/config') || p.endsWith('.git/config'),
     )
     expect(hasGitConfigPattern).toBe(false)
   })
 
-  it('always includes .git/hooks in deny patterns regardless of allowGitConfig', () => {
-    const patternsWithoutGitConfig = macGetMandatoryDenyPatterns(false)
-    const patternsWithGitConfig = macGetMandatoryDenyPatterns(true)
-
-    // Both should include .git/hooks pattern
-    const hasHooksPatternFalse = patternsWithoutGitConfig.some(p =>
-      p.includes('.git/hooks'),
-    )
-    const hasHooksPatternTrue = patternsWithGitConfig.some(p =>
-      p.includes('.git/hooks'),
-    )
-
-    expect(hasHooksPatternFalse).toBe(true)
-    expect(hasHooksPatternTrue).toBe(true)
-  })
-
-  it('defaults to blocking .git/config when no argument provided', () => {
+  it('does not include .git/hooks in deny patterns', () => {
     const patterns = macGetMandatoryDenyPatterns()
 
-    const hasGitConfigPattern = patterns.some(
-      p => p.includes('.git/config') || p.endsWith('.git/config'),
-    )
-    expect(hasGitConfigPattern).toBe(true)
+    const hasHooksPattern = patterns.some(p => p.includes('.git/hooks'))
+    expect(hasHooksPattern).toBe(false)
   })
 })

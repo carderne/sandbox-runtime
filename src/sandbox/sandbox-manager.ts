@@ -1112,10 +1112,6 @@ function getMandatoryDenySearchDepth(): number {
   return config?.mandatoryDenySearchDepth ?? 3
 }
 
-function getAllowGitConfig(): boolean {
-  return config?.filesystem?.allowGitConfig ?? false
-}
-
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -1317,7 +1313,6 @@ async function wrapWithSandbox(
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowBrowserProcess,
-        allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
@@ -1353,7 +1348,6 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,

@@ -66,8 +66,6 @@ export interface LinuxSandboxParams {
   ripgrepConfig?: { command: string; args?: string[] }
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
-  /** Allow writes to .git/config files (default: false) */
-  allowGitConfig?: boolean
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
   /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
@@ -261,7 +259,6 @@ function findFirstNonExistentComponent(targetPath: string): string {
 async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
-  allowGitConfig = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const cwd = process.cwd()
@@ -278,29 +275,6 @@ async function linuxGetMandatoryDenyPaths(
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
   ]
 
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
-  const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
-  try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
-  } catch {
-    // .git doesn't exist
-  }
-
-  if (dotGitIsDirectory) {
-    // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
-
-    // Git config conditionally blocked based on allowGitConfig setting
-    if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
-    }
-  }
-
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
   for (const fileName of DANGEROUS_FILES) {
@@ -308,13 +282,6 @@ async function linuxGetMandatoryDenyPaths(
   }
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
-  }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
-
-  // Git config conditionally blocked in nested repos
-  if (!allowGitConfig) {
-    iglobArgs.push('--iglob', '**/.git/config')
   }
 
   // Single ripgrep call to find all dangerous paths in subdirectories
@@ -346,24 +313,14 @@ async function linuxGetMandatoryDenyPaths(
 
     // File inside a dangerous directory -> add the directory path
     let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
+    for (const dirName of dangerousDirectories) {
       const normalizedDirName = normalizeCaseForComparison(dirName)
       const segments = absolutePath.split(path.sep)
       const dirIndex = segments.findIndex(
         s => normalizeCaseForComparison(s) === normalizedDirName,
       )
       if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
-        }
+        denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
         foundDir = true
         break
       }
@@ -895,7 +852,6 @@ async function generateFilesystemArgs(
   maskedFileStoreDir: string | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
-  allowGitConfig = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
@@ -976,7 +932,6 @@ async function generateFilesystemArgs(
       ...(await linuxGetMandatoryDenyPaths(
         ripgrepConfig,
         mandatoryDenySearchDepth,
-        allowGitConfig,
         abortSignal,
       )),
     ]
@@ -1416,7 +1371,6 @@ export async function wrapCommandWithSandboxLinux(
     binShell,
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
-    allowGitConfig = false,
     seccompConfig,
     bwrapPath,
     socatPath,
@@ -1601,7 +1555,6 @@ export async function wrapCommandWithSandboxLinux(
       maskedFileStoreDir,
       ripgrepConfig,
       mandatoryDenySearchDepth,
-      allowGitConfig,
       abortSignal,
     )
     bwrapArgs.push(...fsArgs)
