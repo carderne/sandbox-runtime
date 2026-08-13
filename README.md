@@ -658,19 +658,17 @@ Certain sensitive files and directories are **always blocked from writes**, even
 - Git config files: `.gitconfig`
 - Other sensitive files: `.ripgreprc`, `.mcp.json`
 
-**Always-blocked directories:**
-
-- Claude config directories: `.claude/commands/`, `.claude/agents/`
-
-These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.claude/commands/foo.md` will fail:
+These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.mcp.json` will fail:
 
 ```bash
 $ srt 'echo "malicious" >> .bashrc'
 /bin/bash: .bashrc: Operation not permitted
 
-$ srt 'echo "bad" > .claude/commands/foo.md'
-/bin/bash: .claude/commands/foo.md: Operation not permitted
+$ srt 'echo "{}" > .mcp.json'
+/bin/bash: .mcp.json: Operation not permitted
 ```
+
+Directories under `.claude/`, including `commands/` and `agents/`, remain writable when their parent path is in `allowWrite`.
 
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
 
