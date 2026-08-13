@@ -1,5 +1,5 @@
 import { quote } from '../utils/shell-quote.js'
-import { spawn } from 'child_process'
+import { execFileSync, spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -429,10 +429,21 @@ function generateWriteRules(
   return rules
 }
 
+function getDarwinUserTempDir(): string | undefined {
+  try {
+    const tempDir = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], {
+      encoding: 'utf8',
+    }).trim()
+    return tempDir ? normalizePathForSandbox(tempDir) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Generate complete sandbox profile
  */
-function generateSandboxProfile({
+export function generateSandboxProfile({
   readConfig,
   writeConfig,
   httpProxyPort,
@@ -463,6 +474,9 @@ function generateSandboxProfile({
   allowAppleEvents?: boolean
   logTag: string
 }): string {
+  const browserTempDir = allowBrowserProcess
+    ? getDarwinUserTempDir()
+    : undefined
   const profile: string[] = [
     '(version 1)',
     `(deny default (with message "${logTag}"))`,
@@ -580,6 +594,7 @@ function generateSandboxProfile({
     '  (sysctl-name "kern.argmax")',
     '  (sysctl-name "kern.bootargs")',
     '  (sysctl-name "kern.hostname")',
+    ...(allowBrowserProcess ? ['  (sysctl-name "kern.hv_vmm_present")'] : []),
     '  (sysctl-name "kern.maxfiles")',
     '  (sysctl-name "kern.maxfilesperproc")',
     '  (sysctl-name "kern.maxproc")',
@@ -664,7 +679,7 @@ function generateSandboxProfile({
     // "localhost:*") matches connect() to 127.0.0.1 and ::1 but not
     // ::ffff:127.0.0.1; runtimes that connect to loopback via dual-stack
     // sockets need to use AF_INET (see JAVA_TOOL_OPTIONS injection below).
-    if (allowLocalBinding) {
+    if (allowLocalBinding || allowBrowserProcess) {
       profile.push('(allow network-bind (local ip "*:*"))')
       profile.push('(allow network-inbound (local ip "*:*"))')
       profile.push('(allow network-outbound (remote ip "localhost:*"))')
@@ -676,6 +691,17 @@ function generateSandboxProfile({
     // 3. network-outbound: connect() to a remote Unix socket path
     // Note: (subpath ...) and (path-regex ...) are path-based filters that can only match
     // bind/connect operations — socket() creation has no path, so it requires system-socket.
+    if (allowBrowserProcess && browserTempDir) {
+      // Chromium creates its ProcessSingleton AF_UNIX socket beneath the
+      // per-user Darwin temporary directory even when TMPDIR points elsewhere.
+      profile.push('(allow system-socket (socket-domain AF_UNIX))')
+      profile.push(
+        `(allow network-bind (local unix-socket (subpath ${escapePath(browserTempDir)})))`,
+      )
+      profile.push(
+        `(allow network-outbound (remote unix-socket (subpath ${escapePath(browserTempDir)})))`,
+      )
+    }
     if (allowAllUnixSockets) {
       // Allow creating AF_UNIX sockets and all Unix socket paths
       profile.push('(allow system-socket (socket-domain AF_UNIX))')
@@ -783,6 +809,15 @@ function generateSandboxProfile({
   if (allowBrowserProcess) {
     profile.push('')
     profile.push('; Browser process support (Chrome/Chromium)')
+    if (browserTempDir) {
+      profile.push(
+        '; Per-user Darwin temporary directory — Chromium ProcessSingleton',
+      )
+      profile.push(
+        `(allow file-read* file-write* (subpath ${escapePath(browserTempDir)}))`,
+      )
+      profile.push('')
+    }
     profile.push(
       '; All Mach operations — Chrome requires bootstrap registration',
     )
