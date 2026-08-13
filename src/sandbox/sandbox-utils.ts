@@ -29,7 +29,7 @@ export const DANGEROUS_DIRECTORIES = [] as const
  * Get the list of dangerous directories to deny writes to.
  */
 export function getDangerousDirectories(): string[] {
-  return [...DANGEROUS_DIRECTORIES, '.claude/commands', '.claude/agents']
+  return [...DANGEROUS_DIRECTORIES]
 }
 
 /**

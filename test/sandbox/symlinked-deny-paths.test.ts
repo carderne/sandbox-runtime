@@ -167,21 +167,19 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
 
-  it('resolves the mandatory .claude deny paths when cwd/.claude is a symlink', async () => {
+  it('does not add mandatory denies for a symlinked .claude directory', async () => {
     const claudeLink = join(PROJ, '.claude')
     symlinkSync(join('..', 'dotfiles', 'claude'), claudeLink)
 
     const originalCwd = process.cwd()
     process.chdir(PROJ)
     try {
-      // No explicit denyWithinAllow: the mandatory deny paths (cwd-relative
-      // .claude/commands, .claude/agents, .mcp.json, ...) trigger the bug.
       const result = await wrap([])
 
       expect(result).not.toContain(`--ro-bind /dev/null ${claudeLink}`)
       for (const sub of ['commands', 'agents']) {
         const resolved = join(DOTFILES, 'claude', sub)
-        expect(result).toContain(`--ro-bind ${resolved} ${resolved}`)
+        expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
       }
     } finally {
       process.chdir(originalCwd)

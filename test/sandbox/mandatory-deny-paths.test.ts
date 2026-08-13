@@ -28,14 +28,14 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import { getDangerousDirectories } from '../../src/sandbox/sandbox-utils.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
  * Integration tests for mandatory deny paths.
  *
- * These tests verify that dangerous files (.bashrc, .gitconfig, etc.) and
- * directories (.claude/commands, etc.) are blocked from writes even when
- * they're within an allowed write path.
+ * These tests verify that dangerous files (.bashrc, .gitconfig, etc.) are
+ * blocked from writes even when they're within an allowed write path.
  *
  * IMPORTANT: The mandatory deny patterns are relative to process.cwd().
  * Tests must chdir to TEST_DIR before generating sandbox commands.
@@ -84,7 +84,7 @@ describe.if(isSupportedPlatform)(
       mkdirSync(join(TEST_DIR, '.idea'), { recursive: true })
       writeFileSync(join(TEST_DIR, '.idea', 'workspace.xml'), ORIGINAL_CONTENT)
 
-      // Create .claude/commands and .claude/agents (should be blocked)
+      // Create .claude/commands and .claude/agents (should be writable)
       mkdirSync(join(TEST_DIR, '.claude', 'commands'), { recursive: true })
       mkdirSync(join(TEST_DIR, '.claude', 'agents'), { recursive: true })
       writeFileSync(
@@ -112,7 +112,7 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, '.git', 'index'), ORIGINAL_CONTENT)
 
-      // Create safe file within .claude that SHOULD be writable (not commands/agents)
+      // Create another safe file within .claude
       writeFileSync(
         join(TEST_DIR, '.claude', 'some-other-file.txt'),
         ORIGINAL_CONTENT,
@@ -273,7 +273,7 @@ describe.if(isSupportedPlatform)(
       })
     })
 
-    describe('Dangerous directories should be blocked', () => {
+    describe('Non-mandatory directories should be writable', () => {
       it('allows writes to .vscode/', async () => {
         const result = await runSandboxedWrite(
           '.vscode/settings.json',
@@ -286,28 +286,28 @@ describe.if(isSupportedPlatform)(
         )
       })
 
-      it('blocks writes to .claude/commands/', async () => {
+      it('allows writes to .claude/commands/', async () => {
         const result = await runSandboxedWrite(
           '.claude/commands/test.md',
           MODIFIED_CONTENT,
         )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/commands/test.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
+        expect(result.success).toBe(true)
+        expect(readFileSync('.claude/commands/test.md', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
         )
       })
 
-      it('blocks writes to .claude/agents/', async () => {
+      it('allows writes to .claude/agents/', async () => {
         const result = await runSandboxedWrite(
           '.claude/agents/test-agent.md',
           MODIFIED_CONTENT,
         )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/agents/test-agent.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
+        expect(result.success).toBe(true)
+        expect(
+          readFileSync('.claude/agents/test-agent.md', 'utf8').trim(),
+        ).toBe(MODIFIED_CONTENT)
       })
 
       it('allows writes to .idea/', async () => {
@@ -367,7 +367,7 @@ describe.if(isSupportedPlatform)(
         expect(readFileSync('.git/index', 'utf8').trim()).toBe(MODIFIED_CONTENT)
       })
 
-      it('allows writes to .claude/ files outside commands/agents', async () => {
+      it('allows writes to other .claude/ files', async () => {
         const result = await runSandboxedWrite(
           '.claude/some-other-file.txt',
           MODIFIED_CONTENT,
@@ -1049,6 +1049,15 @@ describe.if(isSupportedPlatform)(
   },
 )
 
+describe('mandatory deny directories', () => {
+  it('does not include .claude directories', () => {
+    const directories = getDangerousDirectories()
+
+    expect(directories).not.toContain('.claude/commands')
+    expect(directories).not.toContain('.claude/agents')
+  })
+})
+
 describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   it('does not include .git/config in deny patterns', () => {
     const patterns = macGetMandatoryDenyPatterns()
@@ -1064,5 +1073,12 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
 
     const hasHooksPattern = patterns.some(p => p.includes('.git/hooks'))
     expect(hasHooksPattern).toBe(false)
+  })
+
+  it('does not include .claude directories in deny patterns', () => {
+    const patterns = macGetMandatoryDenyPatterns()
+
+    const hasClaudePattern = patterns.some(p => p.includes('.claude/'))
+    expect(hasClaudePattern).toBe(false)
   })
 })
