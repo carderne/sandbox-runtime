@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { execFileSync, spawn } from 'child_process'
+import { realpathSync } from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -434,7 +435,7 @@ function getDarwinUserTempDir(): string | undefined {
     const tempDir = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], {
       encoding: 'utf8',
     }).trim()
-    return tempDir ? normalizePathForSandbox(tempDir) : undefined
+    return tempDir ? realpathSync(tempDir) : undefined
   } catch {
     return undefined
   }
