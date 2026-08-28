@@ -221,6 +221,40 @@ d('SandboxManager attributed attempts', () => {
     await SandboxManager.finishSandboxAttempt(descriptor.attempt)
   })
 
+  it('keeps attributed runtime environment keys after credential restrictions', async () => {
+    const previousNoProxy = process.env.NO_PROXY
+    process.env.NO_PROXY = 'parent-value-to-mask'
+    try {
+      await SandboxManager.initialize({
+        ...config(),
+        credentials: {
+          allowPlaintextInject: true,
+          envVars: [
+            { name: 'HTTPS_PROXY', mode: 'deny' },
+            { name: 'NO_PROXY', mode: 'mask' },
+            { name: 'UNRELATED_SECRET', mode: 'deny' },
+          ],
+        },
+      })
+      const descriptor = await SandboxManager.prepareSandboxAttempt({
+        command: 'true',
+      })
+      const argv = descriptor.argv.join('\0')
+
+      expect(descriptor.env.HTTPS_PROXY).toContain('localhost:')
+      expect(descriptor.env.NO_PROXY).toContain('localhost')
+      expect(argv).not.toMatch(/(?:-u|--unsetenv)[ '"]+HTTPS_PROXY/)
+      expect(argv).not.toContain('NO_PROXY=fake_value_')
+      expect(argv).toContain('UNRELATED_SECRET')
+
+      SandboxManager.cleanupAfterCommand()
+      await SandboxManager.finishSandboxAttempt(descriptor.attempt)
+    } finally {
+      if (previousNoProxy === undefined) delete process.env.NO_PROXY
+      else process.env.NO_PROXY = previousNoProxy
+    }
+  })
+
   it('discards an unpublished attempt when wrapper preparation fails', async () => {
     await SandboxManager.initialize(config())
     const allocate = spyOn(SandboxAttemptRegistry.prototype, 'allocate')

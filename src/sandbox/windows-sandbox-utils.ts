@@ -10,6 +10,7 @@ import {
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
+  type ProxyAuthTokens,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path.
@@ -260,8 +261,8 @@ export interface WindowsSandboxParams {
    * port (same as `httpProxyPort`).
    */
   socksProxyPort?: number
-  /** Per-session proxy auth token; embedded in proxy env URLs. */
-  proxyAuthToken?: string
+  /** Per-session proxy auth tokens; embedded only in runtime-owned legs. */
+  proxyAuthToken?: ProxyAuthTokens
   /**
    * `mode: 'mask'` credential env vars — sentinel values the
    * sandboxed child should see in place of the real credentials.

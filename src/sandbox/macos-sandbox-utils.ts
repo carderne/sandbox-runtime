@@ -12,6 +12,7 @@ import {
   globToRegex,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  type ProxyAuthTokens,
 } from './sandbox-utils.js'
 
 import type {
@@ -25,8 +26,8 @@ export interface MacOSSandboxParams {
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
-  /** Per-session proxy auth token; embedded in proxy env URLs. */
-  proxyAuthToken?: string
+  /** Per-session proxy auth tokens; embedded only in runtime-owned legs. */
+  proxyAuthToken?: ProxyAuthTokens
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   allowUnixSockets?: string[]
@@ -113,6 +114,7 @@ const ATTEMPT_TAG_REGEX = /(?:^|\n)SRTATTEMPT_([A-Za-z0-9_-]{8,128})_END_/
 const LEGACY_TAG_REGEX = /(?:^|\n)CMD64_(.+?)_END_/
 const SANDBOX_DETAILS_REGEX = /Sandbox:\s+([^\r\n]+)/
 const DENIED_OPERATION_REGEX = /\bdeny(?:\(1\))?\s+(\S+)/
+const MAX_MACOS_LOG_FRAME_BYTES = 64 * 1024
 
 /** Parse one compact macOS log fragment without retaining malformed input. */
 export function parseMacOSSandboxDenial(
@@ -205,6 +207,68 @@ export function routeMacOSSandboxDenial(
     encodedCommand,
     timestamp: new Date(),
   })
+}
+
+export function createMacOSSandboxLogChunkRouter(
+  callback: SandboxViolationCallback,
+  recordAttemptDenial?: (
+    correlation: string,
+    operation: string,
+    details: string,
+  ) => void,
+  ignoreViolations?: IgnoreViolationsConfig,
+): (chunk: Buffer) => void {
+  let buffered: Buffer = Buffer.alloc(0)
+  let discardUntilNewline = false
+
+  return (chunk: Buffer): void => {
+    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk
+    for (;;) {
+      const newline = buffered.indexOf(0x0a)
+      if (discardUntilNewline) {
+        if (newline < 0) {
+          buffered = Buffer.alloc(0)
+          return
+        }
+        buffered = buffered.subarray(newline + 1)
+        discardUntilNewline = false
+        continue
+      }
+      if (newline < 0) {
+        if (buffered.length > MAX_MACOS_LOG_FRAME_BYTES) {
+          buffered = Buffer.alloc(0)
+          discardUntilNewline = true
+        }
+        return
+      }
+      const frame = buffered.subarray(0, newline)
+      buffered = buffered.subarray(newline + 1)
+      if (frame.length === 0 || frame.length > MAX_MACOS_LOG_FRAME_BYTES) {
+        continue
+      }
+
+      let value: unknown
+      try {
+        value = JSON.parse(frame.toString('utf8')) as unknown
+      } catch {
+        continue
+      }
+      if (
+        typeof value !== 'object' ||
+        value === null ||
+        Array.isArray(value) ||
+        typeof (value as Record<string, unknown>).eventMessage !== 'string'
+      ) {
+        continue
+      }
+      routeMacOSSandboxDenial(
+        (value as { eventMessage: string }).eventMessage,
+        callback,
+        ignoreViolations,
+        recordAttemptDenial,
+      )
+    }
+  }
 }
 
 /**
@@ -1153,18 +1217,17 @@ export function startMacOSSandboxLogMonitor(
     'stream',
     '--predicate',
     `(eventMessage ENDSWITH "${sessionSuffix}")`,
+    '--no-backtrace',
     '--style',
-    'compact',
+    'ndjson',
   ])
 
-  logProcess.stdout?.on('data', (data: Buffer) => {
-    routeMacOSSandboxDenial(
-      data.toString(),
-      callback,
-      ignoreViolations,
-      options.recordAttemptDenial,
-    )
-  })
+  const routeChunk = createMacOSSandboxLogChunkRouter(
+    callback,
+    options.recordAttemptDenial,
+    ignoreViolations,
+  )
+  logProcess.stdout?.on('data', routeChunk)
 
   logProcess.stderr?.on('data', (data: Buffer) => {
     logForDebugging(`[Sandbox Monitor] Log stream stderr: ${data.toString()}`)

@@ -4,6 +4,7 @@ import {
   routeMacOSSandboxDenial,
   type SandboxViolationEvent,
 } from '../../src/sandbox/macos-sandbox-utils.js'
+import * as macOSUtils from '../../src/sandbox/macos-sandbox-utils.js'
 import { SandboxAttemptRegistry } from '../../src/sandbox/sandbox-attempt-registry.js'
 
 describe('macOS attempt monitor parsing', () => {
@@ -78,6 +79,77 @@ describe('macOS attempt monitor parsing', () => {
 })
 
 describe('macOS attempt monitor routing', () => {
+  it('frames split and coalesced NDJSON records independently', () => {
+    const createChunkRouter = (
+      macOSUtils as unknown as {
+        createMacOSSandboxLogChunkRouter?: (
+          callback: (event: SandboxViolationEvent) => void,
+          recordAttemptDenial: (
+            correlation: string,
+            operation: string,
+            details: string,
+          ) => void,
+        ) => (chunk: Buffer) => void
+      }
+    ).createMacOSSandboxLogChunkRouter
+    expect(createChunkRouter).toBeFunction()
+    if (!createChunkRouter) return
+
+    const routed: Array<{ correlation: string; details: string }> = []
+    const feed = createChunkRouter(
+      () => {},
+      (correlation, _operation, details) =>
+        routed.push({ correlation, details }),
+    )
+    const first = `${JSON.stringify({
+      eventMessage:
+        'SRTATTEMPT_corr_aaaaaaaa_END__123_SBX\n' +
+        'Sandbox: bash(1) deny(1) file-read-data /first',
+    })}\n`
+    const second = `${JSON.stringify({
+      eventMessage:
+        'SRTATTEMPT_corr_bbbbbbbb_END__123_SBX\n' +
+        'Sandbox: bash(2) deny(1) file-write-data /second',
+    })}\n`
+
+    feed(Buffer.from(first.slice(0, 17)))
+    expect(routed).toEqual([])
+    feed(Buffer.from(first.slice(17) + second))
+
+    expect(routed).toEqual([
+      {
+        correlation: 'corr_aaaaaaaa',
+        details: 'bash(1) deny(1) file-read-data /first',
+      },
+      {
+        correlation: 'corr_bbbbbbbb',
+        details: 'bash(2) deny(1) file-write-data /second',
+      },
+    ])
+  })
+
+  it('drops oversized and malformed NDJSON records and resumes routing', () => {
+    const routed: string[] = []
+    const feed = macOSUtils.createMacOSSandboxLogChunkRouter(
+      () => {},
+      correlation => routed.push(correlation),
+    )
+    const message = (correlation: string, path: string) =>
+      `SRTATTEMPT_${correlation}_END__123_SBX\n` +
+      `Sandbox: bash(1) deny(1) file-read-data ${path}`
+    const oversized = `${JSON.stringify({
+      padding: 'x'.repeat(64 * 1024),
+      eventMessage: message('corr_oversized', '/oversized'),
+    })}\n`
+    const valid = `${JSON.stringify({
+      eventMessage: message('corr_recovered', '/recovered'),
+    })}\n`
+
+    feed(Buffer.from(oversized + '{malformed}\n' + '{}\n' + valid))
+
+    expect(routed).toEqual(['corr_recovered'])
+  })
+
   it('routes attempt tags only to the active registry correlation', async () => {
     const registry = new SandboxAttemptRegistry({ finishGraceMs: 0 })
     const pending = registry.allocate({

@@ -70,6 +70,8 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  generateProxyEnvVars,
+  type ProxyAuthTokens,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -1161,6 +1163,19 @@ function getProxyAuthToken(): string | undefined {
   return proxyAuthToken
 }
 
+function getLegacyProxyAuthTokens(): ProxyAuthTokens | undefined {
+  if (!proxyAuthToken) return undefined
+  const runtimeOwnsHttpProxy = config?.network.httpProxyPort === undefined
+  const runtimeOwnsSocksProxy = config?.network.socksProxyPort === undefined
+  return {
+    http: runtimeOwnsHttpProxy ? proxyAuthToken : undefined,
+    socks: runtimeOwnsSocksProxy ? proxyAuthToken : undefined,
+    // Linux SSH compatibility uses HTTP CONNECT. macOS ignores this field
+    // because its nc-based SOCKS route cannot send proxy authentication.
+    ssh: runtimeOwnsHttpProxy ? proxyAuthToken : undefined,
+  }
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -1245,7 +1260,7 @@ async function buildSandboxCommand(
   // Credential env handling is independent of filesystem policy: unsetEnvVars /
   // setEnvVars must be applied even when fsDisabled (the credential file
   // deny-reads are dropped, but env scrubbing still happens).
-  const credentialRestrictions = getCredentialRestrictions(
+  let credentialRestrictions = getCredentialRestrictions(
     customConfig?.credentials ?? config?.credentials,
     customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
   )
@@ -1348,6 +1363,36 @@ async function buildSandboxCommand(
     await waitForNetworkInitialization()
   }
 
+  if (!embedProxyEnvironment) {
+    const runtimeOwnsHttpProxy = config?.network.httpProxyPort === undefined
+    const runtimeOwnsSocksProxy = config?.network.socksProxyPort === undefined
+    const marker = 'runtime-owned'
+    const protectedEnvNames = new Set(
+      generateProxyEnvVars(
+        needsNetworkProxy ? 1 : undefined,
+        needsNetworkProxy ? 1 : undefined,
+        mitmCA?.trustBundlePath,
+        {
+          http: runtimeOwnsHttpProxy ? marker : undefined,
+          socks: runtimeOwnsSocksProxy ? marker : undefined,
+          ssh: runtimeOwnsHttpProxy ? marker : undefined,
+        },
+        fsDisabled,
+      ).map(assignment => assignment.slice(0, assignment.indexOf('='))),
+    )
+    credentialRestrictions = {
+      ...credentialRestrictions,
+      unsetEnvVars: credentialRestrictions.unsetEnvVars.filter(
+        name => !protectedEnvNames.has(name),
+      ),
+      setEnvVars: Object.fromEntries(
+        Object.entries(credentialRestrictions.setEnvVars).filter(
+          ([name]) => !protectedEnvNames.has(name),
+        ),
+      ),
+    }
+  }
+
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
@@ -1365,7 +1410,9 @@ async function buildSandboxCommand(
           // Only pass proxy ports if proxy is running (when there are domains to filter)
           httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
           socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
-          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          proxyAuthToken: needsNetworkProxy
+            ? getLegacyProxyAuthTokens()
+            : undefined,
           caCertPath: mitmCA?.trustBundlePath,
           readConfig,
           writeConfig,
@@ -1408,7 +1455,9 @@ async function buildSandboxCommand(
           socksProxyPort: needsNetworkProxy
             ? managerContext?.socksProxyPort
             : undefined,
-          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          proxyAuthToken: needsNetworkProxy
+            ? getLegacyProxyAuthTokens()
+            : undefined,
           caCertPath: mitmCA?.trustBundlePath,
           readConfig,
           writeConfig,
@@ -1647,7 +1696,7 @@ async function wrapWithSandboxArgv(
       command,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
-      proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      proxyAuthToken: hasNetworkConfig ? getLegacyProxyAuthTokens() : undefined,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees

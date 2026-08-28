@@ -155,6 +155,36 @@ describe('structured platform wrapper results', () => {
     },
   )
 
+  it('applies Linux attempt monitor variables after credential operations', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'srt-monitor-env-order-'))
+    const observer = join(dir, 'observer.sock')
+    writeFileSync(observer, '')
+    try {
+      const result = await prepareCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: undefined,
+        unsetEnvVars: ['SRT_ATTEMPT_CORRELATION'],
+        observeSocketPath: observer,
+        seccompConfig: {
+          applyPath: '/bin/true',
+          argv0: 'apply-seccomp',
+        },
+        monitorCorrelation: 'corr_1234567890',
+        embedProxyEnvironment: false,
+      })
+
+      const unset = result.command.indexOf('--unsetenv SRT_ATTEMPT_CORRELATION')
+      const set = result.command.indexOf('--setenv SRT_ATTEMPT_CORRELATION')
+      expect(unset).toBeGreaterThanOrEqual(0)
+      expect(set).toBeGreaterThan(unset)
+    } finally {
+      cleanupBwrapMountPoints()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it.if(isLinux)(
     'classifies only write paths that produced writable binds',
     async () => {

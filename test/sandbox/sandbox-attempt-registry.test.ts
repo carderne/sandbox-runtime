@@ -217,6 +217,19 @@ describe('SandboxAttemptRegistry', () => {
     await expect(finishing).rejects.toThrow(/invalidated by reset/i)
   })
 
+  it('rejects activation of an attempt allocated before reset', () => {
+    const registry = new SandboxAttemptRegistry({ finishGraceMs: 0 })
+    const pending = registry.allocate({ command: 'wraps across reset' })
+
+    registry.reset()
+
+    expect(() =>
+      registry.activate(pending, { backend: 'macos-seatbelt' }),
+    ).toThrow(/invalidated by reset/i)
+    expect(registry.hasActiveCorrelation(pending.correlation)).toBe(false)
+    expect(registry.resolveProxyToken(pending.proxyToken)).toBeUndefined()
+  })
+
   it('discards captured-token and monitor events after close without reassigning them', async () => {
     const registry = new SandboxAttemptRegistry({ finishGraceMs: 0 })
     const closed = activate(registry)

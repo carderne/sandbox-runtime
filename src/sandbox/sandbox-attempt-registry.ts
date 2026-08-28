@@ -55,6 +55,7 @@ interface PendingState {
   status: 'pending' | 'activated' | 'discarded'
   readonly command: string
   readonly ignoreViolations?: IgnoreViolationsConfig
+  readonly generation: number
 }
 
 interface ActiveAttemptState {
@@ -154,6 +155,7 @@ export class SandboxAttemptRegistry {
       status: 'pending',
       command: options.command,
       ignoreViolations: copyIgnoreViolations(options.ignoreViolations),
+      generation: this.generation,
     })
     return pending
   }
@@ -168,6 +170,10 @@ export class SandboxAttemptRegistry {
     const pendingState = this.pendingStates.get(pending)
     if (!pendingState || pendingState.status !== 'pending') {
       throw new Error('sandbox attempt is not pending')
+    }
+    if (pendingState.generation !== this.generation) {
+      pendingState.status = 'discarded'
+      throw new Error('sandbox attempt invalidated by reset')
     }
     if (
       this.attemptsById.has(pending.handle.attemptId) ||

@@ -16,6 +16,7 @@ import {
   encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  type ProxyAuthTokens,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -41,8 +42,8 @@ export interface LinuxSandboxParams {
   socksSocketPath?: string
   httpProxyPort?: number
   socksProxyPort?: number
-  /** Per-session proxy auth token; embedded in proxy env URLs. */
-  proxyAuthToken?: string
+  /** Per-session proxy auth tokens; embedded only in runtime-owned legs. */
+  proxyAuthToken?: ProxyAuthTokens
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   readConfig?: FsReadRestrictionConfig
@@ -1483,9 +1484,27 @@ export async function prepareCommandWithSandboxLinux(
       )
     }
 
+    // ========== ENV RESTRICTIONS ==========
+    // Drop denied credential env vars from the inherited environment. Emitted
+    // before the proxy --setenv flags below: bwrap applies env operations in
+    // argument order, so SRT's own proxy plumbing vars survive even if a
+    // caller lists one of them as a denied credential.
+    if (hasEnvRestrictions) {
+      for (const name of unsetEnvVars ?? []) {
+        bwrapArgs.push('--unsetenv', name)
+      }
+      // Masked credentials override the inherited real value with a
+      // sentinel; bwrap --setenv replaces any inherited value of NAME.
+      for (const [name, value] of Object.entries(setEnvVars ?? {})) {
+        bwrapArgs.push('--setenv', name, value)
+      }
+    }
+
     // ========== VIOLATION OBSERVATION (best-effort) ==========
     // Only meaningful when apply-seccomp will run — it is the binary that
-    // installs the USER_NOTIF filter and ships the listener fd.
+    // installs the USER_NOTIF filter and ships the listener fd. Runtime-owned
+    // monitor variables are emitted after credential operations so they
+    // cannot be unset or masked by a colliding credential name.
     if (observeSocketPath && applySeccompPrefix) {
       if (fs.existsSync(observeSocketPath)) {
         bwrapArgs.push('--bind', observeSocketPath, observeSocketPath)
@@ -1513,22 +1532,6 @@ export async function prepareCommandWithSandboxLinux(
           '[Sandbox Linux] observe socket missing — supervisor not running; ' +
             'continuing without violation monitoring',
         )
-      }
-    }
-
-    // ========== ENV RESTRICTIONS ==========
-    // Drop denied credential env vars from the inherited environment. Emitted
-    // before the proxy --setenv flags below: bwrap applies env operations in
-    // argument order, so SRT's own proxy plumbing vars survive even if a
-    // caller lists one of them as a denied credential.
-    if (hasEnvRestrictions) {
-      for (const name of unsetEnvVars ?? []) {
-        bwrapArgs.push('--unsetenv', name)
-      }
-      // Masked credentials override the inherited real value with a
-      // sentinel; bwrap --setenv replaces any inherited value of NAME.
-      for (const [name, value] of Object.entries(setEnvVars ?? {})) {
-        bwrapArgs.push('--setenv', name, value)
       }
     }
 

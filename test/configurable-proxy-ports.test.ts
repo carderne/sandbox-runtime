@@ -47,6 +47,37 @@ describe('Configurable Proxy Ports Integration Tests', () => {
 
       await SandboxManager.reset()
     })
+
+    it('keeps the legacy session credential off the external HTTP leg', async () => {
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          httpProxyPort: 8888,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+      const token = SandboxManager.getProxyAuthToken()
+      expect(token).toBeDefined()
+      try {
+        const descriptor = await SandboxManager.wrapWithSandboxArgv('true')
+        const emitted = [
+          descriptor.argv.join(' '),
+          descriptor.env.HTTP_PROXY,
+          descriptor.env.HTTPS_PROXY,
+          descriptor.env.ALL_PROXY,
+          descriptor.env.FTP_PROXY,
+        ].join('\n')
+
+        expect(emitted).toContain('http://localhost:8888')
+        expect(emitted).not.toContain(`http://srt:${token}@localhost:8888`)
+        expect(emitted).toContain(`socks5h://srt:${token}@localhost:`)
+      } finally {
+        SandboxManager.cleanupAfterCommand()
+        await SandboxManager.reset()
+      }
+    })
   })
 
   describe('External SOCKS proxy + local HTTP', () => {
@@ -78,6 +109,37 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       expect(httpProxyPort).toBeGreaterThan(0)
 
       await SandboxManager.reset()
+    })
+
+    it('keeps the legacy session credential off the external SOCKS leg', async () => {
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          socksProxyPort: 1080,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+      const token = SandboxManager.getProxyAuthToken()
+      expect(token).toBeDefined()
+      try {
+        const descriptor = await SandboxManager.wrapWithSandboxArgv('true')
+        const emitted = [
+          descriptor.argv.join(' '),
+          descriptor.env.HTTP_PROXY,
+          descriptor.env.HTTPS_PROXY,
+          descriptor.env.ALL_PROXY,
+          descriptor.env.FTP_PROXY,
+        ].join('\n')
+
+        expect(emitted).toContain(`http://srt:${token}@localhost:`)
+        expect(emitted).toContain('socks5h://localhost:1080')
+        expect(emitted).not.toContain(`socks5h://srt:${token}@localhost:1080`)
+      } finally {
+        SandboxManager.cleanupAfterCommand()
+        await SandboxManager.reset()
+      }
     })
   })
 

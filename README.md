@@ -45,7 +45,7 @@ This package provides a standalone sandbox implementation that can be used as bo
 - **Network restrictions**: Control which hosts/domains can be accessed via HTTP/HTTPS and other protocols
 - **Filesystem restrictions**: Control which files/directories can be read/written
 - **Unix socket restrictions**: Control access to local IPC sockets
-- **Violation monitoring**: On macOS, tap into the system's sandbox violation log store for real-time alerts
+- **Violation monitoring**: Collect best-effort denial telemetry from the macOS sandbox log and Linux seccomp observer
 
 ### Example Use Case: Sandboxing MCP Servers
 
@@ -857,7 +857,6 @@ Users should be aware of potential risks that come from allowing broad domains l
 
 - Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox.
 - Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
-  <<<<<<< HEAD
 - Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used in cases where additional isolation is otherwise enforced.
 - Apple Events (macOS): The `allowAppleEvents` option re-enables sending Apple Events and Launch Services open requests (`(allow appleevent-send)`, `(allow lsopen)`, and mach-lookups for `com.apple.coreservices.appleevents`, `com.apple.CoreServices.coreservicesd`, and `com.apple.coreservices.quarantine-resolver`), which `open`, `osascript`, and URL-opening helpers require. With these allowed, a sandboxed command can launch arbitrary applications with no user prompt, and launched applications run outside the sandbox entirely — so this option removes code-execution isolation, not just weakens it. Scripting already-running applications via Apple Events is additionally gated by macOS TCC automation consent, but launching via `open` is not. Only enable this when commands inside the sandbox genuinely need to open URLs or applications.
 - Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent` and `com.apple.SystemConfiguration.configd`. The former is needed for Go programs to verify TLS certificates via the macOS Security framework; the latter is needed for Rust/Go programs (e.g. `uv`, `cargo`) that query system proxy/network configuration on startup. This opens a potential data exfiltration vector through the trustd service and exposes read-only host network configuration (proxy settings, DNS servers) through configd. Only enable when needed.
@@ -870,5 +869,3 @@ Users should be aware of potential risks that come from allowing broad domains l
 **Future improvements:**
 
 - **Proxychains support**: Add support for `proxychains` with `LD_PRELOAD` on Linux to intercept network calls at a lower level, making bypass more difficult
-
-- **Linux violation monitoring**: Implement automatic `strace`-based violation detection for Linux, integrated with the violation store. Currently, Linux users must manually run `strace` to see violations, unlike macOS which has automatic violation monitoring via the system log store
