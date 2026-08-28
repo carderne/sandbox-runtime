@@ -91,7 +91,121 @@ export type SandboxViolationCallback = (
   violation: SandboxViolationEvent,
 ) => void
 
+export type ParsedMacOSSandboxDenial = {
+  attribution:
+    | { kind: 'attempt'; correlation: string }
+    | { kind: 'legacy'; encodedCommand?: string; command?: string }
+  operation: string
+  details: string
+}
+
+export interface MacOSSandboxLogMonitorOptions {
+  recordAttemptDenial?: (
+    correlation: string,
+    operation: string,
+    details: string,
+  ) => void
+}
+
 const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
+
+const ATTEMPT_TAG_REGEX = /(?:^|\n)SRTATTEMPT_([A-Za-z0-9_-]{8,128})_END_/
+const LEGACY_TAG_REGEX = /(?:^|\n)CMD64_(.+?)_END_/
+const SANDBOX_DETAILS_REGEX = /Sandbox:\s+([^\r\n]+)/
+const DENIED_OPERATION_REGEX = /\bdeny(?:\(1\))?\s+(\S+)/
+
+/** Parse one compact macOS log fragment without retaining malformed input. */
+export function parseMacOSSandboxDenial(
+  text: string,
+): ParsedMacOSSandboxDenial | undefined {
+  const details = SANDBOX_DETAILS_REGEX.exec(text)?.[1]
+  if (!details || !details.includes('deny')) return undefined
+
+  if (
+    details.includes('mDNSResponder') ||
+    details.includes('mach-lookup com.apple.diagnosticd') ||
+    details.includes('mach-lookup com.apple.analyticsd')
+  ) {
+    return undefined
+  }
+
+  const operation = DENIED_OPERATION_REGEX.exec(details)?.[1]
+  if (!operation) return undefined
+
+  const attempt = ATTEMPT_TAG_REGEX.exec(text)?.[1]
+  if (attempt) {
+    return {
+      attribution: { kind: 'attempt', correlation: attempt },
+      operation,
+      details,
+    }
+  }
+  // A malformed attempt tag must not fall through into the legacy path.
+  if (text.includes('SRTATTEMPT_')) return undefined
+
+  const encodedCommand = LEGACY_TAG_REGEX.exec(text)?.[1]
+  let command: string | undefined
+  if (encodedCommand) {
+    try {
+      command = decodeSandboxedCommand(encodedCommand)
+    } catch {
+      // Preserve legacy reporting when the command tag cannot be decoded.
+    }
+  }
+  return {
+    attribution: { kind: 'legacy', encodedCommand, command },
+    operation,
+    details,
+  }
+}
+
+/** Route one parsed fragment to either attempt attribution or legacy storage. */
+export function routeMacOSSandboxDenial(
+  text: string,
+  callback: SandboxViolationCallback,
+  ignoreViolations?: IgnoreViolationsConfig,
+  recordAttemptDenial?: (
+    correlation: string,
+    operation: string,
+    details: string,
+  ) => void,
+): void {
+  const parsed = parseMacOSSandboxDenial(text)
+  if (!parsed) return
+  if (parsed.attribution.kind === 'attempt') {
+    recordAttemptDenial?.(
+      parsed.attribution.correlation,
+      parsed.operation,
+      parsed.details,
+    )
+    return
+  }
+
+  const { command, encodedCommand } = parsed.attribution
+  if (ignoreViolations && command) {
+    if (
+      (ignoreViolations['*'] ?? []).some(path => parsed.details.includes(path))
+    ) {
+      return
+    }
+    for (const [pattern, paths] of Object.entries(ignoreViolations)) {
+      if (
+        pattern !== '*' &&
+        command.includes(pattern) &&
+        paths.some(path => parsed.details.includes(path))
+      ) {
+        return
+      }
+    }
+  }
+
+  callback({
+    line: parsed.details,
+    command,
+    encodedCommand,
+    timestamp: new Date(),
+  })
+}
 
 /**
  * Generate a unique log tag for sandbox monitoring
@@ -1031,17 +1145,8 @@ export function wrapCommandWithSandboxMacOS(
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
   ignoreViolations?: IgnoreViolationsConfig,
+  options: MacOSSandboxLogMonitorOptions = {},
 ): () => void {
-  // Pre-compile regex patterns for better performance
-  const cmdExtractRegex = /CMD64_(.+?)_END/
-  const sandboxExtractRegex = /Sandbox:\s+(.+)$/
-
-  // Pre-process ignore patterns for faster lookup
-  const wildcardPaths = ignoreViolations?.['*'] || []
-  const commandPatterns = ignoreViolations
-    ? Object.entries(ignoreViolations).filter(([pattern]) => pattern !== '*')
-    : []
-
   // Stream and filter kernel logs for all sandbox violations
   // We can't filter by specific logTag since it's dynamic per command
   const logProcess = spawn('log', [
@@ -1053,74 +1158,12 @@ export function startMacOSSandboxLogMonitor(
   ])
 
   logProcess.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().split('\n')
-
-    // Get violation and command lines
-    const violationLine = lines.find(
-      line => line.includes('Sandbox:') && line.includes('deny'),
+    routeMacOSSandboxDenial(
+      data.toString(),
+      callback,
+      ignoreViolations,
+      options.recordAttemptDenial,
     )
-    const commandLine = lines.find(line => line.startsWith('CMD64_'))
-
-    if (!violationLine) return
-
-    // Extract violation details
-    const sandboxMatch = violationLine.match(sandboxExtractRegex)
-    if (!sandboxMatch?.[1]) return
-
-    const violationDetails = sandboxMatch[1]
-
-    // Try to get command
-    let command: string | undefined
-    let encodedCommand: string | undefined
-    if (commandLine) {
-      const cmdMatch = commandLine.match(cmdExtractRegex)
-      encodedCommand = cmdMatch?.[1]
-      if (encodedCommand) {
-        try {
-          command = decodeSandboxedCommand(encodedCommand)
-        } catch {
-          // Failed to decode, continue without command
-        }
-      }
-    }
-
-    // Always filter out noisey violations
-    if (
-      violationDetails.includes('mDNSResponder') ||
-      violationDetails.includes('mach-lookup com.apple.diagnosticd') ||
-      violationDetails.includes('mach-lookup com.apple.analyticsd')
-    ) {
-      return
-    }
-
-    // Check if we should ignore this violation
-    if (ignoreViolations && command) {
-      // Check wildcard patterns first
-      if (wildcardPaths.length > 0) {
-        const shouldIgnore = wildcardPaths.some(path =>
-          violationDetails.includes(path),
-        )
-        if (shouldIgnore) return
-      }
-
-      // Check command-specific patterns
-      for (const [pattern, paths] of commandPatterns) {
-        if (command.includes(pattern)) {
-          const shouldIgnore = paths.some(path =>
-            violationDetails.includes(path),
-          )
-          if (shouldIgnore) return
-        }
-      }
-    }
-
-    // Not ignored - report the violation
-    callback({
-      line: violationDetails,
-      command,
-      encodedCommand,
-      timestamp: new Date(), // We could parse the timestamp from the log but this feels more reliable
-    })
   })
 
   logProcess.stderr?.on('data', (data: Buffer) => {
