@@ -394,17 +394,37 @@ export const CA_TRUST_VARS = [
   'NIX_SSL_CERT_FILE',
 ] as const
 
+export type ProxyAuthTokens =
+  | string
+  | {
+      readonly http?: string
+      readonly socks?: string
+      readonly ssh?: string
+    }
+
 export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
   caCertPath?: string,
-  proxyAuthToken?: string,
+  proxyAuthTokens?: ProxyAuthTokens,
   skipTmpdir?: boolean,
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
-  const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
+  const httpToken =
+    typeof proxyAuthTokens === 'string'
+      ? proxyAuthTokens
+      : proxyAuthTokens?.http
+  const socksToken =
+    typeof proxyAuthTokens === 'string'
+      ? proxyAuthTokens
+      : proxyAuthTokens?.socks
+  const sshToken =
+    typeof proxyAuthTokens === 'string' ? proxyAuthTokens : proxyAuthTokens?.ssh
+  const httpAuth = httpToken ? `srt:${httpToken}@` : ''
+  const socksAuth = socksToken ? `srt:${socksToken}@` : ''
+  const sshAuth = sshToken ? `,proxyauth=srt:${sshToken}` : ''
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
@@ -453,12 +473,12 @@ export function generateProxyEnvVars(
   envVars.push(`no_proxy=${noProxyAddresses}`)
 
   if (httpProxyPort) {
-    envVars.push(`HTTP_PROXY=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`HTTPS_PROXY=http://${auth}localhost:${httpProxyPort}`)
+    envVars.push(`HTTP_PROXY=http://${httpAuth}localhost:${httpProxyPort}`)
+    envVars.push(`HTTPS_PROXY=http://${httpAuth}localhost:${httpProxyPort}`)
     // Lowercase versions for compatibility with some tools
-    envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`)
-    if (proxyAuthToken) {
+    envVars.push(`http_proxy=http://${httpAuth}localhost:${httpProxyPort}`)
+    envVars.push(`https_proxy=http://${httpAuth}localhost:${httpProxyPort}`)
+    if (httpToken) {
       // Pre-send Basic so git never gets a 407 and never invokes a
       // credential helper for the proxy URL (Windows GCM intercepts the
       // challenge and the URL-embedded password doesn't survive it).
@@ -476,8 +496,8 @@ export function generateProxyEnvVars(
   // Falls back to socks5h:// only when no HTTP proxy port exists, which no
   // current caller configures.
   const allProxy = httpProxyPort
-    ? `http://${auth}localhost:${httpProxyPort}`
-    : `socks5h://${auth}localhost:${socksProxyPort}`
+    ? `http://${httpAuth}localhost:${httpProxyPort}`
+    : `socks5h://${socksAuth}localhost:${socksProxyPort}`
   envVars.push(`ALL_PROXY=${allProxy}`)
   envVars.push(`all_proxy=${allProxy}`)
 
@@ -504,15 +524,14 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
-      const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : ''
       envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${sshAuth}'`,
       )
     }
 
     // FTP proxy support (use socks5h for DNS resolution through proxy)
-    envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
-    envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(`FTP_PROXY=socks5h://${socksAuth}localhost:${socksProxyPort}`)
+    envVars.push(`ftp_proxy=socks5h://${socksAuth}localhost:${socksProxyPort}`)
 
     // rsync proxy support — RSYNC_PROXY is host:port only, no userinfo. With
     // proxy auth on, rsync via this var fails at the CONNECT (407); use SSH
@@ -525,10 +544,10 @@ export function generateProxyEnvVars(
     // Docker CLI uses HTTP for the API
     // This makes Docker use the HTTP proxy for registry operations
     envVars.push(
-      `DOCKER_HTTP_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTP_PROXY=http://${httpAuth}localhost:${httpProxyPort || socksProxyPort}`,
     )
     envVars.push(
-      `DOCKER_HTTPS_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTPS_PROXY=http://${httpAuth}localhost:${httpProxyPort || socksProxyPort}`,
     )
 
     // Kubernetes kubectl - uses standard HTTPS_PROXY
@@ -546,9 +565,9 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
-      if (proxyAuthToken) {
+      if (httpToken) {
         envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`)
-        envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
+        envVars.push(`CLOUDSDK_PROXY_PASSWORD=${httpToken}`)
       }
     }
 
@@ -559,8 +578,8 @@ export function generateProxyEnvVars(
     // Terraform respects HTTP_PROXY/HTTPS_PROXY which we already set above
 
     // gRPC-based tools - use standard proxy vars
-    envVars.push(`GRPC_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
-    envVars.push(`grpc_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(`GRPC_PROXY=socks5h://${socksAuth}localhost:${socksProxyPort}`)
+    envVars.push(`grpc_proxy=socks5h://${socksAuth}localhost:${socksProxyPort}`)
   }
 
   // Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs in the SOCKS-only path:

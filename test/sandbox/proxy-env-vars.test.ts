@@ -12,6 +12,58 @@ import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
+  it('keeps the legacy string token in every credential-bearing location', () => {
+    const env = generateProxyEnvVars(3128, 1080, undefined, 'legacy-token')
+
+    for (const prefix of [
+      'HTTP_PROXY=',
+      'HTTPS_PROXY=',
+      'ALL_PROXY=',
+      'FTP_PROXY=',
+      'DOCKER_HTTP_PROXY=',
+      'GRPC_PROXY=',
+    ]) {
+      expect(env.find(value => value.startsWith(prefix))).toContain(
+        'legacy-token',
+      )
+    }
+    expect(env).toContain('CLOUDSDK_PROXY_USERNAME=srt')
+    expect(env).toContain('CLOUDSDK_PROXY_PASSWORD=legacy-token')
+    if (process.platform === 'linux') {
+      expect(env.find(value => value.startsWith('GIT_SSH_COMMAND='))).toContain(
+        'legacy-token',
+      )
+    }
+  })
+
+  it('uses independent HTTP, SOCKS, and SSH credentials', () => {
+    const env = generateProxyEnvVars(3128, 1080, undefined, {
+      http: 'http-token',
+      socks: 'socks-token',
+      ssh: 'ssh-token',
+    })
+
+    expect(env.find(value => value.startsWith('HTTPS_PROXY='))).toContain(
+      'http-token',
+    )
+    expect(env.find(value => value.startsWith('ALL_PROXY='))).toContain(
+      'http-token',
+    )
+    expect(env.find(value => value.startsWith('FTP_PROXY='))).toContain(
+      'socks-token',
+    )
+    expect(env.find(value => value.startsWith('GRPC_PROXY='))).toContain(
+      'socks-token',
+    )
+    expect(env).toContain('CLOUDSDK_PROXY_PASSWORD=http-token')
+    if (process.platform === 'linux') {
+      expect(env.find(value => value.startsWith('GIT_SSH_COMMAND='))).toContain(
+        'ssh-token',
+      )
+    }
+    expect(env.join('\n')).not.toContain('[object Object]')
+  })
+
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
     // gcloud's proxy/type only accepts http, http_no_tunnel, socks4, socks5.
     // Our local proxy is an HTTP CONNECT proxy regardless of the traffic it
