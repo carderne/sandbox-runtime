@@ -23,6 +23,7 @@ import type {
 } from './sandbox-schemas.js'
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
+import type { LinuxWriteClassification } from './sandbox-attempt-types.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -79,10 +80,20 @@ export interface LinuxSandboxParams {
   observeSocketPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  cwd?: string
+  monitorCorrelation?: string
+  embedProxyEnvironment?: boolean
 }
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+function isPathAtOrUnder(candidate: string, prefix: string): boolean {
+  return (
+    candidate === prefix ||
+    candidate.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`)
+  )
+}
 
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
@@ -260,8 +271,8 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   abortSignal?: AbortSignal,
+  cwd: string = process.cwd(),
 ): Promise<string[]> {
-  const cwd = process.cwd()
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
@@ -845,6 +856,11 @@ function pushReadDenyDirMounts(
 /**
  * Generate filesystem bind mount arguments for bwrap
  */
+interface LinuxFilesystemBuildResult {
+  args: string[]
+  writeClassification: LinuxWriteClassification
+}
+
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
@@ -853,7 +869,8 @@ async function generateFilesystemArgs(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   abortSignal?: AbortSignal,
-): Promise<string[]> {
+  cwd?: string,
+): Promise<LinuxFilesystemBuildResult> {
   const args: string[] = []
   // fs already imported
 
@@ -869,6 +886,7 @@ async function generateFilesystemArgs(
   // symlink no longer matches them by string prefix. Both spellings name the
   // same inode once bwrap resolves them, so the comparisons below test both.
   const denyWriteRawDests = new Map<string, string>()
+  const classifiedDenyWritePaths = new Set<string>()
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -933,6 +951,7 @@ async function generateFilesystemArgs(
         ripgrepConfig,
         mandatoryDenySearchDepth,
         abortSignal,
+        cwd,
       )),
     ]
 
@@ -1102,6 +1121,7 @@ async function generateFilesystemArgs(
   } else {
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
+    allowedWritePaths.push('/')
   }
   // denyWriteArgs is emitted after the denyRead loop below.
 
@@ -1203,6 +1223,9 @@ async function generateFilesystemArgs(
   for (const { realPath, fakePath } of maskedFileBinds ?? []) {
     const dest = resolveSymlinkDenyDest(realPath)
     args.push('--ro-bind', fakePath, dest)
+    if (allowedWritePaths.some(prefix => isPathAtOrUnder(dest, prefix))) {
+      classifiedDenyWritePaths.add(dest)
+    }
     maskedFiles.set(dest, fakePath)
     maskedFiles.set(realPath, fakePath)
   }
@@ -1249,6 +1272,7 @@ async function generateFilesystemArgs(
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+    classifiedDenyWritePaths.add(dest)
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
@@ -1295,9 +1319,22 @@ async function generateFilesystemArgs(
   // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
   if (maskedFileStoreDir !== undefined) {
     args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+    if (
+      allowedWritePaths.some(prefix =>
+        isPathAtOrUnder(maskedFileStoreDir, prefix),
+      )
+    ) {
+      classifiedDenyWritePaths.add(maskedFileStoreDir)
+    }
   }
 
-  return args
+  return {
+    args,
+    writeClassification: {
+      allowWritePaths: [...allowedWritePaths],
+      denyWritePaths: [...classifiedDenyWritePaths],
+    },
+  }
 }
 
 /**
@@ -1348,9 +1385,15 @@ async function generateFilesystemArgs(
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
  */
-export async function wrapCommandWithSandboxLinux(
+export interface LinuxSandboxWrapResult {
+  command: string
+  sandboxBackend: 'none' | 'linux-bwrap' | 'linux-seccomp'
+  linuxWriteClassification?: LinuxWriteClassification
+}
+
+export async function prepareCommandWithSandboxLinux(
   params: LinuxSandboxParams,
-): Promise<string> {
+): Promise<LinuxSandboxWrapResult> {
   const {
     command,
     needsNetworkRestriction,
@@ -1376,6 +1419,9 @@ export async function wrapCommandWithSandboxLinux(
     socatPath,
     observeSocketPath,
     abortSignal,
+    cwd,
+    monitorCorrelation,
+    embedProxyEnvironment = true,
   } = params
 
   // Determine if we have restrictions to apply
@@ -1396,7 +1442,7 @@ export async function wrapCommandWithSandboxLinux(
     !hasWriteRestrictions &&
     !hasEnvRestrictions
   ) {
-    return command
+    return { command, sandboxBackend: 'none' }
   }
 
   // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
@@ -1446,11 +1492,22 @@ export async function wrapCommandWithSandboxLinux(
         bwrapArgs.push('--setenv', 'SRT_OBSERVE_SOCK', observeSocketPath)
         // Tag events with the encoded command so the violation store can
         // associate them with this invocation (parity with macOS log tag).
-        bwrapArgs.push(
-          '--setenv',
-          'SRT_ENCODED_CMD',
-          encodeSandboxedCommand(command),
-        )
+        if (monitorCorrelation !== undefined) {
+          if (!/^[A-Za-z0-9_-]{8,128}$/.test(monitorCorrelation)) {
+            throw new Error('invalid sandbox attempt monitor correlation')
+          }
+          bwrapArgs.push(
+            '--setenv',
+            'SRT_ATTEMPT_CORRELATION',
+            monitorCorrelation,
+          )
+        } else {
+          bwrapArgs.push(
+            '--setenv',
+            'SRT_ENCODED_CMD',
+            encodeSandboxedCommand(command),
+          )
+        }
       } else {
         logForDebugging(
           '[Sandbox Linux] observe socket missing — supervisor not running; ' +
@@ -1511,21 +1568,23 @@ export async function wrapCommandWithSandboxLinux(
         // Add proxy environment variables
         // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
         // which forwards to the Unix socket that bridges to the host's proxy server
-        const proxyEnv = generateProxyEnvVars(
-          3128, // Internal HTTP listener port
-          1080, // Internal SOCKS listener port
-          caCertPath,
-          proxyAuthToken,
-          writeConfig === undefined,
-        )
-        bwrapArgs.push(
-          ...proxyEnv.flatMap((env: string) => {
-            const firstEq = env.indexOf('=')
-            const key = env.slice(0, firstEq)
-            const value = env.slice(firstEq + 1)
-            return ['--setenv', key, value]
-          }),
-        )
+        if (embedProxyEnvironment) {
+          const proxyEnv = generateProxyEnvVars(
+            3128, // Internal HTTP listener port
+            1080, // Internal SOCKS listener port
+            caCertPath,
+            proxyAuthToken,
+            writeConfig === undefined,
+          )
+          bwrapArgs.push(
+            ...proxyEnv.flatMap((env: string) => {
+              const firstEq = env.indexOf('=')
+              const key = env.slice(0, firstEq)
+              const value = env.slice(firstEq + 1)
+              return ['--setenv', key, value]
+            }),
+          )
+        }
 
         // Add host proxy port environment variables for debugging/transparency
         // These show which host ports the Unix socket bridges connect to
@@ -1548,7 +1607,7 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const fsArgs = await generateFilesystemArgs(
+    const filesystem = await generateFilesystemArgs(
       readConfig,
       writeConfig,
       maskedFileBinds,
@@ -1556,8 +1615,9 @@ export async function wrapCommandWithSandboxLinux(
       ripgrepConfig,
       mandatoryDenySearchDepth,
       abortSignal,
+      cwd,
     )
-    bwrapArgs.push(...fsArgs)
+    bwrapArgs.push(...filesystem.args)
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
@@ -1641,7 +1701,11 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
-    return wrappedCommand
+    return {
+      command: wrappedCommand,
+      sandboxBackend: applySeccompPrefix ? 'linux-seccomp' : 'linux-bwrap',
+      linuxWriteClassification: filesystem.writeClassification,
+    }
   } catch (error) {
     // Undo the activeSandboxCount increment — the caller won't call
     // cleanupBwrapMountPoints() for a wrap that threw.
@@ -1650,4 +1714,10 @@ export async function wrapCommandWithSandboxLinux(
     }
     throw error
   }
+}
+
+export async function wrapCommandWithSandboxLinux(
+  params: LinuxSandboxParams,
+): Promise<string> {
+  return (await prepareCommandWithSandboxLinux(params)).command
 }

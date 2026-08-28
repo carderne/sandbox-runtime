@@ -1,9 +1,22 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
-import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  cleanupBwrapMountPoints,
+  prepareCommandWithSandboxLinux,
+  wrapCommandWithSandboxLinux,
+} from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  prepareCommandWithSandboxMacOS,
+  wrapCommandWithSandboxMacOS,
+} from '../../src/sandbox/macos-sandbox-utils.js'
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
@@ -24,6 +37,202 @@ function createTestConfig(): SandboxRuntimeConfig {
     },
   }
 }
+
+describe('structured platform wrapper results', () => {
+  it.if(isMacOS)(
+    'reports none or macos-seatbelt and uses an attempt tag',
+    () => {
+      const plain = prepareCommandWithSandboxMacOS({
+        command: 'echo ok',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: undefined,
+        monitorCorrelation: 'corr_1234567890',
+        embedProxyEnvironment: false,
+      })
+      expect(plain).toEqual({ command: 'echo ok', sandboxBackend: 'none' })
+
+      const wrapped = prepareCommandWithSandboxMacOS({
+        command: 'cat /private/blocked',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/private/blocked'] },
+        writeConfig: undefined,
+        monitorCorrelation: 'corr_1234567890',
+        embedProxyEnvironment: false,
+      })
+      expect(wrapped.sandboxBackend).toBe('macos-seatbelt')
+      expect(wrapped.command).toContain('SRTATTEMPT_corr_1234567890_END_')
+    },
+  )
+
+  it.if(isMacOS)(
+    'resolves mandatory project denies against the supplied cwd',
+    () => {
+      const attemptCwd = mkdtempSync(join(tmpdir(), 'srt-attempt-cwd-'))
+      try {
+        const result = prepareCommandWithSandboxMacOS({
+          command: 'echo ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: [attemptCwd], denyWithinAllow: [] },
+          cwd: attemptCwd,
+          monitorCorrelation: 'corr_1234567890',
+          embedProxyEnvironment: false,
+        })
+
+        expect(result.command).toContain(join(attemptCwd, '.mcp.json'))
+        expect(result.command).not.toContain(join(process.cwd(), '.mcp.json'))
+      } finally {
+        rmSync(attemptCwd, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(isMacOS)(
+    'keeps legacy proxy auth embedded but omits descriptor auth',
+    () => {
+      const legacy = wrapCommandWithSandboxMacOS({
+        command: 'curl https://example.com',
+        needsNetworkRestriction: true,
+        httpProxyPort: 3128,
+        socksProxyPort: 1080,
+        proxyAuthToken: 'session-token',
+        readConfig: { denyOnly: [] },
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      })
+      const attributed = prepareCommandWithSandboxMacOS({
+        command: 'curl https://example.com',
+        needsNetworkRestriction: true,
+        httpProxyPort: 3128,
+        socksProxyPort: 1080,
+        proxyAuthToken: 'attempt-token',
+        readConfig: { denyOnly: [] },
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        monitorCorrelation: 'corr_1234567890',
+        embedProxyEnvironment: false,
+      })
+
+      expect(legacy).toContain('session-token')
+      expect(attributed.command).not.toContain('attempt-token')
+    },
+  )
+
+  it.if(isLinux)(
+    'reports the emitted Linux backend and classification snapshot',
+    async () => {
+      const allowDir = mkdtempSync(join(tmpdir(), 'srt-write-classification-'))
+      const denyDir = join(allowDir, 'no')
+      const observer = join(allowDir, 'observer.sock')
+      mkdirSync(denyDir)
+      writeFileSync(observer, '')
+      try {
+        const result = await prepareCommandWithSandboxLinux({
+          command: 'echo ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: {
+            allowOnly: [allowDir],
+            denyWithinAllow: [denyDir],
+          },
+          observeSocketPath: observer,
+          seccompConfig: { applyPath: '/bin/true' },
+          monitorCorrelation: 'corr_1234567890',
+          proxyAuthToken: 'attempt-token',
+          embedProxyEnvironment: false,
+        })
+
+        expect(result.sandboxBackend).toBe('linux-seccomp')
+        expect(result.linuxWriteClassification).toEqual({
+          allowWritePaths: [allowDir],
+          denyWritePaths: [denyDir],
+        })
+        expect(result.command).toContain('SRT_ATTEMPT_CORRELATION')
+        expect(result.command).not.toContain('attempt-token')
+      } finally {
+        cleanupBwrapMountPoints()
+        rmSync(allowDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'classifies only write paths that produced writable binds',
+    async () => {
+      const allowDir = mkdtempSync(join(tmpdir(), 'srt-write-emitted-'))
+      const missing = join(allowDir, 'missing')
+      try {
+        const result = await prepareCommandWithSandboxLinux({
+          command: 'echo ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: {
+            allowOnly: [allowDir, missing],
+            denyWithinAllow: [],
+          },
+          allowAllUnixSockets: true,
+        })
+
+        expect(result.linuxWriteClassification?.allowWritePaths).toEqual([
+          allowDir,
+        ])
+      } finally {
+        cleanupBwrapMountPoints()
+        rmSync(allowDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'classifies a deny path by its resolved symlink target',
+    async () => {
+      const allowDir = mkdtempSync(join(tmpdir(), 'srt-write-symlink-'))
+      const target = join(allowDir, 'target')
+      const link = join(allowDir, 'link')
+      mkdirSync(target)
+      symlinkSync(target, link)
+      try {
+        const result = await prepareCommandWithSandboxLinux({
+          command: 'echo ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: {
+            allowOnly: [allowDir],
+            denyWithinAllow: [link],
+          },
+          allowAllUnixSockets: true,
+        })
+
+        expect(result.linuxWriteClassification?.denyWritePaths).toEqual([
+          target,
+        ])
+      } finally {
+        cleanupBwrapMountPoints()
+        rmSync(allowDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(isLinux)(
+    'classifies mandatory project denies under an allowed ancestor',
+    async () => {
+      try {
+        const result = await prepareCommandWithSandboxLinux({
+          command: 'echo ok',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: [process.cwd()], denyWithinAllow: [] },
+          allowAllUnixSockets: true,
+        })
+
+        expect(result.linuxWriteClassification?.denyWritePaths).toContain(
+          join(process.cwd(), '.git'),
+        )
+      } finally {
+        cleanupBwrapMountPoints()
+      }
+    },
+  )
+})
 
 describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
   beforeAll(async () => {

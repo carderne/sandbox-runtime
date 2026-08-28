@@ -51,14 +51,18 @@ export interface MacOSSandboxParams {
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
+  cwd?: string
+  monitorCorrelation?: string
+  embedProxyEnvironment?: boolean
 }
 
 /**
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(): string[] {
-  const cwd = process.cwd()
+export function macGetMandatoryDenyPatterns(
+  cwd: string = process.cwd(),
+): string[] {
   const denyPaths: string[] = []
 
   // Dangerous files - static paths in CWD + glob patterns for subtree
@@ -93,7 +97,13 @@ const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
  * Generate a unique log tag for sandbox monitoring
  * @param command - The command being executed (will be base64 encoded)
  */
-function generateLogTag(command: string): string {
+function generateLogTag(command: string, correlation?: string): string {
+  if (correlation !== undefined) {
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(correlation)) {
+      throw new Error('invalid sandbox attempt monitor correlation')
+    }
+    return `SRTATTEMPT_${correlation}_END_${sessionSuffix}`
+  }
   const encodedCommand = encodeSandboxedCommand(command)
   return `CMD64_${encodedCommand}_END_${sessionSuffix}`
 }
@@ -367,6 +377,7 @@ function generateReadRules(
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
+  cwd: string | undefined,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -399,7 +410,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(),
+    ...macGetMandatoryDenyPatterns(cwd),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -447,6 +458,7 @@ function generateSandboxProfile({
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
   logTag,
+  cwd,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
@@ -462,6 +474,7 @@ function generateSandboxProfile({
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   logTag: string
+  cwd?: string
 }): string {
   const profile: string[] = [
     '(version 1)',
@@ -741,7 +754,7 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag))
+  profile.push(...generateWriteRules(writeConfig, logTag, cwd))
 
   // Pseudo-terminal (pty) support
   if (allowPty) {
@@ -824,11 +837,16 @@ function escapePath(pathStr: string): string {
 }
 
 /**
- * Wrap command with macOS sandbox
+ * Prepare a command with macOS sandbox metadata.
  */
-export function wrapCommandWithSandboxMacOS(
+export interface MacOSSandboxWrapResult {
+  command: string
+  sandboxBackend: 'none' | 'macos-seatbelt'
+}
+
+export function prepareCommandWithSandboxMacOS(
   params: MacOSSandboxParams,
-): string {
+): MacOSSandboxWrapResult {
   const {
     command,
     needsNetworkRestriction,
@@ -850,6 +868,9 @@ export function wrapCommandWithSandboxMacOS(
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
+    cwd,
+    monitorCorrelation,
+    embedProxyEnvironment = true,
   } = params
 
   // SBPL cannot redirect a read to different bytes, so whole-file masking
@@ -888,10 +909,10 @@ export function wrapCommandWithSandboxMacOS(
     !hasWriteRestrictions &&
     !hasEnvRestrictions
   ) {
-    return command
+    return { command, sandboxBackend: 'none' }
   }
 
-  const logTag = generateLogTag(command)
+  const logTag = generateLogTag(command, monitorCorrelation)
 
   const profile = generateSandboxProfile({
     readConfig,
@@ -908,16 +929,19 @@ export function wrapCommandWithSandboxMacOS(
     enableWeakerNetworkIsolation,
     allowAppleEvents,
     logTag,
+    cwd,
   })
 
   // Generate proxy environment variables using shared utility
-  const proxyEnvArgs = generateProxyEnvVars(
-    httpProxyPort,
-    socksProxyPort,
-    caCertPath,
-    proxyAuthToken,
-    writeConfig === undefined,
-  )
+  const proxyEnvArgs = embedProxyEnvironment
+    ? generateProxyEnvVars(
+        httpProxyPort,
+        socksProxyPort,
+        caCertPath,
+        proxyAuthToken,
+        writeConfig === undefined,
+      )
+    : []
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the
   // allowLocalBinding outbound rule above — matches 127.0.0.1 and ::1 but not
@@ -988,7 +1012,16 @@ export function wrapCommandWithSandboxMacOS(
     }`,
   )
 
-  return wrappedCommand
+  return { command: wrappedCommand, sandboxBackend: 'macos-seatbelt' }
+}
+
+/**
+ * Wrap command with macOS sandbox using the legacy string result.
+ */
+export function wrapCommandWithSandboxMacOS(
+  params: MacOSSandboxParams,
+): string {
+  return prepareCommandWithSandboxMacOS(params).command
 }
 
 /**
