@@ -7,16 +7,21 @@ import { join } from 'node:path'
 
 import { isLinux } from '../helpers/platform.js'
 import {
+  MAX_OBSERVER_FRAME_BYTES,
   startLinuxSandboxViolationMonitor,
   type LinuxViolationMonitor,
 } from '../../src/sandbox/linux-violation-monitor.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
 
-const d = isLinux ? describe : describe.skip
-
-d('linux-violation-monitor (listener)', () => {
+describe('linux-violation-monitor (listener)', () => {
   let mon: LinuxViolationMonitor
   const violations: { line: string; encodedCommand?: string }[] = []
+  const attributed: Array<{
+    correlation: string
+    operation: string
+    path: string
+  }> = []
+  const active = new Set(['corr_abcdefgh'])
   const allow = '/tmp/srt-test-allow'
   const deny = '/tmp/srt-test-allow/deny'
 
@@ -24,37 +29,64 @@ d('linux-violation-monitor (listener)', () => {
     mon = startLinuxSandboxViolationMonitor(
       v => violations.push({ line: v.line, encodedCommand: v.encodedCommand }),
       { allowWritePaths: [allow, '/dev'], denyWritePaths: [deny] },
+      {
+        hasActiveCorrelation: correlation => active.has(correlation),
+        recordAttemptDenial: (correlation, operation, path) => {
+          attributed.push({ correlation, operation, path })
+          if (path === '/deactivate-after-first') active.delete(correlation)
+        },
+      },
     )
     await mon.ready
   })
   afterAll(() => mon.stop())
 
-  /** Simulate apply-seccomp's outer stub: connect and write JSON lines. */
-  const send = (lines: string[]): Promise<void> =>
+  /** Simulate apply-seccomp's outer stub with arbitrary transport chunks. */
+  const sendChunks = (chunks: Array<string | Buffer>): Promise<void> =>
     new Promise((res, rej) => {
       const c = connect(mon.observeSocketPath!, () => {
-        c.write(lines.join('\n') + '\n')
+        for (const chunk of chunks) c.write(chunk)
         c.end()
       })
-      c.on('close', () => res())
+      c.on('close', () => setTimeout(res, 10))
       c.on('error', rej)
     })
+
+  const send = (lines: unknown[]): Promise<void> =>
+    sendChunks(lines.map(line => JSON.stringify(line) + '\n'))
 
   it('binds a filesystem unix socket', () => {
     expect(mon.observeSocketPath).toBeDefined()
     expect(existsSync(mon.observeSocketPath!)).toBe(true)
   })
 
-  it('filters allowed writes, surfaces denied writes', async () => {
+  it('routes attributed events and retains legacy classification', async () => {
     violations.length = 0
+    attributed.length = 0
     await send([
-      JSON.stringify({ encodedCommand: 'dGVzdA==' }), // base64("test")
-      JSON.stringify({ nr: 257, syscall: 'openat', path: `${allow}/ok` }),
-      JSON.stringify({ nr: 257, syscall: 'openat', path: '/dev/null' }),
-      JSON.stringify({ nr: 257, syscall: 'openat', path: `${deny}/bad` }),
-      JSON.stringify({ nr: 263, syscall: 'unlinkat', path: '/etc/passwd' }),
+      { attemptCorrelation: 'corr_abcdefgh' },
+      { nr: 257, syscall: 'openat', path: `${allow}/attempt` },
+      { nr: 263, syscall: 'unlinkat', path: '/etc/attempt' },
     ])
-    await new Promise(r => setTimeout(r, 50))
+    await send([
+      { encodedCommand: 'dGVzdA==' },
+      { nr: 257, syscall: 'openat', path: `${allow}/ok` },
+      { nr: 257, syscall: 'openat', path: '/dev/null' },
+      { nr: 257, syscall: 'openat', path: `${deny}/bad` },
+      { nr: 263, syscall: 'unlinkat', path: '/etc/passwd' },
+    ])
+    expect(attributed).toEqual([
+      {
+        correlation: 'corr_abcdefgh',
+        operation: 'openat',
+        path: `${allow}/attempt`,
+      },
+      {
+        correlation: 'corr_abcdefgh',
+        operation: 'unlinkat',
+        path: '/etc/attempt',
+      },
+    ])
     expect(violations.map(v => v.line)).toEqual([
       `deny openat ${deny}/bad`,
       'deny unlinkat /etc/passwd',
@@ -62,28 +94,68 @@ d('linux-violation-monitor (listener)', () => {
     expect(violations[0].encodedCommand).toBe('dGVzdA==')
   })
 
-  it('drops unresolved relative paths instead of guessing', async () => {
-    // apply-seccomp resolves relative paths before emitting; a relative
-    // path here means resolution failed. Best-effort telemetry: never
-    // classify what could not be evaluated against policy.
-    violations.length = 0
+  it('drops inactive, malformed, overlong, and unsupported attributed data', async () => {
+    attributed.length = 0
     await send([
-      JSON.stringify({ nr: 83, syscall: 'mkdir', path: 'rel/dir' }),
-      JSON.stringify({ nr: 257, syscall: 'openat', path: '/etc/passwd' }),
+      { attemptCorrelation: 'inactive_corr' },
+      { syscall: 'openat', path: '/inactive' },
     ])
-    await new Promise(r => setTimeout(r, 50))
-    expect(violations.map(v => v.line)).toEqual(['deny openat /etc/passwd'])
+    await send([
+      { attemptCorrelation: 'corr_abcdefgh' },
+      { syscall: 'openat', path: 'relative' },
+      { syscall: 'read', path: '/unsupported' },
+      { syscall: 'openat', path: `/${'p'.repeat(4096)}` },
+      'not-an-object',
+      [{ syscall: 'openat', path: '/array' }],
+    ])
+    await send([
+      { attemptCorrelation: 'x'.repeat(129) },
+      { syscall: 'openat', path: '/overlong-correlation' },
+    ])
+    expect(attributed).toEqual([])
   })
 
-  it('normalizes ./ and ../ segments before the policy check', async () => {
+  it('checks correlation activity again before every attributed event', async () => {
+    attributed.length = 0
+    await send([
+      { attemptCorrelation: 'corr_abcdefgh' },
+      { syscall: 'openat', path: '/deactivate-after-first' },
+      { syscall: 'openat', path: '/closed' },
+    ])
+    active.add('corr_abcdefgh')
+    expect(attributed.map(event => event.path)).toEqual([
+      '/deactivate-after-first',
+    ])
+  })
+
+  it('handles split/coalesced frames and recovers after an oversized frame', async () => {
+    attributed.length = 0
+    const header = '{"attemptCorrelation":"corr_abcdefgh"}\n'
+    await sendChunks([
+      header.slice(0, 9),
+      header.slice(9),
+      '{"syscall":"openat","path":"/split"}\n' +
+        '{"syscall":"unlinkat","path":"/coalesced"}\n',
+    ])
+    await sendChunks([
+      Buffer.alloc(MAX_OBSERVER_FRAME_BYTES + 1, 0x61),
+      '\n' + header + '{"syscall":"mkdirat","path":"/after-oversized"}\n',
+    ])
+    expect(attributed.map(event => event.path)).toEqual([
+      '/split',
+      '/coalesced',
+      '/after-oversized',
+    ])
+  })
+
+  it('drops relative legacy paths and normalizes policy comparisons', async () => {
     violations.length = 0
     await send([
-      // inside allow once collapsed → not a violation
-      JSON.stringify({ syscall: 'openat', path: `${allow}/sub/../ok` }),
-      // escapes allow once collapsed → violation, reported as spelled
-      JSON.stringify({ syscall: 'openat', path: `${allow}/../escape` }),
+      { encodedCommand: 'dGVzdA==' },
+      { nr: 83, syscall: 'mkdir', path: 'rel/dir' },
+      { syscall: 'openat', path: `${allow}/sub/../ok` },
+      { syscall: 'openat', path: `${allow}/../escape` },
     ])
-    await new Promise(r => setTimeout(r, 50))
     expect(violations.map(v => v.line)).toEqual([
       `deny openat ${allow}/../escape`,
     ])
@@ -92,11 +164,10 @@ d('linux-violation-monitor (listener)', () => {
   it('handles concurrent connections (one per command)', async () => {
     violations.length = 0
     await Promise.all([
-      send([JSON.stringify({ syscall: 'openat', path: '/a' })]),
-      send([JSON.stringify({ syscall: 'openat', path: '/b' })]),
-      send([JSON.stringify({ syscall: 'openat', path: '/c' })]),
+      send([{ encodedCommand: 'YQ==' }, { syscall: 'openat', path: '/a' }]),
+      send([{ encodedCommand: 'Yg==' }, { syscall: 'openat', path: '/b' }]),
+      send([{ encodedCommand: 'Yw==' }, { syscall: 'openat', path: '/c' }]),
     ])
-    await new Promise(r => setTimeout(r, 50))
     expect(violations.map(v => v.line).sort()).toEqual([
       'deny openat /a',
       'deny openat /b',
@@ -104,15 +175,16 @@ d('linux-violation-monitor (listener)', () => {
     ])
   })
 
-  it('ignores malformed lines and observe_init_error', async () => {
+  it('ignores malformed frames and observe_init_error', async () => {
     violations.length = 0
-    await send([
+    await sendChunks([
       'not json',
-      JSON.stringify({ observe_init_error: 'seccomp: EINVAL' }),
-      JSON.stringify({ nr: 257 }), // no path
-      JSON.stringify({ syscall: 'openat', path: '/x' }),
+      '\n',
+      JSON.stringify({ encodedCommand: 'dGVzdA==' }) + '\n',
+      JSON.stringify({ observe_init_error: 'seccomp: EINVAL' }) + '\n',
+      JSON.stringify({ nr: 257 }) + '\n',
+      JSON.stringify({ syscall: 'openat', path: '/x' }) + '\n',
     ])
-    await new Promise(r => setTimeout(r, 50))
     expect(violations.map(v => v.line)).toEqual(['deny openat /x'])
   })
 })
@@ -128,13 +200,22 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
   const deny = join(work, 'ro')
   let mon: LinuxViolationMonitor
   const violations: string[] = []
+  const attributed: Array<{ operation: string; path: string }> = []
 
   beforeAll(async () => {
     spawnSync('mkdir', ['-p', allow, deny])
-    mon = startLinuxSandboxViolationMonitor(v => violations.push(v.line), {
-      allowWritePaths: [allow, '/dev'],
-      denyWritePaths: [deny],
-    })
+    mon = startLinuxSandboxViolationMonitor(
+      v => violations.push(v.line),
+      {
+        allowWritePaths: [allow, '/dev'],
+        denyWritePaths: [deny],
+      },
+      {
+        hasActiveCorrelation: correlation => correlation === 'corr_abcdefgh',
+        recordAttemptDenial: (_correlation, operation, path) =>
+          attributed.push({ operation, path }),
+      },
+    )
     await mon.ready
   })
   afterAll(() => {
@@ -150,6 +231,7 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
         env: {
           ...process.env,
           SRT_OBSERVE_SOCK: mon.observeSocketPath!,
+          SRT_ENCODED_CMD: 'dGVzdA==',
         },
       },
     )
@@ -170,7 +252,13 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
         // the deny dir — both spelled relative, resolved by the supervisor.
         `cd ${allow} && echo a > rel-ok.txt && echo b > ../ro/rel-bad.txt`,
       ],
-      { env: { ...process.env, SRT_OBSERVE_SOCK: mon.observeSocketPath! } },
+      {
+        env: {
+          ...process.env,
+          SRT_OBSERVE_SOCK: mon.observeSocketPath!,
+          SRT_ENCODED_CMD: 'dGVzdA==',
+        },
+      },
     )
     expect(r.status).toBe(0)
     await new Promise(r => setTimeout(r, 100))
@@ -181,6 +269,28 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     const bad = violations.find(v => v.includes('rel-bad.txt'))
     expect(bad).toBeDefined()
     expect(bad).toContain(`deny openat ${allow}/../ro/rel-bad.txt`)
+  })
+
+  it('emits attempt correlation through the real observer protocol', async () => {
+    attributed.length = 0
+    const r = spawnSync(
+      applyPath!,
+      ['/bin/sh', '-c', `echo x > ${deny}/attr`],
+      {
+        env: {
+          ...process.env,
+          SRT_OBSERVE_SOCK: mon.observeSocketPath!,
+          SRT_ATTEMPT_CORRELATION: 'corr_abcdefgh',
+          SRT_ENCODED_CMD: 'must-not-win',
+        },
+      },
+    )
+    expect(r.status).toBe(0)
+    await new Promise(r => setTimeout(r, 100))
+    expect(attributed).toContainEqual({
+      operation: 'openat',
+      path: `${deny}/attr`,
+    })
   })
 
   it('does not hang when the listener stops reading (full pipe drops)', () => {

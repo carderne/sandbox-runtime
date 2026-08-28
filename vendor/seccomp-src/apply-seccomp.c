@@ -441,13 +441,23 @@ static size_t resolve_relative(int host_proc_fd, pid_t pid,
 }
 
 static void emit_event(int out, const struct observe_call *oc, int nr, pid_t pid,
-                       const char *path, size_t pathlen, const char *enc) {
+                       const char *path, size_t pathlen, const char *enc,
+                       const char *attempt_correlation) {
     if (out < 0) return;
     char esc[OBS_LINE_CAP];
     json_escape_into(esc, sizeof(esc), path, pathlen);
-    char line[OBS_LINE_CAP + 512];
+    char line[OBS_LINE_CAP + 1024];
     int n;
-    if (enc && *enc) {
+    if (attempt_correlation && *attempt_correlation) {
+        char corr_esc[128 * 6 + 1];
+        size_t corr_len = strnlen(attempt_correlation, 128);
+        json_escape_into(corr_esc, sizeof(corr_esc),
+                         attempt_correlation, corr_len);
+        n = snprintf(line, sizeof(line),
+                     "{\"nr\":%d,\"syscall\":\"%s\",\"pid\":%d,\"path\":\"%s\","
+                     "\"attemptCorrelation\":\"%s\"}\n",
+                     nr, oc ? oc->name : "syscall", (int)pid, esc, corr_esc);
+    } else if (enc && *enc) {
         n = snprintf(line, sizeof(line),
                      "{\"nr\":%d,\"syscall\":\"%s\",\"pid\":%d,\"path\":\"%s\","
                      "\"encodedCommand\":\"%s\"}\n",
@@ -486,7 +496,8 @@ static int connect_observe_sock(const char *path) {
  * STUB, which never installed either seccomp filter. Always replies CONTINUE,
  * even when out_sock < 0, so a missing listener never wedges the workload. */
 static void supervise(pid_t child, int notify_fd, int out_sock,
-                      const char *enc, int host_proc_fd) {
+                      const char *enc, const char *attempt_correlation,
+                      int host_proc_fd) {
     struct seccomp_notif_sizes sz;
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sz) < 0) {
         sz.seccomp_notif = sizeof(struct seccomp_notif);
@@ -550,7 +561,8 @@ static void supervise(pid_t child, int notify_fd, int out_sock,
                 for (int k = 0; k < 2; k++) {
                     if (flen[k] > 0) {
                         emit_event(out_sock, oc, req->data.nr, req->pid,
-                                   k == 0 ? fbuf1 : fbuf2, flen[k], enc);
+                                   k == 0 ? fbuf1 : fbuf2, flen[k], enc,
+                                   attempt_correlation);
                     }
                 }
             } else if (errno != EINTR && errno != ENOENT) {
@@ -675,6 +687,7 @@ int main(int argc, char *argv[]) {
     /* ---- Optional observation: pre-fork setup --------------------------- */
     const char *observe_sock = getenv("SRT_OBSERVE_SOCK");
     const char *encoded_cmd  = getenv("SRT_ENCODED_CMD");
+    const char *attempt_correlation = getenv("SRT_ATTEMPT_CORRELATION");
     int sp[2] = { -1, -1 };
     if (observe_sock && *observe_sock && SRT_AUDIT_ARCH != 0) {
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) < 0) {
@@ -756,6 +769,18 @@ int main(int argc, char *argv[]) {
                         "{\"observe_init_error\":\"connect %s: %s\"}\n",
                         observe_sock, strerror(errno));
                     (void)!write(2, buf, (size_t)n);
+                } else if (attempt_correlation && *attempt_correlation) {
+                    char corr_esc[128 * 6 + 1];
+                    size_t corr_len = strnlen(attempt_correlation, 128);
+                    json_escape_into(corr_esc, sizeof(corr_esc),
+                                     attempt_correlation, corr_len);
+                    char hdr[sizeof(corr_esc) + 32];
+                    int n = snprintf(hdr, sizeof(hdr),
+                        "{\"attemptCorrelation\":\"%s\"}\n", corr_esc);
+                    if (n > 0) {
+                        (void)!send(out, hdr, (size_t)n,
+                                    MSG_DONTWAIT | MSG_NOSIGNAL);
+                    }
                 } else if (encoded_cmd && *encoded_cmd) {
                     char hdr[768];
                     int n = snprintf(hdr, sizeof(hdr),
@@ -765,7 +790,8 @@ int main(int argc, char *argv[]) {
                                     MSG_DONTWAIT | MSG_NOSIGNAL);
                     }
                 }
-                supervise(child, notify_fd, out, encoded_cmd, host_proc_fd);
+                supervise(child, notify_fd, out, encoded_cmd,
+                          attempt_correlation, host_proc_fd);
                 if (out >= 0) close(out);
                 close(notify_fd);
             }
@@ -835,6 +861,7 @@ int main(int argc, char *argv[]) {
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
+    unsetenv("SRT_ATTEMPT_CORRELATION");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }

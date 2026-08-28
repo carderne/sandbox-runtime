@@ -3,13 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, posix } from 'node:path'
-import { createInterface } from 'node:readline'
 
 import { logForDebugging } from '../utils/debug.js'
-import type {
-  SandboxViolationCallback,
-  SandboxViolationEvent,
-} from './macos-sandbox-utils.js'
+import type { SandboxViolationCallback } from './macos-sandbox-utils.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
 import { decodeSandboxedCommand } from './sandbox-utils.js'
 
@@ -27,6 +23,15 @@ export interface LinuxViolationMonitorOptions {
   ignoreViolations?: IgnoreViolationsConfig
 }
 
+export interface LinuxAttemptViolationRouting {
+  hasActiveCorrelation(correlation: string): boolean
+  recordAttemptDenial(
+    correlation: string,
+    operation: string,
+    path: string,
+  ): void
+}
+
 export interface LinuxViolationMonitor {
   /** Filesystem unix-socket path the listener is bound to. Bind-mount this
    *  into each bwrap sandbox and pass it to apply-seccomp via
@@ -38,14 +43,44 @@ export interface LinuxViolationMonitor {
   stop: () => void
 }
 
-interface ObserveEvent {
-  nr?: number
-  syscall?: string
-  pid?: number
-  path?: string
-  encodedCommand?: string
-  observe_init_error?: string
-}
+export const MAX_OBSERVER_FRAME_BYTES = 16 * 1024
+const MAX_CORRELATION_CHARS = 128
+const MAX_OBSERVER_PATH_CHARS = 4096
+const ATTEMPT_CORRELATION_REGEX = /^[A-Za-z0-9_-]{8,128}$/
+const SUPPORTED_OPERATIONS = new Set([
+  'openat',
+  'openat2',
+  'unlinkat',
+  'mkdirat',
+  'mknodat',
+  'symlinkat',
+  'linkat',
+  'renameat',
+  'renameat2',
+  'fchmodat',
+  'fchmodat2',
+  'fchownat',
+  'utimensat',
+  'open',
+  'creat',
+  'unlink',
+  'rmdir',
+  'rename',
+  'link',
+  'symlink',
+  'mkdir',
+  'mknod',
+  'truncate',
+  'chmod',
+  'chown',
+  'lchown',
+  'utime',
+  'utimes',
+])
+
+type ConnectionAttribution =
+  | { kind: 'attempt'; correlation: string; activeAtHeader: boolean }
+  | { kind: 'legacy'; encodedCommand: string }
 
 /**
  * Linux equivalent of {@link startMacOSSandboxLogMonitor}. Creates a single
@@ -71,6 +106,7 @@ interface ObserveEvent {
 export function startLinuxSandboxViolationMonitor(
   callback: SandboxViolationCallback,
   opts: LinuxViolationMonitorOptions,
+  attemptRouting?: LinuxAttemptViolationRouting,
 ): LinuxViolationMonitor {
   const { allowWritePaths, denyWritePaths, ignoreViolations } = opts
 
@@ -110,39 +146,51 @@ export function startLinuxSandboxViolationMonitor(
   }
 
   const handleEvent = (
-    ev: ObserveEvent,
-    encodedCommand: string | undefined,
+    ev: Record<string, unknown>,
+    attribution: ConnectionAttribution,
   ): void => {
-    if (ev.observe_init_error) {
-      logForDebugging(
-        `[Sandbox Linux Monitor] observe filter not installed: ${ev.observe_init_error}`,
-      )
+    if (typeof ev.observe_init_error === 'string') {
+      logForDebugging('[Sandbox Linux Monitor] observe filter not installed')
       return
     }
-    if (typeof ev.path !== 'string') return
-    // Only resolved absolute paths are classifiable. Anything else means
-    // resolution failed upstream (or an old producer): this channel is
-    // best-effort telemetry, so drop rather than guess.
-    if (!ev.path.startsWith('/')) return
-    if (!isDenied(ev.path)) return
+    if (
+      typeof ev.syscall !== 'string' ||
+      !SUPPORTED_OPERATIONS.has(ev.syscall) ||
+      typeof ev.path !== 'string' ||
+      ev.path.length > MAX_OBSERVER_PATH_CHARS ||
+      !posix.isAbsolute(ev.path)
+    ) {
+      return
+    }
 
-    let command: string | undefined
-    if (encodedCommand) {
-      try {
-        command = decodeSandboxedCommand(encodedCommand)
-      } catch {
-        /* ignore */
+    if (attribution.kind === 'attempt') {
+      if (
+        attribution.activeAtHeader &&
+        attemptRouting?.hasActiveCorrelation(attribution.correlation)
+      ) {
+        attemptRouting.recordAttemptDenial(
+          attribution.correlation,
+          ev.syscall,
+          ev.path,
+        )
       }
+      return
+    }
+
+    if (!isDenied(ev.path)) return
+    let command: string | undefined
+    try {
+      command = decodeSandboxedCommand(attribution.encodedCommand)
+    } catch {
+      /* retain legacy violation reporting without decoded command text */
     }
     if (shouldIgnore(ev.path, command)) return
-
-    const violation: SandboxViolationEvent = {
-      line: `deny ${ev.syscall ?? 'syscall'} ${ev.path}`,
+    callback({
+      line: `deny ${ev.syscall} ${ev.path}`,
       command,
-      encodedCommand,
+      encodedCommand: attribution.encodedCommand,
       timestamp: new Date(),
-    }
-    callback(violation)
+    })
   }
 
   let resolveReady: () => void
@@ -153,26 +201,76 @@ export function startLinuxSandboxViolationMonitor(
   let observeSocketPath: string | undefined = sockPath
 
   const server: Server = createServer(conn => {
-    let encodedCommand: string | undefined
-    const rl = createInterface({ input: conn })
-    rl.on('line', raw => {
-      if (!raw) return
-      let ev: ObserveEvent
+    let attribution: ConnectionAttribution | undefined
+    let buffered: Buffer = Buffer.alloc(0)
+    let discardUntilNewline = false
+
+    const handleFrame = (frame: Buffer): void => {
+      if (frame.length === 0 || frame.length > MAX_OBSERVER_FRAME_BYTES) return
+      let value: unknown
       try {
-        ev = JSON.parse(raw) as ObserveEvent
+        value = JSON.parse(frame.toString('utf8')) as unknown
       } catch {
         return
       }
-      // First line from each apply-seccomp instance is the encodedCommand
-      // header; subsequent lines may also carry it but the header is
-      // authoritative for this connection.
-      if (ev.encodedCommand && encodedCommand === undefined) {
-        encodedCommand = ev.encodedCommand
+      if (!isRecord(value)) return
+
+      if (!attribution) {
+        const correlation = value.attemptCorrelation
+        const encodedCommand = value.encodedCommand
+        if (
+          typeof correlation === 'string' &&
+          encodedCommand === undefined &&
+          correlation.length <= MAX_CORRELATION_CHARS &&
+          ATTEMPT_CORRELATION_REGEX.test(correlation)
+        ) {
+          attribution = {
+            kind: 'attempt',
+            correlation,
+            activeAtHeader:
+              attemptRouting?.hasActiveCorrelation(correlation) ?? false,
+          }
+        } else if (
+          typeof encodedCommand === 'string' &&
+          encodedCommand.length > 0 &&
+          correlation === undefined &&
+          Buffer.byteLength(encodedCommand, 'utf8') <= MAX_OBSERVER_FRAME_BYTES
+        ) {
+          attribution = { kind: 'legacy', encodedCommand }
+        }
+        return
       }
-      handleEvent(ev, encodedCommand ?? ev.encodedCommand)
+
+      handleEvent(value, attribution)
+    }
+
+    conn.on('data', (chunk: Buffer) => {
+      buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk
+      for (;;) {
+        const newline = buffered.indexOf(0x0a)
+        if (discardUntilNewline) {
+          if (newline < 0) {
+            buffered = Buffer.alloc(0)
+            return
+          }
+          buffered = buffered.subarray(newline + 1)
+          discardUntilNewline = false
+          continue
+        }
+        if (newline >= 0) {
+          const frame = buffered.subarray(0, newline)
+          buffered = buffered.subarray(newline + 1)
+          handleFrame(frame)
+          continue
+        }
+        if (buffered.length > MAX_OBSERVER_FRAME_BYTES) {
+          buffered = Buffer.alloc(0)
+          discardUntilNewline = true
+        }
+        return
+      }
     })
-    conn.on('error', () => rl.close())
-    conn.on('close', () => rl.close())
+    conn.on('error', () => {})
   })
 
   server.on('error', err => {
@@ -209,4 +307,8 @@ export function startLinuxSandboxViolationMonitor(
     ready,
     stop,
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
