@@ -75,6 +75,7 @@ export async function decideAndRespond(
   res: ServerResponse,
   url: string,
   signal: AbortSignal,
+  onPolicyDenied?: () => void,
 ): Promise<Readable | null> {
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
@@ -126,6 +127,7 @@ export async function decideAndRespond(
     return forUpstream
   }
 
+  onPolicyDenied?.()
   deny(res, decision)
   forUpstream.destroy()
   return null

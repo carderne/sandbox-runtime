@@ -120,6 +120,7 @@ export function terminateAndForward(
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
+  onPolicyDenied?: () => void,
 ): void {
   // ALPN advertises HTTP/1.1 only — terminating HTTP/2 would require a frame
   // parser; clients negotiate down. The base secureContext covers clients
@@ -139,7 +140,14 @@ export function terminateAndForward(
   })
 
   inner.on('request', (req, res) => {
-    void forwardUpstream(filterRequest, mutateHeaders, req, res, target)
+    void forwardUpstream(
+      filterRequest,
+      mutateHeaders,
+      req,
+      res,
+      target,
+      onPolicyDenied,
+    )
   })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
@@ -201,6 +209,7 @@ async function forwardUpstream(
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
+  onPolicyDenied?: () => void,
 ): Promise<void> {
   // req.url is the request-target verbatim. Inside a CONNECT tunnel almost
   // every client sends origin-form (`/path?q`), but RFC 7230 §5.3.2 also
@@ -239,6 +248,7 @@ async function forwardUpstream(
       res,
       `https://${host}${path}`,
       ac.signal,
+      onPolicyDenied,
     )
     if (out === null) return
     body = out

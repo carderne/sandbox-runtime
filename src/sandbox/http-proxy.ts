@@ -18,6 +18,7 @@ import {
   terminateAndForward,
 } from './tls-terminate-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import type { AuthenticatedAttemptCredential } from './sandbox-attempt-types.js'
 import {
   connectViaParentProxy,
   dialDirect,
@@ -111,18 +112,35 @@ export interface HttpProxyServerOptions {
    * and reach the filter callback.
    */
   proxyAuthToken?: string
+
+  /** Resolve an active per-attempt proxy credential for denial attribution. */
+  resolveAttemptProxyToken?: (
+    token: string,
+  ) => AuthenticatedAttemptCredential | undefined
 }
+
+type ProxyAuthentication =
+  | { authenticated: false }
+  | { authenticated: true; attempt?: AuthenticatedAttemptCredential }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
-  const checkAuth = (got: string | undefined): boolean => {
-    if (!options.proxyAuthToken) return true
+  const checkAuth = (got: string | undefined): ProxyAuthentication => {
+    if (!options.proxyAuthToken && !options.resolveAttemptProxyToken) {
+      return { authenticated: true }
+    }
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
-    if (!m) return false
+    if (!m) return { authenticated: false }
     const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
     const sep = decoded.indexOf(':')
-    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+    if (sep <= 0) return { authenticated: false }
+    const token = decoded.slice(sep + 1)
+    if (options.proxyAuthToken && token === options.proxyAuthToken) {
+      return { authenticated: true }
+    }
+    const attempt = options.resolveAttemptProxyToken?.(token)
+    return attempt ? { authenticated: true, attempt } : { authenticated: false }
   }
 
   // Handle CONNECT requests for HTTPS traffic
@@ -139,7 +157,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.authenticated) {
         socket.end(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
@@ -158,6 +177,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(port, hostname, socket)
       if (!allowed) {
+        auth.attempt?.recordNetworkDenial('http-proxy')
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -203,6 +223,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             socket,
             peeked.head,
             { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            () => auth.attempt?.recordNetworkDenial('http-proxy'),
           )
           return
         }
@@ -309,7 +330,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.end(options.mitmCA.crlDer)
         return
       }
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.authenticated) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()
         return
@@ -324,6 +346,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(port, hostname, req.socket)
       if (!allowed) {
+        auth.attempt?.recordNetworkDenial('http-proxy')
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -371,6 +394,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res,
           absUrl,
           ac.signal,
+          () => auth.attempt?.recordNetworkDenial('http-proxy'),
         )
         if (out === null) return
         body = out

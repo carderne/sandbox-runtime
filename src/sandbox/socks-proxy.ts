@@ -2,6 +2,7 @@ import type { Socket } from 'net'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import type { AuthenticatedAttemptCredential } from './sandbox-attempt-types.js'
 import {
   connectViaParentProxy,
   dialDirect,
@@ -26,6 +27,14 @@ export interface SocksProxyServerOptions {
    * user "srt" with this token as the password.
    */
   proxyAuthToken?: string
+
+  /** Resolve an active per-attempt proxy credential for denial attribution. */
+  resolveAttemptProxyToken?: (
+    token: string,
+  ) => AuthenticatedAttemptCredential | undefined
+
+  /** Allow legacy SOCKS clients that do not offer username/password auth. */
+  allowUnauthenticated?: boolean
 }
 
 export interface SocksProxyWrapper {
@@ -45,20 +54,36 @@ export interface SocksProxyWrapper {
 export function createSocksProxyServer(
   options: SocksProxyServerOptions,
 ): SocksProxyWrapper {
-  const socksServer = createServer()
+  const authenticatedServer = createServer()
+  const unauthenticatedServer = createServer()
+  const allowUnauthenticated =
+    options.allowUnauthenticated ?? !options.proxyAuthToken
+  const attemptByConnection = new WeakMap<
+    object,
+    AuthenticatedAttemptCredential
+  >()
 
-  if (options.proxyAuthToken) {
-    socksServer.setAuthHandler((conn, accept, deny) => {
-      if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
+  authenticatedServer.setAuthHandler((conn, accept, deny) => {
+    if (conn.username === 'srt') {
+      if (conn.password === options.proxyAuthToken) {
         accept()
-      } else {
-        logForDebugging('SOCKS auth rejected', { level: 'error' })
-        deny()
+        return
       }
-    })
-  }
+      const attempt = options.resolveAttemptProxyToken?.(conn.password)
+      if (attempt) {
+        attemptByConnection.set(conn, attempt)
+        accept()
+        return
+      }
+    }
+    logForDebugging('SOCKS auth rejected', { level: 'error' })
+    deny()
+  })
 
-  socksServer.setRulesetValidator(async conn => {
+  const validateRuleset = async (conn: {
+    destAddress: string
+    destPort: number
+  }): Promise<boolean> => {
     try {
       const hostname = conn.destAddress
       const port = conn.destPort
@@ -80,6 +105,7 @@ export function createSocksProxyServer(
       const allowed = await options.filter(port, hostname)
 
       if (!allowed) {
+        attemptByConnection.get(conn)?.recordNetworkDenial('socks-proxy')
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -94,12 +120,21 @@ export function createSocksProxyServer(
       })
       return false
     }
-  })
+  }
+
+  authenticatedServer.setRulesetValidator(validateRuleset)
+  unauthenticatedServer.setRulesetValidator(validateRuleset)
 
   // Override the default connection handler so we can route through a parent
   // HTTP proxy when one is configured. The default handler does a straight
   // net.connect() which fails when direct egress is blocked.
-  socksServer.setConnectionHandler((conn, sendStatus) => {
+  type ConnectionHandler = Parameters<
+    typeof authenticatedServer.setConnectionHandler
+  >[0]
+  const handleUpstreamConnection = (
+    conn: Parameters<ConnectionHandler>[0],
+    sendStatus: Parameters<ConnectionHandler>[1],
+  ): void => {
     const host = conn.destAddress
     const port = conn.destPort
 
@@ -149,7 +184,10 @@ export function createSocksProxyServer(
           }
         }
       })
-  })
+  }
+
+  authenticatedServer.setConnectionHandler(handleUpstreamConnection)
+  unauthenticatedServer.setConnectionHandler(handleUpstreamConnection)
 
   // Track every injected client socket so close() can tear them down
   // immediately. A SOCKS connection mid-`dialDirect()` (30s timeout) or
@@ -163,11 +201,83 @@ export function createSocksProxyServer(
       socket.setNoDelay()
       openSockets.add(socket)
       socket.once('close', () => openSockets.delete(socket))
-      socksServer._handleConnection(socket)
+      void routeGreeting(
+        socket,
+        authenticatedServer,
+        unauthenticatedServer,
+        allowUnauthenticated,
+      )
     },
     async close(): Promise<void> {
       for (const socket of openSockets) socket.destroy()
       openSockets.clear()
     },
   }
+}
+
+type SocksServer = ReturnType<typeof createServer>
+
+const GREETING_TIMEOUT_MS = 2_000
+
+async function routeGreeting(
+  socket: Socket,
+  authenticatedServer: SocksServer,
+  unauthenticatedServer: SocksServer,
+  allowUnauthenticated: boolean,
+): Promise<void> {
+  const greeting = await readGreeting(socket)
+  if (!greeting) return
+  socket.pause()
+  socket.unshift(greeting)
+
+  if (greeting[0] !== 0x05) {
+    authenticatedServer._handleConnection(socket)
+    return
+  }
+
+  const methodCount = greeting[1]!
+  const methods = greeting.subarray(2, 2 + methodCount)
+  if (methods.includes(0x02)) {
+    authenticatedServer._handleConnection(socket)
+  } else if (allowUnauthenticated && methods.includes(0x00)) {
+    unauthenticatedServer._handleConnection(socket)
+  } else {
+    socket.write(Buffer.from([0x05, 0xff]))
+    socket.destroy()
+  }
+}
+
+function readGreeting(socket: Socket): Promise<Buffer | undefined> {
+  return new Promise(resolve => {
+    let buffered = Buffer.alloc(0)
+    const timer = setTimeout(() => {
+      socket.destroy()
+      done()
+    }, GREETING_TIMEOUT_MS)
+    timer.unref()
+
+    const done = (value?: Buffer): void => {
+      clearTimeout(timer)
+      socket.removeListener('data', onData)
+      socket.removeListener('close', onClose)
+      socket.removeListener('error', onClose)
+      socket.pause()
+      resolve(value)
+    }
+    const onClose = (): void => done()
+    const onData = (chunk: Buffer): void => {
+      buffered = Buffer.concat([buffered, chunk])
+      if (buffered.length < 1) return
+      if (buffered[0] !== 0x05) return done(buffered)
+      if (buffered.length < 2) return
+      const methodCount = buffered[1]!
+      if (methodCount === 0 || methodCount > 128) return done(buffered)
+      if (buffered.length >= 2 + methodCount) done(buffered)
+    }
+
+    socket.on('data', onData)
+    socket.once('close', onClose)
+    socket.once('error', onClose)
+    socket.resume()
+  })
 }
