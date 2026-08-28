@@ -33,7 +33,7 @@ import type {
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
-  wrapCommandWithSandboxLinux,
+  prepareCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
   checkLinuxDependencies,
@@ -41,7 +41,7 @@ import {
   cleanupBwrapMountPoints,
 } from './linux-sandbox-utils.js'
 import {
-  wrapCommandWithSandboxMacOS,
+  prepareCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
@@ -84,6 +84,16 @@ import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
+import { SandboxAttemptRegistry } from './sandbox-attempt-registry.js'
+import { buildSandboxAttemptEnvironment } from './sandbox-attempt-environment.js'
+import type {
+  FinishedSandboxAttempt,
+  LinuxWriteClassification,
+  PrepareSandboxAttemptOptions,
+  SandboxAttemptDescriptor,
+  SandboxAttemptHandle,
+  SandboxBackend,
+} from './sandbox-attempt-types.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -142,6 +152,7 @@ const sentinelRegistry = new SentinelRegistry()
 // Temp dir holding the sentinel-content fake files for masked credential
 // files. Created lazily on first masked file; removed on reset().
 const maskedFileStore = new MaskedFileStore()
+const attemptRegistry = new SandboxAttemptRegistry()
 
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -340,15 +351,16 @@ async function startMuxProxyServer(
       : undefined,
     parentProxy,
     proxyAuthToken,
+    resolveAttemptProxyToken: token => attemptRegistry.resolveProxyToken(token),
   })
 
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     parentProxy,
-    proxyAuthToken: config?.network.allowUnauthenticatedSocksProxy
-      ? undefined
-      : proxyAuthToken,
+    proxyAuthToken,
+    resolveAttemptProxyToken: token => attemptRegistry.resolveProxyToken(token),
+    allowUnauthenticated: config?.network.allowUnauthenticatedSocksProxy,
   })
 
   muxProxyServer = createMuxProxyServer({
@@ -426,31 +438,62 @@ async function initialize(
 
   // Start log monitor for macOS if enabled
   if (enableLogMonitor && getPlatform() === 'macos') {
-    logMonitorShutdown = startMacOSSandboxLogMonitor(
-      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
-      config.ignoreViolations,
-    )
-    logForDebugging('Started macOS sandbox log monitor')
+    try {
+      logMonitorShutdown = startMacOSSandboxLogMonitor(
+        sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+        config.ignoreViolations,
+        {
+          recordAttemptDenial: (correlation, operation, details) =>
+            attemptRegistry.recordMacOSDenial(correlation, operation, details),
+        },
+      )
+      logForDebugging('Started macOS sandbox log monitor')
+    } catch (error) {
+      logForDebugging(
+        `[Sandbox Monitor] setup failed; attribution disabled: ${(error as Error).message}`,
+        { level: 'warn' },
+      )
+    }
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
-    linuxMonitor = startLinuxSandboxViolationMonitor(
-      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
-      {
-        // apply-seccomp's observer reports every write-intent syscall
-        // (allowed or not). Only paths bwrap would actually refuse — outside
-        // allowWrite or inside a denyWrite carve-out — go to the store.
-        allowWritePaths: [
-          ...getDefaultWritePaths(),
-          ...config.filesystem.allowWrite,
-        ],
-        denyWritePaths: config.filesystem.denyWrite,
-        ignoreViolations: config.ignoreViolations,
-      },
-    )
-    // Don't block initialization on listen() — wrap-time checks
-    // fs.existsSync(observeSocketPath) and degrades gracefully.
-    void linuxMonitor.ready
-    logForDebugging('Started Linux seccomp violation monitor')
+    try {
+      const monitor = startLinuxSandboxViolationMonitor(
+        sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+        {
+          // Legacy events use the initialization-time classification. Attempt
+          // events route to registry snapshots captured during preparation.
+          allowWritePaths: [
+            ...getDefaultWritePaths(),
+            ...config.filesystem.allowWrite,
+          ],
+          denyWritePaths: config.filesystem.denyWrite,
+          ignoreViolations: config.ignoreViolations,
+        },
+        {
+          hasActiveCorrelation: correlation =>
+            attemptRegistry.hasActiveCorrelation(correlation),
+          recordAttemptDenial: (correlation, operation, path) =>
+            attemptRegistry.recordLinuxDenial(correlation, operation, path),
+        },
+      )
+      linuxMonitor = monitor
+      // Don't block initialization on listen() — wrapping checks the socket
+      // and degrades gracefully. A rejected readiness is telemetry failure.
+      void monitor.ready.catch(error => {
+        if (linuxMonitor === monitor) linuxMonitor = undefined
+        logForDebugging(
+          `[Sandbox Linux Monitor] readiness failed; attribution disabled: ${(error as Error).message}`,
+          { level: 'warn' },
+        )
+      })
+      logForDebugging('Started Linux seccomp violation monitor')
+    } catch (error) {
+      linuxMonitor = undefined
+      logForDebugging(
+        `[Sandbox Linux Monitor] setup failed; attribution disabled: ${(error as Error).message}`,
+        { level: 'warn' },
+      )
+    }
   }
 
   // Register cleanup handlers first time
@@ -622,14 +665,6 @@ async function initialize(
           ? (config.windows?.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE)
           : undefined
 
-      // The auth token is only set when this process owns the proxy; an
-      // external proxy (config.network.httpProxyPort) handles its own auth,
-      // and embedding our token in its URL would be wrong.
-      proxyAuthToken =
-        config.network.httpProxyPort !== undefined
-          ? undefined
-          : randomBytes(16).toString('hex')
-
       // The mux front-end serves both protocols on one port. Each side's
       // reported port is the external override if configured, else the mux
       // port — so the public config.network.{http,socks}ProxyPort contract
@@ -637,6 +672,12 @@ async function initialize(
       const needLocalProxy =
         config.network.httpProxyPort === undefined ||
         config.network.socksProxyPort === undefined
+      // Session auth exists whenever this process owns either proxy leg. The
+      // environment builder only places it on runtime-owned compatibility
+      // paths, never on caller-supplied external proxy URLs.
+      proxyAuthToken = needLocalProxy
+        ? randomBytes(16).toString('hex')
+        : undefined
       const muxPort = needLocalProxy
         ? await startMuxProxyServer(sandboxAskCallback, portRange)
         : undefined
@@ -1155,12 +1196,36 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   return managerContext !== undefined
 }
 
-async function wrapWithSandbox(
-  command: string,
-  binShell?: string,
-  customConfig?: Partial<SandboxRuntimeConfig>,
-  abortSignal?: AbortSignal,
-): Promise<string> {
+interface BuildSandboxCommandOptions {
+  command: string
+  binShell?: string
+  customConfig?: Partial<SandboxRuntimeConfig>
+  abortSignal?: AbortSignal
+  cwd?: string
+  monitorCorrelation?: string
+  embedProxyEnvironment: boolean
+}
+
+interface BuiltSandboxCommand {
+  command: string
+  sandboxBackend: SandboxBackend
+  linuxWriteClassification?: LinuxWriteClassification
+  filesystemDisabled: boolean
+  needsNetworkProxy: boolean
+}
+
+async function buildSandboxCommand(
+  options: BuildSandboxCommandOptions,
+): Promise<BuiltSandboxCommand> {
+  const {
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    cwd,
+    monitorCorrelation,
+    embedProxyEnvironment,
+  } = options
   const platform = getPlatform()
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
@@ -1293,67 +1358,81 @@ async function wrapWithSandbox(
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
-      return wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction,
-        // Only pass proxy ports if proxy is running (when there are domains to filter)
-        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
-        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
-        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.trustBundlePath,
-        readConfig,
-        writeConfig,
-        unsetEnvVars: credentialRestrictions.unsetEnvVars,
-        setEnvVars: credentialRestrictions.setEnvVars,
-        maskedFileBinds: credentialRestrictions.maskedFileBinds,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
-        allowMachLookup: getAllowMachLookup(),
-        ignoreViolations: getIgnoreViolations(),
-        allowPty,
-        allowBrowserProcess,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
-        binShell,
-      })
+      return {
+        ...prepareCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction,
+          // Only pass proxy ports if proxy is running (when there are domains to filter)
+          httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+          socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          caCertPath: mitmCA?.trustBundlePath,
+          readConfig,
+          writeConfig,
+          unsetEnvVars: credentialRestrictions.unsetEnvVars,
+          setEnvVars: credentialRestrictions.setEnvVars,
+          maskedFileBinds: credentialRestrictions.maskedFileBinds,
+          allowUnixSockets: getAllowUnixSockets(),
+          allowAllUnixSockets: getAllowAllUnixSockets(),
+          allowLocalBinding: getAllowLocalBinding(),
+          allowMachLookup: getAllowMachLookup(),
+          ignoreViolations: getIgnoreViolations(),
+          allowPty,
+          allowBrowserProcess,
+          enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+          allowAppleEvents: getAllowAppleEvents(),
+          binShell,
+          cwd,
+          monitorCorrelation,
+          embedProxyEnvironment,
+        }),
+        filesystemDisabled: fsDisabled,
+        needsNetworkProxy,
+      }
 
     case 'linux':
-      return wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction,
-        // Only pass socket paths if proxy is running (when there are domains to filter)
-        httpSocketPath: needsNetworkProxy
-          ? getLinuxHttpSocketPath()
-          : undefined,
-        socksSocketPath: needsNetworkProxy
-          ? getLinuxSocksSocketPath()
-          : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
-        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.trustBundlePath,
-        readConfig,
-        writeConfig,
-        unsetEnvVars: credentialRestrictions.unsetEnvVars,
-        setEnvVars: credentialRestrictions.setEnvVars,
-        maskedFileBinds: credentialRestrictions.maskedFileBinds,
-        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
-        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        binShell,
-        ripgrepConfig: getRipgrepConfig(),
-        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        seccompConfig: getSeccompConfig(),
-        bwrapPath: config?.bwrapPath,
-        socatPath: config?.socatPath,
-        observeSocketPath: linuxMonitor?.observeSocketPath,
-        abortSignal,
-      })
+      return {
+        ...(await prepareCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction,
+          // Only pass socket paths if proxy is running (when there are domains to filter)
+          httpSocketPath: needsNetworkProxy
+            ? getLinuxHttpSocketPath()
+            : undefined,
+          socksSocketPath: needsNetworkProxy
+            ? getLinuxSocksSocketPath()
+            : undefined,
+          httpProxyPort: needsNetworkProxy
+            ? managerContext?.httpProxyPort
+            : undefined,
+          socksProxyPort: needsNetworkProxy
+            ? managerContext?.socksProxyPort
+            : undefined,
+          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          caCertPath: mitmCA?.trustBundlePath,
+          readConfig,
+          writeConfig,
+          unsetEnvVars: credentialRestrictions.unsetEnvVars,
+          setEnvVars: credentialRestrictions.setEnvVars,
+          maskedFileBinds: credentialRestrictions.maskedFileBinds,
+          maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
+          enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+          allowAllUnixSockets: getAllowAllUnixSockets(),
+          binShell,
+          ripgrepConfig: getRipgrepConfig(),
+          mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+          seccompConfig: getSeccompConfig(),
+          bwrapPath: config?.bwrapPath,
+          socatPath: config?.socatPath,
+          observeSocketPath: linuxMonitor?.observeSocketPath,
+          abortSignal,
+          cwd,
+          monitorCorrelation,
+          embedProxyEnvironment,
+        })),
+        filesystemDisabled: fsDisabled,
+        needsNetworkProxy,
+      }
 
     case 'windows':
       // Windows wraps to an argv array, not a shell string. Forcing
@@ -1372,6 +1451,97 @@ async function wrapWithSandbox(
         `Sandbox configuration is not supported on platform: ${platform}`,
       )
   }
+}
+
+async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+): Promise<string> {
+  return (
+    await buildSandboxCommand({
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      embedProxyEnvironment: true,
+    })
+  ).command
+}
+
+async function prepareSandboxAttempt(
+  options: PrepareSandboxAttemptOptions,
+): Promise<SandboxAttemptDescriptor> {
+  const platform = getPlatform()
+  if (platform !== 'macos' && platform !== 'linux') {
+    throw new Error(
+      `Sandbox attempts are not supported on platform: ${platform}`,
+    )
+  }
+
+  const pending = attemptRegistry.allocate({
+    command: options.command,
+    ignoreViolations: getIgnoreViolations(),
+  })
+  let built: BuiltSandboxCommand | undefined
+  try {
+    built = await buildSandboxCommand({
+      command: options.command,
+      binShell: options.binShell,
+      abortSignal: options.abortSignal,
+      cwd: options.cwd,
+      monitorCorrelation: pending.correlation,
+      embedProxyEnvironment: false,
+    })
+    if (built.needsNetworkProxy && !managerContext) {
+      throw new Error('Sandbox network infrastructure is not initialized')
+    }
+
+    const env = buildSandboxAttemptEnvironment({
+      env: options.env,
+      sandboxHttpProxyPort: !built.needsNetworkProxy
+        ? undefined
+        : platform === 'linux'
+          ? 3128
+          : getProxyPort(),
+      sandboxSocksProxyPort: !built.needsNetworkProxy
+        ? undefined
+        : platform === 'linux'
+          ? 1080
+          : getSocksProxyPort(),
+      runtimeOwnsHttpProxy: config?.network.httpProxyPort === undefined,
+      runtimeOwnsSocksProxy: config?.network.socksProxyPort === undefined,
+      attemptProxyToken: pending.proxyToken,
+      legacySshProxyToken: proxyAuthToken,
+      caCertPath: mitmCA?.trustBundlePath,
+      skipTmpdir: built.filesystemDisabled,
+    })
+    const shell = options.binShell ?? '/bin/bash'
+    const descriptor: SandboxAttemptDescriptor = {
+      attempt: pending.handle,
+      argv: [shell, '-c', built.command],
+      env,
+      sandboxBackend: built.sandboxBackend,
+    }
+    attemptRegistry.activate(pending, {
+      backend: built.sandboxBackend,
+      linuxWriteClassification: built.linuxWriteClassification,
+    })
+    return descriptor
+  } catch (error) {
+    attemptRegistry.discard(pending)
+    if (platform === 'linux' && built && built.sandboxBackend !== 'none') {
+      cleanupBwrapMountPoints()
+    }
+    throw error
+  }
+}
+
+function finishSandboxAttempt(
+  attempt: SandboxAttemptHandle,
+): Promise<FinishedSandboxAttempt> {
+  return attemptRegistry.finish(attempt)
 }
 
 /**
@@ -1535,11 +1705,10 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * including Windows. This is what lets a host enable/deny domains
  * for already-running sandboxed children.
  *
- * Filesystem changes (denyRead/denyWrite) are NOT applied live:
- * macOS bakes them into the seatbelt profile at wrap time, and
- * Linux/Windows bake them into the bwrap argv / DENY-ACE set at
- * wrap time. Call reset() + initialize() to apply a new
- * filesystem config.
+ * macOS/Linux filesystem changes apply to future wrapper and attempt
+ * preparation. Already prepared profiles/argv and Linux attempt
+ * classification snapshots do not change. Windows filesystem ACL
+ * infrastructure remains session-wide and requires reset() + initialize().
  *
  * @param newConfig - The new configuration to use
  */
@@ -1698,6 +1867,10 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  // Revoke attempt correlations and proxy credentials before any listener or
+  // bridge teardown so reset-raced events cannot enter an old queue.
+  attemptRegistry.reset()
+
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
@@ -1934,6 +2107,12 @@ export interface ISandboxManager {
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
   ): Promise<string>
+  prepareSandboxAttempt(
+    options: PrepareSandboxAttemptOptions,
+  ): Promise<SandboxAttemptDescriptor>
+  finishSandboxAttempt(
+    attempt: SandboxAttemptHandle,
+  ): Promise<FinishedSandboxAttempt>
   wrapWithSandboxArgv(
     command: string,
     binShell?: string | WindowsBinShell,
@@ -1981,6 +2160,8 @@ export const SandboxManager: ISandboxManager = {
   getLinuxSocksSocketPath,
   waitForNetworkInitialization,
   wrapWithSandbox,
+  prepareSandboxAttempt,
+  finishSandboxAttempt,
   wrapWithSandboxArgv,
   cleanupAfterCommand,
   reset,

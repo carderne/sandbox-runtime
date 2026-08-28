@@ -1,6 +1,14 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
+export type {
+  SandboxAttemptHandle,
+  SandboxBackend,
+  PrepareSandboxAttemptOptions,
+  SandboxAttemptDescriptor,
+  SandboxDenialSummary,
+  FinishedSandboxAttempt,
+} from './sandbox/sandbox-attempt-types.js'
 
 // Configuration types and schemas
 export type {

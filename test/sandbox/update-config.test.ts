@@ -3,7 +3,7 @@ import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
 import { getPlatform } from '../../src/utils/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isMacOS } from '../helpers/platform.js'
 
 /**
  * Helper to make a CONNECT request through the proxy using raw TCP
@@ -112,6 +112,47 @@ describe('SandboxManager.updateConfig', () => {
   afterEach(async () => {
     await SandboxManager.reset()
   })
+
+  it.if(isMacOS)(
+    'applies filesystem changes to future attempts without mutating prepared argv',
+    async () => {
+      const firstPath = '/tmp/srt-update-attempt-a'
+      const secondPath = '/tmp/srt-update-attempt-b'
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [firstPath],
+          denyWrite: [],
+        },
+      })
+      const first = await SandboxManager.prepareSandboxAttempt({
+        command: 'true',
+      })
+      const frozenArgv = [...first.argv]
+
+      SandboxManager.updateConfig({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [secondPath],
+          denyWrite: [],
+        },
+      })
+      const second = await SandboxManager.prepareSandboxAttempt({
+        command: 'true',
+      })
+
+      expect(first.argv).toEqual(frozenArgv)
+      expect(first.argv.join('\0')).toContain(firstPath)
+      expect(second.argv.join('\0')).toContain(secondPath)
+      expect(second.argv.join('\0')).not.toContain(firstPath)
+      SandboxManager.cleanupAfterCommand()
+      await SandboxManager.finishSandboxAttempt(first.attempt)
+      SandboxManager.cleanupAfterCommand()
+      await SandboxManager.finishSandboxAttempt(second.attempt)
+    },
+  )
 
   it('should handle updateConfig called before initialize', async () => {
     // updateConfig before initialize - should not throw
