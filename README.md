@@ -215,6 +215,74 @@ child.on('exit', async code => {
 })
 ```
 
+#### Attributed sandbox attempts
+
+On macOS and Linux, use the prepare/finish API when the caller needs denial
+evidence tied to one exact process attempt:
+
+```typescript
+import { once } from 'node:events'
+import { spawn } from 'node:child_process'
+import {
+  SandboxManager,
+  type SandboxDenialSummary,
+} from '@anthropic-ai/sandbox-runtime'
+
+const cwd = process.cwd()
+const descriptor = await SandboxManager.prepareSandboxAttempt({
+  command: 'curl https://example.com',
+  cwd,
+  env: process.env,
+})
+
+let denials: readonly SandboxDenialSummary[] = []
+try {
+  const child = spawn(descriptor.argv[0], descriptor.argv.slice(1), {
+    shell: false,
+    cwd,
+    env: descriptor.env,
+    stdio: 'inherit',
+  })
+  await once(child, 'close')
+} finally {
+  SandboxManager.cleanupAfterCommand()
+  const result = await SandboxManager.finishSandboxAttempt(descriptor.attempt)
+  denials = result.denials
+}
+```
+
+Use the same cleanup-then-finish ordering if `spawn` fails. Prepare a new
+descriptor for every process and every retry, pass the same `cwd` to prepare
+and spawn, and finish each handle exactly once. `sandboxBackend` reports the
+backend actually emitted for that descriptor: `none`, `macos-seatbelt`,
+`linux-bwrap`, or `linux-seccomp`.
+
+Each attempt retains its first 100 supported summaries. Finishing keeps event
+admission open for 100 ms to collect monitor/proxy delivery already in flight,
+then synchronously revokes that attempt's correlation and proxy credential.
+The public evidence union is:
+
+```typescript
+type SandboxDenialSummary =
+  | { kind: 'filesystem'; source: 'macos-seatbelt' | 'linux-seccomp' }
+  | {
+      kind: 'network'
+      source: 'macos-seatbelt' | 'http-proxy' | 'socks-proxy'
+    }
+```
+
+Attempt credentials are placed only on HTTP/SOCKS proxy legs owned by this
+runtime and are kept out of `argv`. Legacy session traffic, SSH compatibility
+traffic, caller-supplied external proxy legs, and unauthenticated SOCKS traffic
+remain functional but unattributed. A missing or failed macOS/Linux monitor is
+a bounded telemetry degradation: sandbox enforcement continues, no denial is
+fabricated, and an empty result does not prove that the OS emitted no denial.
+Consumers that previously used stderr heuristics should retain that fallback
+when structural evidence is unavailable.
+
+These summaries are diagnostic evidence only. The runtime does not turn them
+into approval, escalation, unsandboxed retry, or local execution decisions.
+
 #### Available exports
 
 ```typescript
@@ -234,6 +302,12 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
+  SandboxAttemptHandle,
+  SandboxBackend,
+  PrepareSandboxAttemptOptions,
+  SandboxAttemptDescriptor,
+  SandboxDenialSummary,
+  FinishedSandboxAttempt,
 } from '@anthropic-ai/sandbox-runtime'
 ```
 
@@ -648,6 +722,16 @@ Filesystem restrictions are enforced at the OS level:
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
+### Runtime Configuration Updates
+
+`SandboxManager.updateConfig()` swaps network allow/deny policy live; shared
+proxies consult the current configuration for each new request. On macOS and
+Linux, filesystem changes are compiled into each future wrapper or attributed
+attempt, so already prepared command strings, descriptor `argv`, and Linux
+write-classification snapshots remain unchanged. On Windows, filesystem ACL
+infrastructure is session-wide: when its filesystem access set changes, call
+`reset()` and then `initialize()` to apply the new set.
+
 ### Mandatory Deny Paths (Auto-Protected Files)
 
 Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
@@ -773,7 +857,7 @@ Users should be aware of potential risks that come from allowing broad domains l
 
 - Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox.
 - Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
-<<<<<<< HEAD
+  <<<<<<< HEAD
 - Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used in cases where additional isolation is otherwise enforced.
 - Apple Events (macOS): The `allowAppleEvents` option re-enables sending Apple Events and Launch Services open requests (`(allow appleevent-send)`, `(allow lsopen)`, and mach-lookups for `com.apple.coreservices.appleevents`, `com.apple.CoreServices.coreservicesd`, and `com.apple.coreservices.quarantine-resolver`), which `open`, `osascript`, and URL-opening helpers require. With these allowed, a sandboxed command can launch arbitrary applications with no user prompt, and launched applications run outside the sandbox entirely — so this option removes code-execution isolation, not just weakens it. Scripting already-running applications via Apple Events is additionally gated by macOS TCC automation consent, but launching via `open` is not. Only enable this when commands inside the sandbox genuinely need to open URLs or applications.
 - Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent` and `com.apple.SystemConfiguration.configd`. The former is needed for Go programs to verify TLS certificates via the macOS Security framework; the latter is needed for Rust/Go programs (e.g. `uv`, `cargo`) that query system proxy/network configuration on startup. This opens a potential data exfiltration vector through the trustd service and exposes read-only host network configuration (proxy settings, DNS servers) through configd. Only enable when needed.
