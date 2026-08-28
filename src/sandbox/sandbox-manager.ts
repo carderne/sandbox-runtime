@@ -819,6 +819,7 @@ function checkDependencies(ripgrepConfig?: {
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
   allowedDomains: readonly string[] | undefined,
+  env: NodeJS.ProcessEnv = process.env,
 ): CredentialRestrictionConfig {
   if (!credentials) {
     return {
@@ -846,6 +847,7 @@ function getCredentialRestrictions(
     credentials.envVars ?? [],
     allowedDomains ?? [],
     sentinelRegistry,
+    env,
   )
   unsetEnvVars.push(...degradeToUnsetNames)
 
@@ -1217,6 +1219,7 @@ interface BuildSandboxCommandOptions {
   customConfig?: Partial<SandboxRuntimeConfig>
   abortSignal?: AbortSignal
   cwd?: string
+  credentialEnv?: NodeJS.ProcessEnv
   monitorCorrelation?: string
   embedProxyEnvironment: boolean
 }
@@ -1238,6 +1241,7 @@ async function buildSandboxCommand(
     customConfig,
     abortSignal,
     cwd,
+    credentialEnv,
     monitorCorrelation,
     embedProxyEnvironment,
   } = options
@@ -1263,6 +1267,7 @@ async function buildSandboxCommand(
   let credentialRestrictions = getCredentialRestrictions(
     customConfig?.credentials ?? config?.credentials,
     customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
+    credentialEnv,
   )
 
   // Get configs - use custom if provided, otherwise fall back to main config
@@ -1529,6 +1534,7 @@ async function prepareSandboxAttempt(
     )
   }
 
+  const attemptEnv = { ...(options.env ?? process.env) }
   const pending = attemptRegistry.allocate({
     command: options.command,
     ignoreViolations: getIgnoreViolations(),
@@ -1540,6 +1546,7 @@ async function prepareSandboxAttempt(
       binShell: options.binShell,
       abortSignal: options.abortSignal,
       cwd: options.cwd,
+      credentialEnv: attemptEnv,
       monitorCorrelation: pending.correlation,
       embedProxyEnvironment: false,
     })
@@ -1548,7 +1555,7 @@ async function prepareSandboxAttempt(
     }
 
     const env = buildSandboxAttemptEnvironment({
-      env: options.env,
+      env: attemptEnv,
       sandboxHttpProxyPort: !built.needsNetworkProxy
         ? undefined
         : platform === 'linux'

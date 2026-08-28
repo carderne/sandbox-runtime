@@ -255,6 +255,46 @@ d('SandboxManager attributed attempts', () => {
     }
   })
 
+  it('masks credentials from the supplied attempt environment', async () => {
+    const previousToken = process.env.API_TOKEN
+    delete process.env.API_TOKEN
+    try {
+      await SandboxManager.initialize({
+        ...config({}, [attemptCwd]),
+        credentials: {
+          allowPlaintextInject: true,
+          envVars: [{ name: 'API_TOKEN', mode: 'mask' }],
+        },
+      })
+      const supplied = { API_TOKEN: 'review-secret' }
+      const descriptor = await SandboxManager.prepareSandboxAttempt({
+        command: `printf '%s' "$API_TOKEN"`,
+        cwd: attemptCwd,
+        env: supplied,
+      })
+
+      const child = spawn(descriptor.argv[0]!, descriptor.argv.slice(1), {
+        shell: false,
+        cwd: attemptCwd,
+        env: descriptor.env,
+      })
+      let stdout = ''
+      child.stdout?.on('data', chunk => (stdout += chunk.toString()))
+      const [status] = await once(child, 'close')
+
+      expect(status).toBe(0)
+      expect(stdout).toMatch(/^fake_value_[0-9a-f-]{36}$/)
+      expect(stdout).not.toContain('review-secret')
+      expect(supplied).toEqual({ API_TOKEN: 'review-secret' })
+
+      SandboxManager.cleanupAfterCommand()
+      await SandboxManager.finishSandboxAttempt(descriptor.attempt)
+    } finally {
+      if (previousToken === undefined) delete process.env.API_TOKEN
+      else process.env.API_TOKEN = previousToken
+    }
+  })
+
   it('discards an unpublished attempt when wrapper preparation fails', async () => {
     await SandboxManager.initialize(config())
     const allocate = spyOn(SandboxAttemptRegistry.prototype, 'allocate')
