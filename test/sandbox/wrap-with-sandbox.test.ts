@@ -255,7 +255,7 @@ describe('structured platform wrapper results', () => {
         })
 
         expect(result.linuxWriteClassification?.denyWritePaths).toContain(
-          join(process.cwd(), '.git'),
+          join(process.cwd(), '.mcp.json'),
         )
       } finally {
         cleanupBwrapMountPoints()

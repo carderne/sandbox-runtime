@@ -1,5 +1,5 @@
 import { once } from 'node:events'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -119,11 +119,8 @@ d('SandboxManager attributed attempts', () => {
     expect(process.env).toEqual(processEnvBefore)
     expect(attemptToken(a)).not.toBe('')
     expect(a.argv.join('\0')).not.toContain(attemptToken(a))
-    expect(a.sandboxBackend).toBe(
-      isMacOS
-        ? 'macos-seatbelt'
-        : expect.stringMatching(/^linux-(?:bwrap|seccomp)$/),
-    )
+    if (isMacOS) expect(a.sandboxBackend).toBe('macos-seatbelt')
+    if (isLinux) expect(a.sandboxBackend).toMatch(/^linux-(?:bwrap|seccomp)$/)
     if (isLinux) {
       expect(a.env.HTTPS_PROXY).toContain('localhost:3128')
       expect(a.env.FTP_PROXY).toContain('localhost:1080')
@@ -368,6 +365,8 @@ d('SandboxManager attributed attempts', () => {
   it('keeps prepared wrappers fixed while updateConfig changes future attempts', async () => {
     const aPath = join(attemptCwd, 'a')
     const bPath = join(attemptCwd, 'b')
+    mkdirSync(aPath)
+    mkdirSync(bPath)
     await SandboxManager.initialize(config({}, [aPath]))
     const a = await SandboxManager.prepareSandboxAttempt({ command: 'true' })
     const aArgv = [...a.argv]

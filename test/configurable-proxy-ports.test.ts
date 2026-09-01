@@ -62,6 +62,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       expect(token).toBeDefined()
       try {
         const descriptor = await SandboxManager.wrapWithSandboxArgv('true')
+        const expectedHttpProxy = `http://localhost:${isLinux ? 3128 : 8888}`
         const emitted = [
           descriptor.argv.join(' '),
           descriptor.env.HTTP_PROXY,
@@ -70,9 +71,17 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           descriptor.env.FTP_PROXY,
         ].join('\n')
 
-        expect(emitted).toContain('http://localhost:8888')
-        expect(emitted).not.toContain(`http://srt:${token}@localhost:8888`)
+        expect(SandboxManager.getProxyPort()).toBe(8888)
+        expect(emitted).toContain(expectedHttpProxy)
+        expect(emitted).not.toContain(
+          `http://srt:${token}@localhost:${isLinux ? 3128 : 8888}`,
+        )
         expect(emitted).toContain(`socks5h://srt:${token}@localhost:`)
+        if (isLinux) {
+          expect(descriptor.argv.join(' ')).toContain(
+            '--setenv CLAUDE_CODE_HOST_HTTP_PROXY_PORT 8888',
+          )
+        }
       } finally {
         SandboxManager.cleanupAfterCommand()
         await SandboxManager.reset()
