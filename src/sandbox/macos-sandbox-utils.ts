@@ -3,6 +3,7 @@ import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
+import { parseAllowedIPEntry } from './sandbox-config.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
@@ -33,6 +34,13 @@ export interface MacOSSandboxParams {
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  /**
+   * network.allowedIPs entries (`<ip|cidr>[:<port>]`, schema-validated).
+   * macOS only: emitted as port-scoped seatbelt allows (see the emission
+   * site in generateSandboxProfile for why the IP/CIDR part cannot be
+   * applied by the kernel). Ignored elsewhere.
+   */
+  allowedIPs?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
@@ -88,6 +96,38 @@ export type SandboxViolationCallback = (
 ) => void
 
 const sessionSuffix = `_${Math.random().toString(36).slice(2, 11)}_SBX`
+
+// Once-per-process notices for network.allowedIPs degradation (see the
+// emission site in generateSandboxProfile). Warn-once keeps per-command
+// wrapping from spamming stderr while still surfacing the relaxation.
+let allowedIPsPortScopedWarned = false
+let allowedIPsPortlessWarned = false
+
+function warnAllowedIPsPortScopedOnce(ports: number[]): void {
+  if (allowedIPsPortScopedWarned) return
+  allowedIPsPortScopedWarned = true
+  const msg =
+    '[sandbox-runtime] WARNING: network.allowedIPs is enforced PORT-SCOPED ' +
+    'on this macOS — the seatbelt compiler rejects IP/CIDR destination ' +
+    'literals, so outbound is allowed to ANY destination on port(s) ' +
+    `${ports.join(', ')}, not just the configured CIDRs. Prefer ` +
+    'service-specific high ports. This traffic also bypasses the local ' +
+    'proxy entirely: no domain filtering, no logging, no credential masking.'
+  console.warn(msg)
+  logForDebugging(msg, { level: 'warn' })
+}
+
+function warnAllowedIPsPortlessOnce(entries: string[]): void {
+  if (allowedIPsPortlessWarned) return
+  allowedIPsPortlessWarned = true
+  const msg =
+    '[sandbox-runtime] WARNING: network.allowedIPs entries without a port ' +
+    `(${entries.join(', ')}) cannot be enforced on this macOS — seatbelt ` +
+    'network filters require a single explicit port — so these entries are ' +
+    'validated and logged but NOT emitted.'
+  console.warn(msg)
+  logForDebugging(msg, { level: 'warn' })
+}
 
 /**
  * Generate a unique log tag for sandbox monitoring
@@ -442,6 +482,7 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowMachLookup,
+  allowedIPs,
   allowPty,
   allowBrowserProcess = false,
   enableWeakerNetworkIsolation = false,
@@ -457,6 +498,7 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowedIPs?: string[]
   allowPty?: boolean
   allowBrowserProcess?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -728,6 +770,47 @@ function generateSandboxProfile({
         `(allow network-outbound (remote ip "localhost:${socksProxyPort}"))`,
       )
     }
+
+    // Direct-dial egress for proxy-blind clients (network.allowedIPs).
+    //
+    // The seatbelt compiler only accepts "*" or "localhost" as the host
+    // token in (remote ip ...) filters — IP/CIDR literals are
+    // compile-rejected on current macOS (see docs/sbpl-probe-allowedIPs.md)
+    // — so the configured destinations degrade to PORT-SCOPED allows: one
+    // rule per unique port, matching ANY destination host on that port.
+    // Emitting the literal "<cidr>:<port>" form would fail the whole
+    // profile at compile time and break every sandboxed command, and
+    // "*:*" would disable egress restriction entirely — neither is
+    // emittable. The IP/CIDR part stays validated and logged for future
+    // enforcement points; the relaxation is surfaced with a warn-once
+    // notice.
+    if (allowedIPs && allowedIPs.length > 0) {
+      const ports: number[] = []
+      const portless: string[] = []
+      for (const entry of allowedIPs) {
+        const parsed = parseAllowedIPEntry(entry)
+        if (parsed.ok && parsed.port !== undefined) {
+          // First-seen order keeps profiles deterministic.
+          if (!ports.includes(parsed.port)) ports.push(parsed.port)
+        } else {
+          // Port-less entries (or anything the schema somehow let
+          // through): no emittable scoping short of "*:*".
+          portless.push(entry)
+        }
+      }
+      if (ports.length > 0) {
+        profile.push(
+          '; Direct-dial IP egress — port-scoped degradation of network.allowedIPs',
+        )
+        for (const port of ports) {
+          profile.push(`(allow network-outbound (remote ip "*:${port}"))`)
+        }
+        warnAllowedIPsPortScopedOnce(ports)
+      }
+      if (portless.length > 0) {
+        warnAllowedIPsPortlessOnce(portless)
+      }
+    }
   }
   profile.push('')
 
@@ -840,6 +923,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowedIPs,
     readConfig: readConfigIn,
     writeConfig,
     unsetEnvVars,
@@ -903,6 +987,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowedIPs,
     allowPty,
     allowBrowserProcess,
     enableWeakerNetworkIsolation,

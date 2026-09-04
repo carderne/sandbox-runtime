@@ -1076,6 +1076,10 @@ function getAllowUnixSockets(): string[] | undefined {
   return config?.network?.allowUnixSockets
 }
 
+function getAllowedIPs(): string[] | undefined {
+  return config?.network?.allowedIPs
+}
+
 function getAllowAllUnixSockets(): boolean | undefined {
   return config?.network?.allowAllUnixSockets
 }
@@ -1155,6 +1159,32 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   return managerContext !== undefined
 }
 
+/**
+ * network.allowedIPs is macOS-only: the seatbelt profile is the only
+ * enforcement point (bwrap/seccomp cannot filter by destination IP, and the
+ * Windows WFP layer has no per-IP egress rule wired up). The config is
+ * ACCEPTED everywhere — same posture as allowUnixSockets on Linux — but
+ * ignored outside macOS, with a once-per-process notice so a config that
+ * silently does nothing on this platform is still visible.
+ */
+let allowedIPsNonMacOSWarned = false
+function warnAllowedIPsIgnoredOutsideMacOS(
+  customConfig?: Partial<SandboxRuntimeConfig>,
+): void {
+  if (allowedIPsNonMacOSWarned) return
+  const platform = getPlatform()
+  if (platform === 'macos') return
+  const ips = customConfig?.network?.allowedIPs ?? config?.network?.allowedIPs
+  if (!ips || ips.length === 0) return
+  allowedIPsNonMacOSWarned = true
+  const msg =
+    '[sandbox-runtime] WARNING: network.allowedIPs is macOS-only and is ' +
+    `ignored on ${platform} (the sandbox layer there cannot filter by ` +
+    `destination IP). Entries: ${ips.join(', ')}`
+  console.warn(msg)
+  logForDebugging(msg, { level: 'warn' })
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
@@ -1162,6 +1192,8 @@ async function wrapWithSandbox(
   abortSignal?: AbortSignal,
 ): Promise<string> {
   const platform = getPlatform()
+
+  warnAllowedIPsIgnoredOutsideMacOS(customConfig)
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1263,10 +1295,13 @@ async function wrapWithSandbox(
   // Network restriction is needed when:
   // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
   // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+  // 3. OR either has a non-empty network.allowedIPs (proxy-blind direct-dial allows)
   // An empty allowedDomains array means "no domains allowed" = block all network access
   const hasNetworkConfig =
     customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    config?.network?.allowedDomains !== undefined ||
+    (customConfig?.network?.allowedIPs?.length ?? 0) > 0 ||
+    (config?.network?.allowedIPs?.length ?? 0) > 0
 
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
@@ -1310,6 +1345,7 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
+        allowedIPs: getAllowedIPs(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowBrowserProcess,
@@ -1405,9 +1441,12 @@ async function wrapWithSandboxArgv(
   const platform = getPlatform()
 
   if (platform === 'windows') {
+    warnAllowedIPsIgnoredOutsideMacOS(customConfig)
     const hasNetworkConfig =
       customConfig?.network?.allowedDomains !== undefined ||
-      config?.network?.allowedDomains !== undefined
+      config?.network?.allowedDomains !== undefined ||
+      (customConfig?.network?.allowedIPs?.length ?? 0) > 0 ||
+      (config?.network?.allowedIPs?.length ?? 0) > 0
     if (hasNetworkConfig) {
       await waitForNetworkInitialization()
     }
@@ -1918,6 +1957,7 @@ export interface ISandboxManager {
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
   getAllowUnixSockets(): string[] | undefined
+  getAllowedIPs(): string[] | undefined
   getAllowLocalBinding(): boolean | undefined
   getAllowMachLookup(): string[] | undefined
   getIgnoreViolations(): Record<string, string[]> | undefined
@@ -1970,6 +2010,7 @@ export const SandboxManager: ISandboxManager = {
   getFsWriteConfig,
   getNetworkRestrictionConfig,
   getAllowUnixSockets,
+  getAllowedIPs,
   getAllowLocalBinding,
   getAllowMachLookup,
   getIgnoreViolations,

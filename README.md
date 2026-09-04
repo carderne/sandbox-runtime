@@ -291,8 +291,28 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 - `network.allowUnauthenticatedSocksProxy` - Disable authentication for the local SOCKS proxy (boolean, default: false). This enables Git-over-SSH with the built-in macOS `nc`, which cannot send SOCKS5 credentials. Domain filtering still applies, but any local process that discovers the proxy port can use it while the sandbox is running.
+- `network.allowedIPs` - Array of direct-dial egress entries, `<ip|cidr>[:<port>]` (e.g. `"10.172.102.0/23:9093"`, `"10.1.2.3"`, `"2001:db8::/32"`). macOS only; ignored on Linux/Windows. For proxy-blind clients (e.g. Go binaries like `kaf`) that dial broker/database addresses directly and ignore HTTP/SOCKS proxy env vars — `allowedDomains` can never authorize that traffic because domain filtering lives in the local proxy. See the security note below for the port-scoped degradation that applies on current macOS.
 
 **TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
+
+**`network.allowedIPs` is enforced PORT-SCOPED on current macOS — read before using.** The macOS seatbelt compiler only accepts `*` or `localhost` as the host token in `(remote ip ...)` network filters; IP/CIDR destination literals are rejected at compile time (probe matrix: `docs/sbpl-probe-allowedIPs.md`). Each configured entry is therefore emitted as an allow for its **port to ANY destination host** — the IP/CIDR part is validated, logged, and preserved for future enforcement points, but it is **not** applied by the kernel. Concretely:
+
+- `"allowedIPs": ["10.172.102.0/23:9093"]` means "outbound TCP/UDP to port 9093 anywhere on the internet", not "to 10.172.102.0/23". Treat each allowed port as **anywhere on this port** and prefer service-specific high ports (a Kafka broker port exposes far less than 443 would).
+- Entries without a port cannot be enforced at all (there is no per-port wildcard short of `*:*`, which would disable egress restriction); they are validated and logged but not emitted, with a warning.
+- This traffic **bypasses the local proxy entirely**: no domain filtering, no request logging, no credential masking/injection, and no `filterRequest` callback.
+
+Example — allow a proxy-blind Kafka CLI to reach its brokers:
+
+```json
+{
+  "network": {
+    "allowedDomains": ["github.com"],
+    "allowedIPs": ["10.172.102.0/23:9093"]
+  }
+}
+```
+
+Intended: brokers `10.172.102.{10,107,121,142,169,254}` + `10.172.103.{18,24,48,79,94,151,243}` on Kafka TLS port 9093. Effective on current macOS: outbound to **any** destination on port 9093 (documented degradation).
 
 - `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
   - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
@@ -502,7 +522,7 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
 
 - `ripgrep` - Fast search tool for deny path detection
   - Install via Homebrew: `brew install ripgrep`
-  - Or download from: https://github.com/BurntSushi/ripgrep/releases
+  - Or download from: <https://github.com/BurntSushi/ripgrep/releases>
 
 **Windows requires:**
 

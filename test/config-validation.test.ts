@@ -1853,4 +1853,69 @@ describe('Config Validation', () => {
       })
     })
   })
+
+  describe('network.allowedIPs', () => {
+    // Minimal valid config with the allowedIPs entry spliced in.
+    const base = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const parseWith = (ips: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: { ...base.network, allowedIPs: ips },
+      })
+
+    test('accepts IPv4/IPv6 literals, CIDRs, and optional ports', () => {
+      for (const entry of [
+        '10.0.0.0/23',
+        '10.0.0.0/23:9093',
+        '10.1.2.3',
+        '10.1.2.3:9093',
+        '2001:db8::/32',
+        '2001:db8::1',
+        '[2001:db8::1]:9093',
+      ]) {
+        const result = parseWith([entry])
+        expect(result.success).toBe(true)
+      }
+    })
+
+    test('rejects hostnames, wildcards, and malformed forms', () => {
+      for (const entry of [
+        'example.com',
+        'example.com:80',
+        '10.0.0.0/8:*',
+        '*',
+        '10.0.0.0/23:99999',
+        '10.0.0.0/23:0',
+        '1.2.3.4/33',
+        '2001:db8::/129',
+        '10.0.0.0/0',
+        'http://10.0.0.1',
+        '10.0.0.0/23:5000-5010',
+        '10.0.0.1 ',
+        '',
+      ]) {
+        const result = parseWith([entry])
+        expect(result.success).toBe(false)
+      }
+    })
+
+    test('is optional and absent by default', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse(base)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.network.allowedIPs).toBeUndefined()
+      }
+    })
+  })
 })

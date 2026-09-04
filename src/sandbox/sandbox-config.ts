@@ -5,6 +5,7 @@
 
 import type { FilterRequestCallback } from './request-filter.js'
 
+import { isIP } from 'node:net'
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 import { isInjectHostCoveredByAllowedDomains } from './domain-pattern.js'
@@ -53,6 +54,145 @@ const domainPatternSchema = z.string().refine(
       'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.',
   },
 )
+
+/**
+ * One parsed `network.allowedIPs` entry: `<ip|cidr>[:<port>]`.
+ */
+interface AllowedIPEntry {
+  /** IPv4/IPv6 literal or CIDR (mask 1–32 for IPv4, 1–128 for IPv6). */
+  host: string
+  /** Optional TCP/UDP port, 1–65535. */
+  port?: number
+}
+
+type AllowedIPEntryParse =
+  | ({ ok: true } & AllowedIPEntry)
+  | { ok: false; error: string }
+
+/**
+ * Parse and validate one `network.allowedIPs` entry — `<ip|cidr>[:<port>]`.
+ *
+ * Single source of truth for the entry grammar: the zod schema below calls
+ * this at config-validation time, and the macOS profile generator calls it
+ * when extracting the ports to emit. The IP/CIDR part is validated and
+ * preserved (logged, and usable by future enforcement points) even though
+ * the current macOS seatbelt emission is port-scoped — see
+ * docs/sbpl-probe-allowedIPs.md for why the kernel cannot apply it.
+ *
+ * A port suffix is recognized in two unambiguous forms only:
+ * - `<ipv4|cidr>:<port>` — a single colon followed by digits, or
+ * - `[<ipv6>]:<port>` — the RFC 3986 bracket form (a bare IPv6 literal
+ *   already contains colons, so an unbracketed suffix could never be
+ *   split off reliably).
+ * Hostnames, globs, schemes, whitespace, a bare `*`, and /0 are rejected.
+ */
+export function parseAllowedIPEntry(entry: string): AllowedIPEntryParse {
+  const invalid = (why: string): AllowedIPEntryParse => ({
+    ok: false,
+    error:
+      `Invalid network.allowedIPs entry "${entry}": ${why} Entries look ` +
+      `like "10.0.0.0/23:9093", "10.1.2.3:9093", "10.1.2.3", or ` +
+      `"2001:db8::/32" — IP/CIDR literals only, no hostnames or wildcards.`,
+  })
+
+  if (entry.length === 0) return invalid('entry is empty.')
+  if (/\s/.test(entry)) return invalid('whitespace is not allowed.')
+
+  let host = entry
+  let portPart: string | undefined
+
+  if (entry.startsWith('[')) {
+    // Bracketed IPv6, optionally "[<ipv6>]:<port>".
+    const close = entry.indexOf(']')
+    if (close === -1) {
+      return invalid('bracketed IPv6 entry is missing "]".')
+    }
+    host = entry.slice(1, close)
+    const rest = entry.slice(close + 1)
+    if (rest !== '') {
+      const p = rest.startsWith(':') ? rest.slice(1) : ''
+      if (p === '' || !/^\d+$/.test(p)) {
+        return invalid(
+          `expected "[<ipv6>]:<port>" — "${rest}" follows the bracketed host.`,
+        )
+      }
+      portPart = p
+    }
+  } else {
+    const first = entry.indexOf(':')
+    if (first !== -1 && first === entry.lastIndexOf(':')) {
+      const after = entry.slice(first + 1)
+      if (/^\d+$/.test(after)) {
+        // Single colon + digits: an IPv4/CIDR with a port. (A bare IPv6
+        // literal always has 2+ colons, so this can never be one.)
+        host = entry.slice(0, first)
+        portPart = after
+      }
+    }
+    // Any other colon layout leaves the whole string as the host candidate;
+    // isIP() below rejects it unless it is a bare IPv6 literal/CIDR.
+  }
+
+  // Host: IPv4/IPv6 literal, optionally "<ip>/<mask>".
+  let ipPart = host
+  let maskPart: string | undefined
+  const slash = host.indexOf('/')
+  if (slash !== -1) {
+    if (slash !== host.lastIndexOf('/')) {
+      return invalid('too many "/" separators.')
+    }
+    ipPart = host.slice(0, slash)
+    maskPart = host.slice(slash + 1)
+  }
+
+  const version = isIP(ipPart)
+  if (version === 0) {
+    return invalid(`"${ipPart}" is not an IPv4/IPv6 address or CIDR.`)
+  }
+
+  if (maskPart !== undefined) {
+    if (!/^\d+$/.test(maskPart)) {
+      return invalid(`CIDR mask "${maskPart}" must be a decimal integer.`)
+    }
+    const mask = Number(maskPart)
+    if (mask === 0) {
+      return {
+        ok: false,
+        error:
+          `Invalid network.allowedIPs entry "${entry}": /0 matches EVERY ` +
+          `address and is rejected as a footgun. List the specific CIDRs ` +
+          `you need instead (e.g. "10.0.0.0/23:9093").`,
+      }
+    }
+    const maxMask = version === 4 ? 32 : 128
+    if (mask > maxMask) {
+      return invalid(
+        `CIDR mask /${mask} is out of range for IPv${version} (max /${maxMask}).`,
+      )
+    }
+  }
+
+  let port: number | undefined
+  if (portPart !== undefined) {
+    port = Number(portPart)
+    if (port < 1 || port > 65535) {
+      return invalid(`port ${portPart} is out of range (must be 1–65535).`)
+    }
+  }
+
+  return { ok: true, host, ...(port !== undefined ? { port } : {}) }
+}
+
+/**
+ * Schema for one `network.allowedIPs` entry — grammar in
+ * {@link parseAllowedIPEntry}.
+ */
+const allowedIPEntrySchema = z.string().superRefine((val, ctx) => {
+  const parsed = parseAllowedIPEntry(val)
+  if (!parsed.ok) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: parsed.error })
+  }
+})
 
 /**
  * Schema for filesystem paths
@@ -545,6 +685,20 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all).',
     ),
+  allowedIPs: z
+    .array(allowedIPEntrySchema)
+    .optional()
+    .describe(
+      'macOS: seatbelt-level outbound allows for proxy-blind clients (e.g. Go ' +
+        'binaries like kaf that dial broker/database addresses directly and ' +
+        'ignore HTTP/SOCKS proxy env vars). Each entry is "<ip|cidr>[:<port>]". ' +
+        'DEGRADED ENFORCEMENT on current macOS: the seatbelt compiler rejects ' +
+        'IP/CIDR destination literals, so each entry allows outbound to its ' +
+        'PORT to ANY destination — the IP/CIDR part is validated and logged ' +
+        'but not applied by the kernel. This traffic bypasses the local proxy ' +
+        'entirely: no domain filtering, no logging, no credential masking. ' +
+        'Ignored on Linux/Windows.',
+    ),
   strictAllowlist: z
     .boolean()
     .optional()
@@ -673,7 +827,7 @@ export const NetworkConfigSchema = z.object({
             'log), so paths that exist on only some hosts are safe to list.',
         ),
     })
-    .refine(o => !o.caCertPath === !o.caKeyPath, {
+    .refine(o => Boolean(o.caCertPath) === Boolean(o.caKeyPath), {
       message: 'caCertPath and caKeyPath must be provided together',
     })
     .optional()
