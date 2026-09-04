@@ -151,4 +151,24 @@ describe.if(isMacOS)('macOS allowedIPs via SandboxManager', () => {
     const after = await SandboxManager.wrapWithSandbox('echo hi')
     expect(after).toContain('(allow network-outbound (remote ip "*:9093"))')
   })
+
+  it('applies per-exec customConfig.allowedIPs when the global config has none', async () => {
+    // Global config has NO allowedIPs — only the per-exec override does.
+    await SandboxManager.initialize(configWith(undefined, ['example.com']))
+
+    const command = 'echo hi'
+    const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowedIPs: ['10.0.0.0/23:9093'],
+      },
+    })
+
+    // Wrapped (not passed through), the per-exec port rule is emitted,
+    // and the profile is restricted (no blanket network allow).
+    expect(wrapped).not.toBe(command)
+    expect(wrapped).toContain('(allow network-outbound (remote ip "*:9093"))')
+    expect(wrapped).not.toContain('(allow network*)')
+  })
 })

@@ -691,7 +691,9 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'macOS: seatbelt-level outbound allows for proxy-blind clients (e.g. Go ' +
         'binaries like kaf that dial broker/database addresses directly and ' +
-        'ignore HTTP/SOCKS proxy env vars). Each entry is "<ip|cidr>[:<port>]". ' +
+        'ignore HTTP/SOCKS proxy env vars). Each entry is "<ip|cidr>[:<port>]"; ' +
+        'IPv6 with a port uses the bracketed "[<ipv6>]:<port>" form (e.g. ' +
+        '"[2001:db8::1]:443") — the only way to express IPv6+port. ' +
         'DEGRADED ENFORCEMENT on current macOS: the seatbelt compiler rejects ' +
         'IP/CIDR destination literals, so each entry allows outbound to its ' +
         'PORT to ANY destination — the IP/CIDR part is validated and logged ' +

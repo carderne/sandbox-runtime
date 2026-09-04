@@ -1345,7 +1345,7 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
-        allowedIPs: getAllowedIPs(),
+        allowedIPs: customConfig?.network?.allowedIPs ?? getAllowedIPs(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowBrowserProcess,
