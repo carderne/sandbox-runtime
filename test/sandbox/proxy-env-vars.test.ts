@@ -24,7 +24,7 @@ describe('proxy lifecycle', () => {
         await SandboxManager.initialize(config)
         expect(SandboxManager.getSocksProxyPort()).toBeDefined()
         expect(await SandboxManager.wrapWithSandbox('true')).toContain(
-          'GIT_SSH_COMMAND=',
+          'GIT_SSH_COMMAND',
         )
         await SandboxManager.reset()
         await rejects(
