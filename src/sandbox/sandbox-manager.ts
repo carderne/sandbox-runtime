@@ -1280,7 +1280,11 @@ async function wrapWithSandbox(
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
-    await waitForNetworkInitialization()
+    if (!(await waitForNetworkInitialization()) || !managerContext) {
+      throw new Error(
+        'Sandbox network proxy is not initialized. Initialize the sandbox before running commands.',
+      )
+    }
   }
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
@@ -1409,7 +1413,11 @@ async function wrapWithSandboxArgv(
       customConfig?.network?.allowedDomains !== undefined ||
       config?.network?.allowedDomains !== undefined
     if (hasNetworkConfig) {
-      await waitForNetworkInitialization()
+      if (!(await waitForNetworkInitialization()) || !managerContext) {
+        throw new Error(
+          'Sandbox network proxy is not initialized. Initialize the sandbox before running commands.',
+        )
+      }
     }
     const credentialRestrictions = getCredentialRestrictions(
       customConfig?.credentials ?? config?.credentials,
@@ -1535,11 +1543,12 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * including Windows. This is what lets a host enable/deny domains
  * for already-running sandboxed children.
  *
- * Filesystem changes (denyRead/denyWrite) are NOT applied live:
- * macOS bakes them into the seatbelt profile at wrap time, and
- * Linux/Windows bake them into the bwrap argv / DENY-ACE set at
- * wrap time. Call reset() + initialize() to apply a new
- * filesystem config.
+ * On macOS/Linux, new commands pick up filesystem changes when
+ * their seatbelt profile / bwrap argv is generated. Already-running
+ * processes keep their existing filesystem restrictions. Resetting
+ * does not change those restrictions and disconnects their proxies.
+ * Windows filesystem permissions are session-wide: call reset() +
+ * initialize() to apply a new filesystem config there.
  *
  * @param newConfig - The new configuration to use
  */
