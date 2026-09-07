@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test'
+import { rejects } from 'node:assert/strict'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -9,7 +10,37 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isMacOS } from '../helpers/platform.js'
+
+describe('proxy lifecycle', () => {
+  it.if(isLinux || isMacOS)(
+    'rejects commands after reset instead of silently omitting the proxy',
+    async () => {
+      const config: SandboxRuntimeConfig = {
+        network: { allowedDomains: ['example.com'], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+      try {
+        await SandboxManager.initialize(config)
+        expect(SandboxManager.getSocksProxyPort()).toBeDefined()
+        expect(await SandboxManager.wrapWithSandbox('true')).toContain(
+          'GIT_SSH_COMMAND',
+        )
+        await SandboxManager.reset()
+        await rejects(
+          SandboxManager.wrapWithSandbox('true'),
+          /Sandbox network proxy is not initialized/,
+        )
+        await rejects(
+          SandboxManager.wrapWithSandboxArgv('true'),
+          /Sandbox network proxy is not initialized/,
+        )
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+})
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
