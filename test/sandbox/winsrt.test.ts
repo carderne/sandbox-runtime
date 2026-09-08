@@ -1395,6 +1395,48 @@ describe.if(isWindows)(
       }
     }, 120_000)
 
+    it('process exit revokes grants and restores deny ACEs synchronously', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-exit-'))
+      const secret = join(dir, 'secret.txt')
+      writeFileSync(secret, 'SECRET')
+      const moduleUrl = new URL('../../dist/index.js', import.meta.url).href
+      const cfg = createFsTestConfig({ allowWrite: [dir], denyRead: [secret] })
+      try {
+        const result = await spawnAsync(
+          'node',
+          [
+            '--input-type=module',
+            '-e',
+            `
+          import { SandboxManager } from ${JSON.stringify(moduleUrl)};
+          import { spawnSync } from 'node:child_process';
+          await SandboxManager.initialize(${JSON.stringify(cfg)});
+          for (const path of ${JSON.stringify([dir, secret])}) {
+            const acl = spawnSync('icacls', [path], { encoding: 'utf8' });
+            if (acl.status !== 0 || !/srt-sandbox/i.test(acl.stdout)) {
+              throw new Error('Expected sandbox ACE before exit: ' + acl.stdout + acl.stderr);
+            }
+          }
+          process.exit(0);
+        `,
+          ],
+          { timeout: 60_000 },
+        )
+        expect(result.status).toBe(0)
+        for (const path of [dir, secret]) {
+          const acl = spawnSync('icacls', [path], {
+            encoding: 'utf8',
+            timeout: 5000,
+          })
+          expect(acl.status).toBe(0)
+          expect(acl.stdout).not.toContain(sbSid)
+          expect(acl.stdout.toLowerCase()).not.toContain('srt-sandbox')
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
     it('H8: reset() revokes the grant — sandbox-user ACE gone', async () => {
       // After H5/H6/H7's reset() calls, the root's DACL must NOT
       // carry an explicit ACE for the sandbox user.

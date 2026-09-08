@@ -376,19 +376,22 @@ function registerExitCleanupHandler(): void {
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
  * directory. It is also called automatically on process exit as a safety net.
  *
- * Each call decrements the active-sandbox counter that was incremented by
+ * Each command-completion call decrements the active-sandbox counter incremented by
  * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
  * reaches zero. Deleting a mount point file on the host while another bwrap
  * instance is still running detaches that instance's bind mount (the dentry
  * is unhashed, so path lookup no longer finds the mount) and the deny rule
  * stops applying inside that sandbox.
  *
- * Pass `{ force: true }` to delete unconditionally — used by the process-exit
- * handler and reset() where deferral is not meaningful.
+ * Pass `{ completed: false }` during manager teardown to leave other commands'
+ * counts untouched. `{ force: true }` is reserved for process exit.
  */
-export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
+export function cleanupBwrapMountPoints(opts?: {
+  force?: boolean
+  completed?: boolean
+}): void {
   if (!opts?.force) {
-    if (activeSandboxCount > 0) {
+    if (opts?.completed !== false && activeSandboxCount > 0) {
       activeSandboxCount--
     }
     if (activeSandboxCount > 0) {
