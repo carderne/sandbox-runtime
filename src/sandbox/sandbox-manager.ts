@@ -91,29 +91,41 @@ interface HostNetworkManagerContext {
   linuxBridge: LinuxNetworkBridgeContext | undefined
 }
 
-const cleanupHandlers = new Set<() => Promise<void>>()
+const cleanupHandlers = new Map<() => Promise<void>, () => Promise<void>>()
 
 function cleanupManagers(): void {
-  for (const cleanup of [...cleanupHandlers]) {
+  runCleanupHandlers([...cleanupHandlers.keys()])
+}
+
+function cleanupManagersOnExit(): void {
+  // Exit handlers cannot await initialization before releasing resources.
+  runCleanupHandlers([...cleanupHandlers.values()])
+}
+
+function runCleanupHandlers(handlers: Array<() => Promise<void>>): void {
+  for (const cleanup of handlers) {
     void cleanup().catch(error => {
       logForDebugging(`Sandbox cleanup failed: ${error}`, { level: 'error' })
     })
   }
 }
 
-function registerCleanup(cleanup: () => Promise<void>): void {
+function registerCleanup(
+  cleanup: () => Promise<void>,
+  cleanupOnExit: () => Promise<void>,
+): void {
   if (cleanupHandlers.size === 0) {
-    process.once('exit', cleanupManagers)
+    process.once('exit', cleanupManagersOnExit)
     process.once('SIGINT', cleanupManagers)
     process.once('SIGTERM', cleanupManagers)
   }
-  cleanupHandlers.add(cleanup)
+  cleanupHandlers.set(cleanup, cleanupOnExit)
 }
 
 function unregisterCleanup(cleanup: () => Promise<void>): void {
   cleanupHandlers.delete(cleanup)
   if (cleanupHandlers.size === 0) {
-    process.removeListener('exit', cleanupManagers)
+    process.removeListener('exit', cleanupManagersOnExit)
     process.removeListener('SIGINT', cleanupManagers)
     process.removeListener('SIGTERM', cleanupManagers)
   }
@@ -528,7 +540,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
     }
 
     // Register cleanup handlers first time
-    registerCleanup(reset)
+    registerCleanup(reset, resetSession)
 
     // Windows: validate provisioning + filesystem config BEFORE any
     // sandboxed child can be spawned. Doing this at initialize() (not
