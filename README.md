@@ -215,6 +215,31 @@ child.on('exit', async code => {
 })
 ```
 
+#### Independent sessions (macOS/Linux)
+
+When multiple agents or sessions run in one process, create one manager per session:
+
+```typescript
+import { createSandboxManager } from '@carderne/sandbox-runtime'
+
+const sandbox = createSandboxManager()
+await sandbox.initialize(config)
+const command = await sandbox.wrapWithSandbox('curl https://example.com')
+// Execute command, then call sandbox.cleanupAfterCommand() when it finishes.
+// At session shutdown, after stopping its commands:
+await sandbox.reset()
+```
+
+Each instance owns its proxy ports, credentials, permissions, and violation store.
+Updating or resetting one instance does not update or stop another session's proxy.
+Do not share an instance between independently managed sessions. Keep the returned
+manager for the session's lifetime, including permission updates and cleanup.
+
+The existing `SandboxManager` export remains the process-wide singleton for
+backwards compatibility. Independent managers currently reject initialization on
+Windows because its filesystem ACL ownership is process-wide; Windows callers
+must continue using the singleton.
+
 #### Available exports
 
 ```typescript

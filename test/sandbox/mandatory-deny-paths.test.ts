@@ -625,6 +625,10 @@ describe.if(isSupportedPlatform)(
             // Without deferral, this would delete sandbox A's mount point too.
             cleanupBwrapMountPoints()
 
+            // Tearing down another manager must not complete sandbox A's command.
+            cleanupBwrapMountPoints({ completed: false })
+            expect(existsSync(protectedFile)).toBe(true)
+
             // Wait for sandbox A to attempt its write
             await exitA
 
