@@ -6,7 +6,7 @@
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { isInjectHostCoveredByAllowedDomains } from './domain-pattern.js'
 
 /**

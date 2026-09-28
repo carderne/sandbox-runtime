@@ -722,7 +722,9 @@ function buildSandboxCommand(
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr,nodelay UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr,nodelay UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // Save and re-exit with the script's status: under zsh a bare `exit` in
+    // an EXIT trap takes the kill's status, so failures reported 0.
+    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
