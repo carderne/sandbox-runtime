@@ -35,8 +35,8 @@ describe('generateProxyEnvVars: TMPDIR', () => {
     expect(generateProxyEnvVars()).toContain('TMPDIR=/tmp/claude-1001')
   })
 
-  it('falls back to /tmp/claude when neither is set', () => {
-    expect(generateProxyEnvVars()).toContain('TMPDIR=/tmp/claude')
+  it('falls back to /tmp when neither is set', () => {
+    expect(generateProxyEnvVars()).toContain('TMPDIR=/tmp')
   })
 
   it('omits TMPDIR when skipTmpdir is true', () => {

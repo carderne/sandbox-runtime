@@ -359,8 +359,8 @@ export function getDefaultWritePaths(): string[] {
     '/dev/tty',
     '/dev/dtracehelper',
     '/dev/autofs_nowait',
-    '/tmp/claude',
-    '/private/tmp/claude',
+    '/tmp',
+    '/private/tmp',
     path.join(homeDir, '.npm/_logs'),
     path.join(homeDir, '.claude/debug'),
   ]
@@ -408,15 +408,12 @@ export function generateProxyEnvVars(
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
-  // (writeConfig === undefined → skipTmpdir), the host TMPDIR is already
-  // writable and /tmp/claude may not exist, so leave it untouched.
+  // (writeConfig === undefined → skipTmpdir), leave the host TMPDIR untouched.
   // CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is kept for
   // backwards compatibility (#141).
   if (!skipTmpdir) {
     const tmpdir =
-      process.env.CLAUDE_CODE_TMPDIR ||
-      process.env.CLAUDE_TMPDIR ||
-      '/tmp/claude'
+      process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || '/tmp'
     envVars.push(`TMPDIR=${tmpdir}`)
   }
 

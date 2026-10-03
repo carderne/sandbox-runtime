@@ -1276,7 +1276,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
 
     // Get configs - use custom if provided, otherwise fall back to main config
     // If neither exists, defaults to empty arrays (most restrictive)
-    // Always include default system write paths (like /dev/null, /tmp/claude)
+    // Always include default system write paths (like /dev/null, /tmp)
     //
     // Strip trailing /** and filter remaining globs on Linux (bwrap needs
     // real paths, not globs; macOS subpath matching is also recursive so
