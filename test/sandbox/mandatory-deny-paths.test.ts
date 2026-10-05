@@ -1127,6 +1127,54 @@ describe.if(isSupportedPlatform)(
           readFileSync(join(CWD_TEST_DIR, 'sub', '.gitconfig'), 'utf8'),
         ).toBe('ORIGINAL')
       })
+
+      // The cases above call wrapCommandWithSandboxLinux() directly, so they
+      // pass a writeConfig that already carries the flag and cannot catch the
+      // flag being dropped on the way from SandboxRuntimeConfig to the
+      // wrapper. These go through the manager's wrapWithSandbox() instead,
+      // which is the path every real caller takes.
+      describe('via SandboxManager.wrapWithSandbox()', () => {
+        async function wrapViaManager(
+          denyMandatoryCwdFiles?: boolean,
+        ): Promise<string> {
+          const manager = createSandboxManager()
+          await manager.initialize({
+            network: { allowedDomains: [], deniedDomains: [] },
+            filesystem: {
+              denyRead: [],
+              allowWrite: ['.'],
+              denyWrite: [],
+              denyMandatoryCwdFiles,
+            },
+          })
+
+          try {
+            return await manager.wrapWithSandbox('true')
+          } finally {
+            await manager.reset()
+          }
+        }
+
+        it('masks mandatory filenames in cwd by default', async () => {
+          const cmd = await wrapViaManager()
+
+          expect(cmd).toContain(`--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`)
+          expect(cmd).toContain(
+            `--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`,
+          )
+        })
+
+        it('does not mask mandatory filenames in cwd when opted out', async () => {
+          const cmd = await wrapViaManager(false)
+
+          expect(cmd).not.toContain(
+            `--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`,
+          )
+          expect(cmd).not.toContain(
+            `--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`,
+          )
+        })
+      })
     })
   },
 )
