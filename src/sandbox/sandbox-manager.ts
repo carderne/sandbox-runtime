@@ -1318,6 +1318,13 @@ function createManager(legacySingleton: boolean): ISandboxManager {
             config?.filesystem.denyWrite ??
             [],
         ),
+        // getFsWriteConfig() also returns this field, but it is not on the
+        // wrapWithSandbox() path — the platform wrappers are handed the
+        // writeConfig built here, so the flag was always undefined by the time
+        // it reached linuxGetMandatoryDenyPaths() and fell back to true.
+        denyMandatoryCwdFiles:
+          customConfig?.filesystem?.denyMandatoryCwdFiles ??
+          config?.filesystem?.denyMandatoryCwdFiles,
       }
 
       // Credential deny paths are unioned with the caller's denyRead — never
