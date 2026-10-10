@@ -252,6 +252,10 @@ const bwrapMountPoints: Set<string> = new Set()
 // the deny rule stops applying inside it.
 let activeSandboxCount = 0
 
+// Forced cleanups so far. One zeroes the count under a wrap still in flight,
+// which from then on has nothing in it to give back.
+let forcedCleanups = 0
+
 let exitHandlerRegistered = false
 
 /**
@@ -306,9 +310,13 @@ export function cleanupBwrapMountPoints(opts?: {
     }
   } else {
     activeSandboxCount = 0
+    forcedCleanups++
   }
 
-  for (const mountPoint of bwrapMountPoints) {
+  // Deepest first: a sandbox wrapped while another's directory mount point is
+  // there gets its own inside it, and a directory goes only when it is empty.
+  const deepestFirst = [...bwrapMountPoints].sort((a, b) => b.length - a.length)
+  for (const mountPoint of deepestFirst) {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
       // If something else has written real content, leave it alone.
@@ -1445,6 +1453,7 @@ export async function wrapCommandWithSandboxLinux(
   // spawned command exits. If wrapping fails below, the catch block
   // decrements so the count does not leak.
   activeSandboxCount++
+  const countedAfter = forcedCleanups
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
@@ -1677,13 +1686,17 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
+    // INVARIANT: a wrap that hands out a command is in the count when it does,
+    // whatever a forced cleanup did meanwhile: its caller gives one back.
+    if (forcedCleanups !== countedAfter) activeSandboxCount++
     return wrappedCommand
   } catch (error) {
     // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
+    // cleanupBwrapMountPoints() for a wrap that threw. A command that ended
+    // meanwhile deferred its removal to this wrap, so it runs here. After a
+    // forced cleanup the count is of other sandboxes only: one taken from it
+    // has their mount points removed while they run.
+    if (forcedCleanups === countedAfter) cleanupBwrapMountPoints()
     throw error
   }
 }
