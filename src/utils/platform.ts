@@ -48,6 +48,9 @@ export function getPlatform(): Platform {
       // WSL2+ is treated as Linux (same sandboxing)
       // WSL1 is also returned as 'linux' but will fail isSupportedPlatform check
       return 'linux'
+    case 'android':
+      // Android/Termux uses the Linux sandbox backend when bubblewrap is available.
+      return 'linux'
     case 'win32':
       return 'windows'
     default:
