@@ -127,6 +127,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
   // Handle CONNECT requests for HTTPS traffic
   server.on('connect', async (req, socket, head) => {
+    ;(socket as Socket).setNoDelay(true)
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })
@@ -244,6 +245,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         } else {
           upstream = await dialDirect(hostname, port)
         }
+        upstream.setNoDelay(true)
       } catch (err) {
         logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
           level: 'error',
