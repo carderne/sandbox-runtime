@@ -148,8 +148,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - run: npm install -g npm@11
 
       - uses: actions/download-artifact@v4
         with:
@@ -200,5 +202,3 @@ jobs:
         # tarball (vs the directory) skips prepublishOnly, so no
         # rebuild happens between verify and publish.
         run: npm publish "$PKG" --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
