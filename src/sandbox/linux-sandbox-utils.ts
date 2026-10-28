@@ -641,7 +641,7 @@ export async function initializeLinuxNetworkBridge(
   // Start HTTP bridge
   const httpSocatArgs = [
     `UNIX-LISTEN:${httpSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
+    `TCP:localhost:${httpProxyPort},nodelay,keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
   ]
 
   logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`)
@@ -685,7 +685,7 @@ export async function initializeLinuxNetworkBridge(
     socksSockPath = socksSocketPath
     const socksSocatArgs = [
       `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
-      `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
+      `TCP:localhost:${socksProxyPort},nodelay,keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
     ]
 
     logForDebugging(
@@ -822,8 +822,8 @@ function buildSandboxCommand(
   // socatPath resolves to the same binary inside bwrap.
   const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:3128,fork,reuseaddr,nodelay UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:1080,fork,reuseaddr,nodelay UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
