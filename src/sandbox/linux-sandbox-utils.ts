@@ -866,10 +866,18 @@ function resolveSymlinkDenyDest(normalizedPath: string): string {
 }
 
 /**
- * Mount a tmpfs over a read-denied directory, then restore the allowed write
- * paths and allowRead paths the tmpfs just wiped. Used by the denyRead loop
- * in generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
- * a read-denied directory and the tmpfs must be re-applied on top.
+ * Mount a tmpfs over a read-denied directory, then restore the allowRead
+ * paths and the allowed write paths the tmpfs just wiped. Used by the
+ * denyRead loop in generateFilesystemArgs and again when a late denyWrite
+ * ro-bind re-exposes a read-denied directory and the tmpfs must be
+ * re-applied on top.
+ *
+ * Order matters: bwrap applies binds in order, so the write re-binds are
+ * emitted AFTER the allowRead re-binds. An allowRead path can be an
+ * ancestor of an allowed-write path (e.g. allowRead: [~/src],
+ * allowWrite: [~/src/repo]); emitting the ancestor's ro-bind last would
+ * silently cover the descendant's rw bind and leave the write path —
+ * often the cwd — read-only again.
  */
 function pushReadDenyDirMounts(
   args: string[],
@@ -879,16 +887,6 @@ function pushReadDenyDirMounts(
 ): void {
   const denySep = normalizedPath === '/' ? '/' : normalizedPath + '/'
   args.push('--tmpfs', normalizedPath)
-
-  // tmpfs wiped any earlier write binds under this path — restore them.
-  for (const writePath of allowedWritePaths) {
-    if (writePath.startsWith(denySep) || writePath === normalizedPath) {
-      args.push('--bind', writePath, writePath)
-      logForDebugging(
-        `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
-      )
-    }
-  }
 
   // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
   // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
@@ -901,7 +899,7 @@ function pushReadDenyDirMounts(
         )
         continue
       }
-      // Skip only if a write path was re-bound just above AND covers
+      // Skip only if a write path below will be re-bound AND covers
       // allowPath. A write path that's an ancestor of the deny dir isn't
       // re-bound (it wasn't wiped), so allowPath under it still needs
       // its own ro-bind here.
@@ -918,6 +916,18 @@ function pushReadDenyDirMounts(
       args.push('--ro-bind', allowPath, allowPath)
       logForDebugging(
         `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+      )
+    }
+  }
+
+  // tmpfs wiped any earlier write binds under this path — restore them.
+  // Emitted after the allowRead re-binds so an rw bind always wins over a
+  // read-only re-bind of one of its ancestors (see doc comment).
+  for (const writePath of allowedWritePaths) {
+    if (writePath.startsWith(denySep) || writePath === normalizedPath) {
+      args.push('--bind', writePath, writePath)
+      logForDebugging(
+        `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
       )
     }
   }
