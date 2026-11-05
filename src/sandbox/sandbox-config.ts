@@ -699,8 +699,7 @@ export const FilesystemConfigSchema = z.object({
     .optional()
     .describe(
       'Disable all filesystem policy enforcement. When true, no read or write rules are emitted: ' +
-        'denyRead/allowRead/allowWrite/denyWrite are ignored, and the built-in mandatory write ' +
-        'protections (shell rc files and .mcp.json) are NOT applied. Use only when the sandboxed process ' +
+        'denyRead/allowRead/allowWrite/denyWrite are ignored. Use only when the sandboxed process ' +
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
@@ -718,16 +717,6 @@ export const FilesystemConfigSchema = z.object({
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
-  denyMandatoryCwdFiles: z
-    .boolean()
-    .optional()
-    .describe(
-      'Deny writes to the built-in mandatory filenames (.gitconfig, .bashrc, .mcp.json, ...) at the ' +
-        'working directory root. Defaults to true. Denying a path that does not exist requires mounting ' +
-        '/dev/null over it, so each denied name is visible to readdir and appears in the working tree as ' +
-        'a zero-length character device that cannot be read, written or removed while the command runs. ' +
-        'Set false to avoid that; these names are still denied at any depth when they already exist.',
-    ),
 })
 
 /**
@@ -739,23 +728,6 @@ export const IgnoreViolationsConfigSchema = z
   .describe(
     'Map of command patterns to filesystem paths to ignore violations for. Use "*" to match all commands',
   )
-
-/**
- * Ripgrep configuration schema
- */
-export const RipgrepConfigSchema = z.object({
-  command: z.string().describe('The ripgrep command to execute'),
-  args: z
-    .array(z.string())
-    .optional()
-    .describe('Additional arguments to pass before ripgrep args'),
-  argv0: z
-    .string()
-    .optional()
-    .describe(
-      'Override argv[0] when spawning (for multicall binaries that dispatch on argv[0])',
-    ),
-})
 
 /**
  * Configuration for locating/invoking the `srt-win` helper (Windows
@@ -896,19 +868,6 @@ export const SandboxRuntimeConfigSchema = z
           'unsandboxed with no user prompt (launched apps are not subject to the sandbox filesystem or ' +
           'network restrictions), and can script running apps subject to TCC automation consent. ' +
           'Default: false.',
-      ),
-    ripgrep: RipgrepConfigSchema.optional().describe(
-      'Custom ripgrep configuration (default: { command: "rg" })',
-    ),
-    mandatoryDenySearchDepth: z
-      .number()
-      .int()
-      .min(1)
-      .max(10)
-      .optional()
-      .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
-          'Higher values provide more protection but slower performance.',
       ),
     allowPty: z
       .boolean()
@@ -1145,7 +1104,6 @@ export type CredentialsConfig = z.infer<typeof CredentialsConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >
-export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>

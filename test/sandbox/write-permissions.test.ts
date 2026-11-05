@@ -20,30 +20,16 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
-import {
-  wrapCommandWithSandboxMacOS,
-  macGetMandatoryDenyPatterns,
-} from '../../src/sandbox/macos-sandbox-utils.js'
+import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
-import { getDangerousDirectories } from '../../src/sandbox/sandbox-utils.js'
 import { createSandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
-/**
- * Integration tests for mandatory deny paths.
- *
- * These tests verify that dangerous files (.bashrc, .gitconfig, etc.) are
- * blocked from writes even when they're within an allowed write path.
- *
- * IMPORTANT: The mandatory deny patterns are relative to process.cwd().
- * Tests must chdir to TEST_DIR before generating sandbox commands.
- */
-
 describe.if(isSupportedPlatform)(
-  'Mandatory Deny Paths - Integration Tests',
+  'Filesystem write permissions - Integration Tests',
   () => {
     const TEST_DIR = join(tmpdir(), `mandatory-deny-integration-${Date.now()}`)
     const ORIGINAL_CONTENT = 'ORIGINAL'
@@ -54,7 +40,6 @@ describe.if(isSupportedPlatform)(
       originalCwd = process.cwd()
       mkdirSync(TEST_DIR, { recursive: true })
 
-      // Create ALL dangerous files from DANGEROUS_FILES
       writeFileSync(join(TEST_DIR, '.bashrc'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.bash_profile'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.gitconfig'), ORIGINAL_CONTENT)
@@ -126,7 +111,6 @@ describe.if(isSupportedPlatform)(
     })
 
     beforeEach(() => {
-      // Must be in TEST_DIR for mandatory deny patterns to apply correctly
       process.chdir(TEST_DIR)
     })
 
@@ -140,14 +124,14 @@ describe.if(isSupportedPlatform)(
     async function runSandboxedWrite(
       filePath: string,
       content: string,
+      denyPaths: string[] = [],
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
       const command = `echo '${content}' > '${filePath}'`
 
-      // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
         allowOnly: ['.'],
-        denyWithinAllow: [], // Empty - relying on mandatory denies
+        denyWithinAllow: denyPaths,
       }
 
       let wrappedCommand: string
@@ -179,74 +163,28 @@ describe.if(isSupportedPlatform)(
       }
     }
 
-    describe('Dangerous files should be blocked', () => {
-      it('blocks writes to .bashrc', async () => {
-        const result = await runSandboxedWrite('.bashrc', MODIFIED_CONTENT)
+    it.each([
+      '.bashrc',
+      '.bash_profile',
+      '.gitconfig',
+      '.zshrc',
+      '.zprofile',
+      '.profile',
+      '.ripgreprc',
+      '.mcp.json',
+    ])('allows writes to %s unless explicitly denied', async filePath => {
+      const result = await runSandboxedWrite(filePath, MODIFIED_CONTENT)
+      expect(result.success).toBe(true)
+      expect(readFileSync(filePath, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+    })
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .gitconfig', async () => {
-        const result = await runSandboxedWrite('.gitconfig', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitconfig', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zshrc', async () => {
-        const result = await runSandboxedWrite('.zshrc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zshrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .mcp.json', async () => {
-        const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .bash_profile', async () => {
-        const result = await runSandboxedWrite(
-          '.bash_profile',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bash_profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zprofile', async () => {
-        const result = await runSandboxedWrite('.zprofile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zprofile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .profile', async () => {
-        const result = await runSandboxedWrite('.profile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('allows writes to .gitmodules', async () => {
-        const result = await runSandboxedWrite('.gitmodules', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(true)
-        expect(readFileSync('.gitmodules', 'utf8').trim()).toBe(
-          MODIFIED_CONTENT,
-        )
-      })
-
-      it('blocks writes to .ripgreprc', async () => {
-        const result = await runSandboxedWrite('.ripgreprc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.ripgreprc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
+    it('preserves an explicitly write-denied configuration file', async () => {
+      writeFileSync('.mcp.json', ORIGINAL_CONTENT)
+      const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT, [
+        join(TEST_DIR, '.mcp.json'),
+      ])
+      expect(result.success).toBe(false)
+      expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
     })
 
     describe('Git hooks and config should be writable', () => {
@@ -796,10 +734,6 @@ describe.if(isSupportedPlatform)(
               denyWithinAllow: [] as string[],
             }
 
-            // This calls linuxGetMandatoryDenyPaths which unconditionally adds
-            // .git/hooks to the deny list. When .git doesn't exist,
-            // findFirstNonExistentComponent returns .git and bwrap mounts
-            // /dev/null there — making .git a file.
             const wrappedCommand = await wrapCommandWithSandboxLinux({
               command: 'git init && git status',
               needsNetworkRestriction: false,
@@ -851,10 +785,6 @@ describe.if(isSupportedPlatform)(
               denyWithinAllow: [] as string[],
             }
 
-            // linuxGetMandatoryDenyPaths adds .git/hooks to deny list.
-            // .git exists as a file, so .git/hooks doesn't exist.
-            // The code will try to mount /dev/null at .git/hooks, but bwrap
-            // can't create a mount point there because .git is a file.
             const wrappedCommand = await wrapCommandWithSandboxLinux({
               command: 'echo hello',
               needsNetworkRestriction: false,
@@ -1057,158 +987,5 @@ describe.if(isSupportedPlatform)(
         })
       },
     )
-
-    describe.if(isLinux)('denyMandatoryCwdFiles (Linux only)', () => {
-      // Denying a mandatory filename that does not exist requires bwrap to
-      // mount /dev/null over it, which surfaces the name in readdir as a
-      // zero-length char device for the lifetime of the command. Callers
-      // that need a clean working tree can opt out via
-      // filesystem.denyMandatoryCwdFiles: false. The ripgrep depth scan is
-      // unaffected, so these names are still denied where they exist.
-      const CWD_TEST_DIR = join(tmpdir(), `mandatory-cwd-files-${Date.now()}`)
-      let savedCwd: string
-
-      beforeAll(() => {
-        savedCwd = process.cwd()
-        mkdirSync(join(CWD_TEST_DIR, 'sub'), { recursive: true })
-      })
-
-      // Runs after the outer beforeEach, which chdirs to the shared TEST_DIR.
-      beforeEach(() => {
-        process.chdir(CWD_TEST_DIR)
-      })
-
-      afterAll(() => {
-        process.chdir(savedCwd)
-        rmSync(CWD_TEST_DIR, { recursive: true, force: true })
-      })
-
-      async function wrapInCwd(
-        command: string,
-        denyMandatoryCwdFiles?: boolean,
-      ): Promise<string> {
-        return wrapCommandWithSandboxLinux({
-          command,
-          needsNetworkRestriction: false,
-          readConfig: undefined,
-          writeConfig: {
-            allowOnly: ['.'],
-            denyWithinAllow: [],
-            denyMandatoryCwdFiles,
-          },
-          enableWeakerNestedSandbox: true,
-        })
-      }
-
-      it('masks mandatory filenames in cwd by default', async () => {
-        const cmd = await wrapInCwd('true')
-
-        expect(cmd).toContain(`--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`)
-        expect(cmd).toContain(`--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`)
-      })
-
-      it('does not mask mandatory filenames in cwd when opted out', async () => {
-        const cmd = await wrapInCwd('true', false)
-
-        expect(cmd).not.toContain(`--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`)
-        expect(cmd).not.toContain(
-          `--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`,
-        )
-      })
-
-      it('still denies a mandatory filename that exists when opted out', async () => {
-        writeFileSync(join(CWD_TEST_DIR, 'sub', '.gitconfig'), 'ORIGINAL')
-
-        const cmd = await wrapInCwd(`echo MODIFIED > sub/.gitconfig`, false)
-        const result = spawnSync(cmd, { shell: true, encoding: 'utf8' })
-
-        expect(result.status).not.toBe(0)
-        expect(
-          readFileSync(join(CWD_TEST_DIR, 'sub', '.gitconfig'), 'utf8'),
-        ).toBe('ORIGINAL')
-      })
-
-      // The cases above call wrapCommandWithSandboxLinux() directly, so they
-      // pass a writeConfig that already carries the flag and cannot catch the
-      // flag being dropped on the way from SandboxRuntimeConfig to the
-      // wrapper. These go through the manager's wrapWithSandbox() instead,
-      // which is the path every real caller takes.
-      describe('via SandboxManager.wrapWithSandbox()', () => {
-        async function wrapViaManager(
-          denyMandatoryCwdFiles?: boolean,
-        ): Promise<string> {
-          const manager = createSandboxManager()
-          await manager.initialize({
-            network: { allowedDomains: [], deniedDomains: [] },
-            filesystem: {
-              denyRead: [],
-              allowWrite: ['.'],
-              denyWrite: [],
-              denyMandatoryCwdFiles,
-            },
-          })
-
-          try {
-            return await manager.wrapWithSandbox('true')
-          } finally {
-            await manager.reset()
-          }
-        }
-
-        it('masks mandatory filenames in cwd by default', async () => {
-          const cmd = await wrapViaManager()
-
-          expect(cmd).toContain(`--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`)
-          expect(cmd).toContain(
-            `--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`,
-          )
-        })
-
-        it('does not mask mandatory filenames in cwd when opted out', async () => {
-          const cmd = await wrapViaManager(false)
-
-          expect(cmd).not.toContain(
-            `--ro-bind /dev/null ${CWD_TEST_DIR}/.bashrc`,
-          )
-          expect(cmd).not.toContain(
-            `--ro-bind /dev/null ${CWD_TEST_DIR}/.gitconfig`,
-          )
-        })
-      })
-    })
   },
 )
-
-describe('mandatory deny directories', () => {
-  it('does not include .claude directories', () => {
-    const directories = getDangerousDirectories()
-
-    expect(directories).not.toContain('.claude/commands')
-    expect(directories).not.toContain('.claude/agents')
-  })
-})
-
-describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
-  it('does not include .git/config in deny patterns', () => {
-    const patterns = macGetMandatoryDenyPatterns()
-
-    const hasGitConfigPattern = patterns.some(
-      p => p.includes('.git/config') || p.endsWith('.git/config'),
-    )
-    expect(hasGitConfigPattern).toBe(false)
-  })
-
-  it('does not include .git/hooks in deny patterns', () => {
-    const patterns = macGetMandatoryDenyPatterns()
-
-    const hasHooksPattern = patterns.some(p => p.includes('.git/hooks'))
-    expect(hasHooksPattern).toBe(false)
-  })
-
-  it('does not include .claude directories in deny patterns', () => {
-    const patterns = macGetMandatoryDenyPatterns()
-
-    const hasClaudePattern = patterns.some(p => p.includes('.claude/'))
-    expect(hasClaudePattern).toBe(false)
-  })
-})

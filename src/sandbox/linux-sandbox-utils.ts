@@ -7,15 +7,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
 import {
   generateProxyEnvVars,
   normalizePathForSandbox,
-  normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
-  DANGEROUS_FILES,
-  getDangerousDirectories,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -63,9 +59,6 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
-  /** Maximum directory depth to search for dangerous files (default: 3) */
-  mandatoryDenySearchDepth?: number
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
   /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
@@ -77,12 +70,7 @@ export interface LinuxSandboxParams {
    *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
    *  stream observed write-intent paths over that socket as newline JSON. */
   observeSocketPath?: string
-  /** Abort signal to cancel the ripgrep scan */
-  abortSignal?: AbortSignal
 }
-
-/** Default max depth for searching dangerous files */
-const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
 
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
@@ -249,96 +237,6 @@ function findFirstNonExistentComponent(targetPath: string): string {
   }
 
   return targetPath // Shouldn't reach here if called correctly
-}
-
-/**
- * Get mandatory deny paths using ripgrep (Linux only).
- * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
- * With --max-depth limiting, this is fast enough to run on each command without memoization.
- */
-async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-  maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
-  abortSignal?: AbortSignal,
-  denyCwdFiles: boolean = true,
-): Promise<string[]> {
-  const cwd = process.cwd()
-  // Use provided signal or create a fallback controller
-  const fallbackController = new AbortController()
-  const signal = abortSignal ?? fallbackController.signal
-  const dangerousDirectories = getDangerousDirectories()
-
-  // Note: Settings files are added at the callsite in sandbox-manager.ts
-  const denyPaths = [
-    // Dangerous files in CWD. Denying a path that does not exist requires
-    // mounting /dev/null over it, which makes the name visible to readdir
-    // and leaves a zero-length char device in the working tree for the
-    // lifetime of the command. Opt out via denyMandatoryCwdFiles: false.
-    // The ripgrep scan below is unaffected and still denies these names at
-    // any depth when they already exist.
-    ...(denyCwdFiles ? DANGEROUS_FILES.map(f => path.resolve(cwd, f)) : []),
-    // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
-  ]
-
-  // Build iglob args for all patterns in one ripgrep call
-  const iglobArgs: string[] = []
-  for (const fileName of DANGEROUS_FILES) {
-    iglobArgs.push('--iglob', fileName)
-  }
-  for (const dirName of dangerousDirectories) {
-    iglobArgs.push('--iglob', `**/${dirName}/**`)
-  }
-
-  // Single ripgrep call to find all dangerous paths in subdirectories
-  // Limit depth for performance - deeply nested dangerous files are rare
-  // and the security benefit doesn't justify the traversal cost
-  let matches: string[] = []
-  try {
-    matches = await ripGrep(
-      [
-        '--files',
-        '--hidden',
-        '--max-depth',
-        String(maxDepth),
-        ...iglobArgs,
-        '-g',
-        '!**/node_modules/**',
-      ],
-      cwd,
-      signal,
-      ripgrepConfig,
-    )
-  } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
-  }
-
-  // Process matches
-  for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
-
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of dangerousDirectories) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
-      )
-      if (dirIndex !== -1) {
-        denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
-        foundDir = true
-        break
-      }
-    }
-
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
-    }
-  }
-
-  return [...new Set(denyPaths)]
 }
 
 // Track mount points created by bwrap for non-existent deny paths.
@@ -931,9 +829,6 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-  mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
-  abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
   // fs already imported
@@ -1007,16 +902,7 @@ async function generateFilesystemArgs(
       allowedWritePaths.push(normalizedPath)
     }
 
-    // Deny writes within allowed paths (user-specified + mandatory denies)
-    const denyPaths = [
-      ...(writeConfig.denyWithinAllow || []),
-      ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
-        mandatoryDenySearchDepth,
-        abortSignal,
-        writeConfig.denyMandatoryCwdFiles ?? true,
-      )),
-    ]
+    const denyPaths = writeConfig.denyWithinAllow || []
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -1451,13 +1337,10 @@ export async function wrapCommandWithSandboxLinux(
     enableWeakerNestedSandbox,
     allowAllUnixSockets,
     binShell,
-    ripgrepConfig = { command: 'rg' },
-    mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     seccompConfig,
     bwrapPath,
     socatPath,
     observeSocketPath,
-    abortSignal,
   } = params
 
   // Determine if we have restrictions to apply
@@ -1635,9 +1518,6 @@ export async function wrapCommandWithSandboxLinux(
       writeConfig,
       maskedFileBinds,
       maskedFileStoreDir,
-      ripgrepConfig,
-      mandatoryDenySearchDepth,
-      abortSignal,
     )
     bwrapArgs.push(...fsArgs)
 

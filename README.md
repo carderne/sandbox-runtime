@@ -500,10 +500,6 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Ubuntu/Debian: `apt-get install socat`
   - Fedora: `dnf install socat`
   - Arch: `pacman -S socat`
-- `ripgrep` - Fast search tool for deny path detection
-  - Ubuntu/Debian: `apt-get install ripgrep`
-  - Fedora: `dnf install ripgrep`
-  - Arch: `pacman -S ripgrep`
 
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 
@@ -525,9 +521,7 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
 
 **macOS requires:**
 
-- `ripgrep` - Fast search tool for deny path detection
-  - Install via Homebrew: `brew install ripgrep`
-  - Or download from: https://github.com/BurntSushi/ripgrep/releases
+- No additional dependencies.
 
 **Windows requires:**
 
@@ -673,45 +667,9 @@ Filesystem restrictions are enforced at the OS level:
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
-### Mandatory Deny Paths (Auto-Protected Files)
+### Write Protection
 
-Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
-
-**Always-blocked files:**
-
-- Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
-- Git config files: `.gitconfig`
-- Other sensitive files: `.ripgreprc`, `.mcp.json`
-
-These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.mcp.json` will fail:
-
-```bash
-$ srt 'echo "malicious" >> .bashrc'
-/bin/bash: .bashrc: Operation not permitted
-
-$ srt 'echo "{}" > .mcp.json'
-/bin/bash: .mcp.json: Operation not permitted
-```
-
-Directories under `.claude/`, including `commands/` and `agents/`, remain writable when their parent path is in `allowWrite`.
-
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
-
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
-
-```json
-{
-  "mandatoryDenySearchDepth": 5,
-  "filesystem": {
-    "allowWrite": ["."]
-  }
-}
-```
-
-- Default: `3` (searches up to 3 levels deep)
-- Range: `1` to `10`
-- Higher values provide more protection but slower performance
-- Files in CWD (depth 0) are always protected regardless of this setting
+No filenames are automatically write-protected within allowed write paths. Add sensitive configuration files to `filesystem.denyWrite` explicitly.
 
 ### Unix Socket Restrictions (Linux)
 

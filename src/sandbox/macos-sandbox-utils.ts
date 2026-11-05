@@ -10,8 +10,6 @@ import {
   decodeSandboxedCommand,
   containsGlobChars,
   globToRegex,
-  DANGEROUS_FILES,
-  getDangerousDirectories,
 } from './sandbox-utils.js'
 
 import type {
@@ -51,29 +49,6 @@ export interface MacOSSandboxParams {
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
-}
-
-/**
- * Get mandatory deny patterns as glob patterns (no filesystem scanning).
- * macOS sandbox profile supports regex/glob matching directly via globToRegex().
- */
-export function macGetMandatoryDenyPatterns(): string[] {
-  const cwd = process.cwd()
-  const denyPaths: string[] = []
-
-  // Dangerous files - static paths in CWD + glob patterns for subtree
-  for (const fileName of DANGEROUS_FILES) {
-    denyPaths.push(path.resolve(cwd, fileName))
-    denyPaths.push(`**/${fileName}`)
-  }
-
-  // Dangerous directories
-  for (const dirName of getDangerousDirectories()) {
-    denyPaths.push(path.resolve(cwd, dirName))
-    denyPaths.push(`**/${dirName}/**`)
-  }
-
-  return [...new Set(denyPaths)]
 }
 
 export interface SandboxViolationEvent {
@@ -396,11 +371,7 @@ function generateWriteRules(
     }
   }
 
-  // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
-  const denyPaths = [
-    ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(),
-  ]
+  const denyPaths = config.denyWithinAllow || []
 
   for (const pathPattern of denyPaths) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
