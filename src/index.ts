@@ -24,7 +24,6 @@ export {
   FilesystemConfigSchema,
   CredentialsConfigSchema,
   IgnoreViolationsConfigSchema,
-  RipgrepConfigSchema,
 } from './sandbox/sandbox-config.js'
 
 // Schema types and utilities

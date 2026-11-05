@@ -16,7 +16,6 @@ import {
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import { randomBytes, X509Certificate } from 'node:crypto'
@@ -143,10 +142,7 @@ export interface ISandboxManager {
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
-  checkDependencies(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): SandboxDependencyCheck
+  checkDependencies(): SandboxDependencyCheck
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -804,13 +800,9 @@ function createManager(legacySingleton: boolean): ISandboxManager {
 
   /**
    * Check sandbox dependencies for the current platform
-   * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
    * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
    */
-  function checkDependencies(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): SandboxDependencyCheck {
+  function checkDependencies(): SandboxDependencyCheck {
     if (!isSupportedPlatform()) {
       return { errors: ['Unsupported platform'], warnings: [] }
     }
@@ -820,14 +812,6 @@ function createManager(legacySingleton: boolean): ISandboxManager {
 
     const platform = getPlatform()
     if (platform === 'linux') {
-      // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
-      // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
-      // profiles take regex patterns directly, so rg is never invoked there.
-      const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-      if (whichSync(rgToCheck.command) === null) {
-        errors.push(`ripgrep (${rgToCheck.command}) not found`)
-      }
-
       const linuxDeps = checkLinuxDependencies({
         seccompConfig: config?.seccomp,
         bwrapPath: config?.bwrapPath,
@@ -1039,7 +1023,6 @@ function createManager(legacySingleton: boolean): ISandboxManager {
     return {
       allowOnly,
       denyWithinAllow: denyPaths,
-      denyMandatoryCwdFiles: config.filesystem.denyMandatoryCwdFiles,
     }
   }
 
@@ -1199,14 +1182,6 @@ function createManager(legacySingleton: boolean): ISandboxManager {
     return config?.allowAppleEvents
   }
 
-  function getRipgrepConfig(): { command: string; args?: string[] } {
-    return config?.ripgrep ?? { command: 'rg' }
-  }
-
-  function getMandatoryDenySearchDepth(): number {
-    return config?.mandatoryDenySearchDepth ?? 3
-  }
-
   function getSeccompConfig(): SeccompConfig | undefined {
     return config?.seccomp
   }
@@ -1256,6 +1231,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
   ): Promise<string> {
+    abortSignal?.throwIfAborted()
     const platform = getPlatform()
 
     // filesystem.disabled bypasses ALL filesystem rule generation. Both
@@ -1318,13 +1294,6 @@ function createManager(legacySingleton: boolean): ISandboxManager {
             config?.filesystem.denyWrite ??
             [],
         ),
-        // getFsWriteConfig() also returns this field, but it is not on the
-        // wrapWithSandbox() path — the platform wrappers are handed the
-        // writeConfig built here, so the flag was always undefined by the time
-        // it reached linuxGetMandatoryDenyPaths() and fell back to true.
-        denyMandatoryCwdFiles:
-          customConfig?.filesystem?.denyMandatoryCwdFiles ??
-          config?.filesystem?.denyMandatoryCwdFiles,
       }
 
       // Credential deny paths are unioned with the caller's denyRead — never
@@ -1404,7 +1373,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
 
     switch (platform) {
       case 'macos':
-        // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+        // macOS sandbox profiles support glob patterns directly.
         return wrapCommandWithSandboxMacOS({
           command,
           needsNetworkRestriction,
@@ -1458,13 +1427,10 @@ function createManager(legacySingleton: boolean): ISandboxManager {
           enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
           allowAllUnixSockets: getAllowAllUnixSockets(),
           binShell,
-          ripgrepConfig: getRipgrepConfig(),
-          mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
           seccompConfig: getSeccompConfig(),
           bwrapPath: config?.bwrapPath,
           socatPath: config?.socatPath,
           observeSocketPath: linuxMonitor?.observeSocketPath,
-          abortSignal,
         })
 
       case 'windows':

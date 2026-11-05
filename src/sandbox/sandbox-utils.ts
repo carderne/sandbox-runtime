@@ -6,47 +6,6 @@ import { logForDebugging } from '../utils/debug.js'
 import { DEFAULT_SANDBOX_TMPDIR } from './sandbox-temp-dir.js'
 
 /**
- * Dangerous files that should be protected from writes.
- * These files can be used for code execution or data exfiltration.
- */
-export const DANGEROUS_FILES = [
-  '.gitconfig',
-  '.bashrc',
-  '.bash_profile',
-  '.zshrc',
-  '.zprofile',
-  '.profile',
-  '.ripgreprc',
-  '.mcp.json',
-] as const
-
-/**
- * Dangerous directories that should be protected from writes.
- * These directories contain sensitive configuration or executable files.
- */
-export const DANGEROUS_DIRECTORIES = [] as const
-
-/**
- * Get the list of dangerous directories to deny writes to.
- */
-export function getDangerousDirectories(): string[] {
-  return [...DANGEROUS_DIRECTORIES]
-}
-
-/**
- * Normalizes a path for case-insensitive comparison.
- * This prevents bypassing security checks using mixed-case paths on case-insensitive
- * filesystems (macOS/Windows) like `.cLauDe/Settings.locaL.json`.
- *
- * We always normalize to lowercase regardless of platform for consistent security.
- * @param path The path to normalize
- * @returns The lowercase path for safe comparison
- */
-export function normalizeCaseForComparison(pathStr: string): string {
-  return pathStr.toLowerCase()
-}
-
-/**
  * Check if a path pattern contains glob characters
  */
 export function containsGlobChars(pathPattern: string): boolean {
