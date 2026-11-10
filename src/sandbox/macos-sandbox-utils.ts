@@ -46,6 +46,7 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowBrowserProcess?: boolean
+  allowProcessSignals?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
@@ -415,6 +416,7 @@ function generateSandboxProfile({
   allowMachLookup,
   allowPty,
   allowBrowserProcess = false,
+  allowProcessSignals = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
   logTag,
@@ -430,6 +432,7 @@ function generateSandboxProfile({
   allowMachLookup?: string[]
   allowPty?: boolean
   allowBrowserProcess?: boolean
+  allowProcessSignals?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   logTag: string
@@ -445,7 +448,9 @@ function generateSandboxProfile({
     '(allow process-exec)',
     '(allow process-fork)',
     '(allow process-info* (target same-sandbox))',
-    '(allow signal (target same-sandbox))',
+    allowProcessSignals
+      ? '(allow signal)'
+      : '(allow signal (target same-sandbox))',
     '(allow mach-priv-task-port (target same-sandbox))',
     '',
     '; User preferences',
@@ -818,6 +823,7 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     allowPty,
     allowBrowserProcess = false,
+    allowProcessSignals = false,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
@@ -876,6 +882,7 @@ export function wrapCommandWithSandboxMacOS(
     allowMachLookup,
     allowPty,
     allowBrowserProcess,
+    allowProcessSignals,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
     logTag,
