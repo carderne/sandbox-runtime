@@ -869,6 +869,16 @@ export const SandboxRuntimeConfigSchema = z
           'network restrictions), and can script running apps subject to TCC automation consent. ' +
           'Default: false.',
       ),
+    allowProcessSignals: z
+      .boolean()
+      .optional()
+      .describe(
+        'Allow signaling processes outside the current sandbox (macOS only). ' +
+          'Useful for stopping a dev server started by an earlier sandboxed command. ' +
+          'Normal OS signal permissions still apply, but this also allows signaling ' +
+          'unrelated processes owned by the user. Only enable from trusted configuration. ' +
+          'Default: false.',
+      ),
     allowPty: z
       .boolean()
       .optional()

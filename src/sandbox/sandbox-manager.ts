@@ -1394,6 +1394,8 @@ function createManager(legacySingleton: boolean): ISandboxManager {
           ignoreViolations: getIgnoreViolations(),
           allowPty,
           allowBrowserProcess,
+          allowProcessSignals:
+            customConfig?.allowProcessSignals ?? config?.allowProcessSignals,
           enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
           allowAppleEvents: getAllowAppleEvents(),
           binShell,
