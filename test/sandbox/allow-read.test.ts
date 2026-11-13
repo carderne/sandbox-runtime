@@ -1,10 +1,27 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  wrapCommandWithSandboxLinux,
+  cleanupBwrapMountPoints,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -646,4 +663,121 @@ describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
       },
     )
   })
+})
+
+/**
+ * Regression: inside pushReadDenyDirMounts the write re-binds were emitted
+ * BEFORE the allowRead re-binds, so an allowRead path that is an ANCESTOR of
+ * an allowed-write path re-covered the rw bind with a read-only one (bwrap
+ * applies binds in order). The cwd went read-only again, and the mandatory
+ * deny mask for a non-existent DANGEROUS_FILE in cwd then failed to creat()
+ * its mount point — "Can't create file <cwd>/.gitconfig: Read-only file
+ * system" — and bwrap refused to start. The fix emits write re-binds after
+ * the allowRead re-binds so the rw bind always wins.
+ *
+ * Shape: denyRead: [denied] (tmpfs), allowRead: [denied/allowed] (ancestor
+ * of cwd), allowWrite: ['.'] (cwd under the allowRead path), cwd has no
+ * .gitconfig so the mandatory mask must create it inside cwd.
+ */
+describe('write re-bind under an allowRead ancestor of denyRead', () => {
+  const TEST_BASE_DIR = join(tmpdir(), 'allow-read-rebind-order-' + Date.now())
+  const TEST_DENIED_DIR = join(TEST_BASE_DIR, 'denied')
+  const TEST_ALLOWED_DIR = join(TEST_DENIED_DIR, 'allowed')
+  const TEST_CWD = join(TEST_ALLOWED_DIR, 'repo')
+  const TEST_ALLOWED_FILE = join(TEST_ALLOWED_DIR, 'visible.txt')
+  const TEST_SECRET_FILE = join(TEST_DENIED_DIR, 'secret.txt')
+  const SECRET_CONTENT = 'TOP_SECRET_REBIND'
+  const ALLOWED_CONTENT = 'VISIBLE_REBIND'
+  const WRITE_CONTENT = 'WRITE_OK_REBIND'
+  let originalCwd: string
+
+  const readConfig: FsReadRestrictionConfig = {
+    denyOnly: [TEST_DENIED_DIR],
+    allowWithinDeny: [TEST_ALLOWED_DIR],
+  }
+  const writeConfig: FsWriteRestrictionConfig = {
+    allowOnly: ['.'], // resolved against process.cwd() == TEST_CWD
+    denyWithinAllow: [],
+  }
+
+  beforeAll(() => {
+    if (!isSupportedPlatform) return
+
+    mkdirSync(TEST_CWD, { recursive: true })
+    writeFileSync(TEST_ALLOWED_FILE, ALLOWED_CONTENT)
+    writeFileSync(TEST_SECRET_FILE, SECRET_CONTENT)
+    // TEST_CWD deliberately contains no DANGEROUS_FILES: the mandatory deny
+    // masks must creat() their mount points inside cwd, which is exactly
+    // what hit EROFS when the ancestor ro-bind covered the rw re-bind.
+  })
+
+  beforeEach(() => {
+    if (!isSupportedPlatform) return
+    // Mandatory deny patterns are relative to process.cwd(); the wrap must
+    // be generated with cwd inside the sandboxed repo.
+    originalCwd = process.cwd()
+    process.chdir(TEST_CWD)
+  })
+
+  afterEach(() => {
+    if (!isSupportedPlatform) return
+    process.chdir(originalCwd)
+    cleanupBwrapMountPoints({ force: true })
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it.if(isLinux)(
+    'should start and write in cwd when allowRead ancestors the allowWrite path',
+    async () => {
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `echo ${WRITE_CONTENT} > out.txt && cat out.txt`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        cwd: TEST_CWD,
+        timeout: 5000,
+      })
+
+      expect(result.stderr).not.toContain('Read-only file system')
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(WRITE_CONTENT)
+      expect(readFileSync(join(TEST_CWD, 'out.txt'), 'utf8')).toContain(
+        WRITE_CONTENT,
+      )
+    },
+  )
+
+  it.if(isLinux)(
+    'should keep the allowRead ancestor readable and denyRead hidden',
+    async () => {
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `cat ${TEST_ALLOWED_FILE}; cat ${TEST_SECRET_FILE} 2>/dev/null || echo SECRET_HIDDEN`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        cwd: TEST_CWD,
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(ALLOWED_CONTENT)
+      expect(result.stdout).toContain('SECRET_HIDDEN')
+      expect(result.stdout).not.toContain(SECRET_CONTENT)
+    },
+  )
 })
