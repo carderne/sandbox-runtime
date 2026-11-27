@@ -1128,9 +1128,11 @@ async function generateFilesystemArgs(
   // Normalize then sort shallow-first so tmpfs over ancestor dirs lands before
   // /dev/null masks on descendant files. Otherwise a file-deny listed before
   // a dir-deny in denyRead gets wiped when the ancestor tmpfs is applied.
+  // Depth is measured at the resolved target, which is where the mount lands.
+  const depth = (p: string) => resolveSymlinkDenyDest(p).split('/').length
   const normalizedDenyPaths = readDenyPaths
     .map(p => normalizePathForSandbox(p))
-    .sort((a, b) => a.split('/').length - b.split('/').length)
+    .sort((a, b) => depth(a) - depth(b))
 
   for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
@@ -1142,13 +1144,25 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
-      tmpfsDirs.push(normalizedPath)
-      pushReadDenyDirMounts(
-        args,
-        normalizedPath,
-        allowedWritePaths,
-        readAllowPaths,
-      )
+      // bwrap refuses a symlink mount destination ("Can't mount on symlink
+      // destination"), which aborted every command for e.g. denyRead:
+      // ['/var/run']. Mount the tmpfs on the resolved target instead: it is
+      // the only inode the deny can protect, since the directory stays
+      // readable by its real name otherwise. normalizePathForSandbox keeps
+      // the symlink path when the target is "outside the boundary" (/var/run
+      // -> /run); that check guards allow paths against broadening, while
+      // resolving a deny can only narrow access. A symlink to / is left as
+      // is (bwrap fails closed) rather than masking the whole filesystem.
+      const resolvedDir = resolveSymlinkDenyDest(normalizedPath)
+      const denyDir = resolvedDir === '/' ? normalizedPath : resolvedDir
+      if (tmpfsDirs.includes(denyDir)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny already masked at ${denyDir}: ${normalizedPath}`,
+        )
+        continue
+      }
+      tmpfsDirs.push(denyDir)
+      pushReadDenyDirMounts(args, denyDir, allowedWritePaths, readAllowPaths)
     } else {
       // For files, only an exact allowRead match overrides the deny. A
       // directory allowRead does not un-deny a file specifically listed in
@@ -1199,10 +1213,11 @@ async function generateFilesystemArgs(
   //   if an allowed write path at-or-under that tmpfs covers the dest, the
   //   denyRead loop re-bound it (the .git/hooks case) and the write-deny bind
   //   is still required on top.
-  // tmpfsDirs and allowedWritePaths hold unresolved paths while dest has been
-  // canonicalized, so each dest is tested under both spellings: they name the
-  // same inode after bwrap resolves the mount destinations, and a hit on
-  // either means the tmpfs really does cover this bind.
+  // allowedWritePaths hold unresolved paths (tmpfsDirs are resolved targets)
+  // while dest has been canonicalized, so each dest is tested under both
+  // spellings: they name the same inode after bwrap resolves the mount
+  // destinations, and a hit on either means the tmpfs really does cover this
+  // bind.
   const isHiddenByTmpfs = (dest: string): boolean =>
     tmpfsDirs.some(tmpfsDir => {
       const underTmpfs = dest === tmpfsDir || dest.startsWith(tmpfsDir + '/')
