@@ -6,7 +6,7 @@
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import { isInjectHostCoveredByAllowedDomains } from './domain-pattern.js'
 
 /**
@@ -561,7 +561,7 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, allow all Unix sockets (disables blocking on both platforms).',
+      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
     ),
   allowLocalBinding: z
     .boolean()
