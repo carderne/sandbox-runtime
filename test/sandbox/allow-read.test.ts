@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -471,7 +472,7 @@ describe('allowRead without denyRead does not trigger sandboxing', () => {
 
 // A literal denyRead path nested under a literal allowRead subpath must keep
 // its deny: Seatbelt is last-match-wins, so the deny is re-emitted after the
-// allow. (Glob paths are out of scope; denyReadAlways is the lever there.)
+// allow. Glob denies are covered in the next describe block.
 describe.if(isMacOS)('macOS denyRead nested under allowRead', () => {
   it('re-emits the deny after the allow so it stays denied', () => {
     const result = wrapCommandWithSandboxMacOS({
@@ -493,6 +494,97 @@ describe.if(isMacOS)('macOS denyRead nested under allowRead', () => {
     // original emit, then re-emit after allowWithinDeny.
     expect(firstDenySecrets).toBeLessThan(allowAt)
     expect(lastDenySecrets).toBeGreaterThan(allowAt)
+  })
+})
+
+// A glob denyRead whose static base directory is at or under a literal
+// allowRead subpath is the more specific rule, so it is re-emitted after the
+// allow like a nested literal. A broader glob stays overridden by the allow.
+describe.if(isMacOS)('macOS glob denyRead under allowRead', () => {
+  const profileFor = (denyOnly: string[], allowWithinDeny: string[]) =>
+    wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly, allowWithinDeny },
+      writeConfig: undefined,
+    })
+  const denyRegexCount = (profile: string, fragment: string) =>
+    profile
+      .split('(deny file-read*')
+      .slice(1)
+      .filter(rule => rule.split('(with message')[0]!.includes(fragment)).length
+
+  it('re-emits a glob deny based at the allowed subpath', () => {
+    const profile = profileFor(['/work/**/*.pem'], ['/work'])
+    const allowAt = profile.indexOf('(allow file-read*\n  (subpath')
+    expect(allowAt).toBeGreaterThan(-1)
+    expect(denyRegexCount(profile, 'pem')).toBe(2)
+    expect(profile.lastIndexOf('pem')).toBeGreaterThan(allowAt)
+  })
+
+  it('re-emits a glob deny based under the allowed subpath', () => {
+    const profile = profileFor(['/work/secrets/*.json'], ['/work'])
+    expect(denyRegexCount(profile, 'json')).toBe(2)
+  })
+
+  it('does not re-emit a broader glob deny over a narrower allow', () => {
+    const profile = profileFor(['/work/**'], ['/work/public'])
+    const allowAt = profile.indexOf('(allow file-read*\n  (subpath')
+    expect(denyRegexCount(profile, '/work/')).toBe(1)
+    expect(profile.indexOf('(deny file-read*')).toBeLessThan(allowAt)
+  })
+
+  describe('enforcement', () => {
+    const base = join(
+      realpathSync(tmpdir()),
+      'glob-denyread-under-allowread-' + Date.now(),
+    )
+    const project = join(base, 'project')
+    const topPem = join(project, 'top.pem')
+    const nestedPem = join(project, 'certs', 'nested.pem')
+    const visible = join(project, 'visible.txt')
+
+    beforeAll(() => {
+      mkdirSync(join(project, 'certs'), { recursive: true })
+      writeFileSync(topPem, 'TOP_SECRET_PEM')
+      writeFileSync(nestedPem, 'NESTED_SECRET_PEM')
+      writeFileSync(visible, 'VISIBLE_DATA')
+    })
+
+    afterAll(() => {
+      rmSync(base, { recursive: true, force: true })
+    })
+
+    const run = (file: string) =>
+      spawnSync(
+        wrapCommandWithSandboxMacOS({
+          command: `cat ${file}`,
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: [base, join(project, '**', '*.pem')],
+            allowWithinDeny: [project],
+          },
+          writeConfig: undefined,
+        }),
+        { shell: true, encoding: 'utf8', timeout: 5000 },
+      )
+
+    it('denies matching files at any depth inside the allowed subpath', () => {
+      for (const [file, content] of [
+        [topPem, 'TOP_SECRET_PEM'],
+        [nestedPem, 'NESTED_SECRET_PEM'],
+      ] as const) {
+        const result = run(file)
+        expect(result.status).not.toBe(0)
+        expect(result.stdout).not.toContain(content)
+      }
+    })
+
+    it('still allows other files in the allowed subpath', () => {
+      const result = run(visible)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('VISIBLE_DATA')
+    })
   })
 })
 

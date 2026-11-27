@@ -200,6 +200,15 @@ function generateMoveBlockingRules(
  *   (deny file-read* ...)     ← deny broad regions
  *   (allow file-read* ...)    ← re-allow specific paths within denied regions
  */
+/** Directory containing a glob's static prefix, or undefined at the root. */
+function globBaseDir(globPath: string): string | undefined {
+  const staticPrefix = globPath.split(/[*?[\]]/)[0]
+  if (!staticPrefix || staticPrefix === '/') return undefined
+  return staticPrefix.endsWith('/')
+    ? staticPrefix.slice(0, -1)
+    : path.dirname(staticPrefix)
+}
+
 function generateReadRules(
   config: FsReadRestrictionConfig | undefined,
   logTag: string,
@@ -267,14 +276,29 @@ function generateReadRules(
       )
     }
   }
-  // A literal denyOnly path nested inside a literal allowWithinDeny subpath
-  // would otherwise be re-allowed (last-match-wins). Re-emit it so the
-  // more-specific deny lands last. Glob denies aren't re-emitted: nesting
-  // of regex-vs-subpath isn't decidable here, and the schema's denyReadAlways
-  // is the explicit lever for that case.
+  // A denyOnly path nested inside a literal allowWithinDeny subpath would
+  // otherwise be re-allowed (last-match-wins). Re-emit it so the
+  // more-specific deny lands last. A literal deny is more specific when it
+  // lies strictly under the allowed subpath. A glob deny is more specific
+  // when its static base directory is the allowed subpath or lies under it
+  // (e.g. `/work/**/*.pem` under `/work`); a broader glob such as
+  // `/Users/**` stays overridden by a narrower allow.
   for (const denyPath of config.denyOnly || []) {
-    if (containsGlobChars(denyPath)) continue
     const normalized = normalizePathForSandbox(denyPath)
+    if (containsGlobChars(normalized)) {
+      const baseDir = globBaseDir(normalized)
+      if (
+        baseDir &&
+        allowedSubpaths.some(a => baseDir === a || baseDir.startsWith(a + '/'))
+      ) {
+        rules.push(
+          `(deny file-read*`,
+          `  (regex ${escapePath(globToRegex(normalized))})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
+      continue
+    }
     if (allowedSubpaths.some(a => normalized.startsWith(a + '/'))) {
       rules.push(
         `(deny file-read*`,
