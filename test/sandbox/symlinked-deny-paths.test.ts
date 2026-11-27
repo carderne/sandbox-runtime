@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -161,10 +162,67 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     symlinkSync(join('..', 'dotfiles', 'claude'), claudeLink)
 
     const result = await wrap([join(claudeLink, 'commands')], [claudeLink])
-    const resolved = join(DOTFILES, 'claude', 'commands')
+    const resolvedDir = join(DOTFILES, 'claude')
+    const resolved = join(resolvedDir, 'commands')
 
-    expect(result).toContain(`--tmpfs ${claudeLink}`)
+    // bwrap rejects a symlink mount destination, so the tmpfs lands on the
+    // resolved directory.
+    expect(result).toContain(`--tmpfs ${resolvedDir}`)
+    expect(result).not.toContain(`--tmpfs ${claudeLink}`)
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
+  })
+
+  // A symlink whose target lies outside its own tree (the /var/run -> /run
+  // shape) is kept unresolved by normalizePathForSandbox, so it reached bwrap
+  // as a --tmpfs destination and every command failed with "Can't mount on
+  // symlink destination".
+  it('masks a read-denied directory symlink at its target', async () => {
+    const target = join(BASE, 'run')
+    const link = join(BASE, 'var-run')
+    mkdirSync(target)
+    symlinkSync(target, link)
+
+    const result = await wrap([], [link])
+
+    expect(result).toContain(`--tmpfs ${target}`)
+    expect(result).not.toContain(`--tmpfs ${link}`)
+  })
+
+  it('masks a directory once when denied by both its symlink and its real name', async () => {
+    const target = join(BASE, 'run')
+    const link = join(BASE, 'var-run')
+    mkdirSync(target)
+    symlinkSync(target, link)
+
+    for (const denyRead of [
+      [link, target],
+      [target, link],
+    ]) {
+      const result = await wrap([], denyRead)
+      expect(result.split(`--tmpfs ${target} `).length - 1).toBe(1)
+      expect(result).not.toContain(`--tmpfs ${link}`)
+    }
+  })
+
+  it('re-allows paths under a symlinked read-deny directory by their real name', async () => {
+    const target = join(BASE, 'run')
+    const link = join(BASE, 'var-run')
+    const allowed = join(target, 'user')
+    mkdirSync(allowed, { recursive: true })
+    symlinkSync(target, link)
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [link], allowWithinDeny: [allowed] },
+      writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+    })
+
+    const tmpfs = result.indexOf(`--tmpfs ${target}`)
+    expect(tmpfs).toBeGreaterThan(-1)
+    expect(result.indexOf(`--ro-bind ${allowed} ${allowed}`)).toBeGreaterThan(
+      tmpfs,
+    )
   })
 
   it('does not add mandatory denies for a symlinked .claude directory', async () => {
@@ -232,6 +290,57 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       const allowed = await run(`sh -c 'echo ok > ${join(PROJ, 'ok.txt')}'`)
       expect(allowed.status).toBe(0)
       expect(existsSync(join(PROJ, 'ok.txt'))).toBe(true)
+    },
+  )
+
+  it('re-allows paths written through a symlinked read-deny directory', async () => {
+    const target = join(BASE, 'run')
+    const link = join(BASE, 'var-run')
+    mkdirSync(join(target, 'user'), { recursive: true })
+    symlinkSync(target, link)
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [link], allowWithinDeny: [join(link, 'user')] },
+      writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+    })
+
+    const tmpfs = result.indexOf(`--tmpfs ${target}`)
+    const rebind = join(target, 'user')
+    expect(tmpfs).toBeGreaterThan(-1)
+    expect(result.indexOf(`--ro-bind ${rebind} ${rebind}`)).toBeGreaterThan(
+      tmpfs,
+    )
+  })
+
+  it.if(hasBwrap)(
+    'e2e: a symlinked read-deny directory starts and hides the target',
+    async () => {
+      const target = join(BASE, 'run')
+      const link = join(BASE, 'var-run')
+      mkdirSync(target)
+      writeFileSync(join(target, 'secret'), 'secret')
+      symlinkSync(target, link)
+
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(target, 'secret')}; cat ${join(link, 'secret')}; echo e2e-ok`,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [link] },
+        writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+      })
+      const result = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+        cwd: PROJ,
+      })
+
+      // Before the fix bwrap aborted with "Can't mount on symlink destination".
+      expect(result.stderr).not.toContain('symlink destination')
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('e2e-ok')
+      expect(result.stdout).not.toContain('secret')
     },
   )
 
