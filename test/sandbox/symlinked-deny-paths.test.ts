@@ -293,6 +293,27 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     },
   )
 
+  it('re-allows paths written through a symlinked read-deny directory', async () => {
+    const target = join(BASE, 'run')
+    const link = join(BASE, 'var-run')
+    mkdirSync(join(target, 'user'), { recursive: true })
+    symlinkSync(target, link)
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [link], allowWithinDeny: [join(link, 'user')] },
+      writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+    })
+
+    const tmpfs = result.indexOf(`--tmpfs ${target}`)
+    const rebind = join(target, 'user')
+    expect(tmpfs).toBeGreaterThan(-1)
+    expect(result.indexOf(`--ro-bind ${rebind} ${rebind}`)).toBeGreaterThan(
+      tmpfs,
+    )
+  })
+
   it.if(hasBwrap)(
     'e2e: a symlinked read-deny directory starts and hides the target',
     async () => {

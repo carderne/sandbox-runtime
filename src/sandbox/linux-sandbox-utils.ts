@@ -752,6 +752,14 @@ function buildSandboxCommand(
  * carve-outs expressed against the symlink path (e.g. /bin on usr-merged
  * systems).
  */
+function isSymlink(p: string): boolean {
+  try {
+    return fs.lstatSync(p).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 function resolveSymlinkDenyDest(normalizedPath: string): string {
   try {
     if (fs.lstatSync(normalizedPath).isSymbolicLink()) {
@@ -1108,7 +1116,13 @@ async function generateFilesystemArgs(
   for (const p of readConfig?.denyOnly || []) {
     if (normalizePathForSandbox(p) === '/') {
       for (const child of fs.readdirSync('/')) {
-        if (!rootSkip.has(child)) readDenyPaths.push('/' + child)
+        if (rootSkip.has(child)) continue
+        // A top-level symlink (/bin -> usr/bin on usr-merged systems) points
+        // under another top-level directory that is masked in its own right.
+        // Masking it again at its target would re-hide that subtree after an
+        // allowRead such as /usr had restored it.
+        if (isSymlink('/' + child)) continue
+        readDenyPaths.push('/' + child)
       }
     } else {
       readDenyPaths.push(p)
@@ -1133,6 +1147,26 @@ async function generateFilesystemArgs(
   const normalizedDenyPaths = readDenyPaths
     .map(p => normalizePathForSandbox(p))
     .sort((a, b) => depth(a) - depth(b))
+
+  // A read-denied directory symlink is masked at its target (see below).
+  // Record the symlink spellings of each target so allow and write paths
+  // written through the symlink (/var/run/user under /var/run -> /run) are
+  // re-bound at the target too.
+  const tmpfsAliases = new Map<string, string[]>()
+  for (const denyPath of normalizedDenyPaths) {
+    const target = resolveSymlinkDenyDest(denyPath)
+    if (target === denyPath || target === '/') continue
+    tmpfsAliases.set(target, [...(tmpfsAliases.get(target) ?? []), denyPath])
+  }
+  const throughAliases = (dir: string, paths: string[]): string[] => {
+    const aliases = tmpfsAliases.get(dir) ?? []
+    const translated = aliases.flatMap(alias =>
+      paths
+        .filter(p => p === alias || p.startsWith(alias + '/'))
+        .map(p => dir + p.slice(alias.length)),
+    )
+    return translated.length ? [...new Set([...paths, ...translated])] : paths
+  }
 
   for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
@@ -1162,7 +1196,12 @@ async function generateFilesystemArgs(
         continue
       }
       tmpfsDirs.push(denyDir)
-      pushReadDenyDirMounts(args, denyDir, allowedWritePaths, readAllowPaths)
+      pushReadDenyDirMounts(
+        args,
+        denyDir,
+        throughAliases(denyDir, allowedWritePaths),
+        throughAliases(denyDir, readAllowPaths),
+      )
     } else {
       // For files, only an exact allowRead match overrides the deny. A
       // directory allowRead does not un-deny a file specifically listed in
@@ -1258,7 +1297,12 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
-      pushReadDenyDirMounts(args, tmpfsDir, allowedWritePaths, readAllowPaths)
+      pushReadDenyDirMounts(
+        args,
+        tmpfsDir,
+        throughAliases(tmpfsDir, allowedWritePaths),
+        throughAliases(tmpfsDir, readAllowPaths),
+      )
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite
